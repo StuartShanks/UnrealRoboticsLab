@@ -520,10 +520,21 @@ void UMjPhysicsEngine::RunMujocoAsync()
 			//   so we drain commands at the rate Python sends them rather
 			//   than capping at 1 / timestep Hz. Short timeout keeps the
 			//   bShouldStopTask check responsive on shutdown.
+			// Real-time pacing applies whenever the session is behaving as Live.
+			// Don't read OwnerMgr->StepMode here: that's the *configured* mode
+			// (default Auto) and is never updated when the dispatcher resolves
+			// Auto->Live or a client promotes to Direct/Puppet. In the common
+			// default-Auto live session it reads back as Auto (!= Live), which
+			// would drop us into the event-wait branch below where nothing
+			// signals StepRequestEvent -> the loop wakes only on the 100ms
+			// timeout and steps at a fixed 10Hz regardless of opt.timestep.
+			// bPublishersPaused is the dispatcher's authoritative "not Live"
+			// signal (false in Live / Auto-resolved-Live, true in Direct/Puppet),
+			// kept in sync across hello / set_mode / disconnect.
 			bool bUseRealTimePacing = true;
 			if (AAMjManager* OwnerMgr = Cast<AAMjManager>(GetOwner()))
 			{
-				bUseRealTimePacing = (OwnerMgr->StepMode == EStepMode::Live);
+				bUseRealTimePacing = !OwnerMgr->bPublishersPaused.load(std::memory_order_acquire);
 			}
 			if (bUseRealTimePacing)
 			{

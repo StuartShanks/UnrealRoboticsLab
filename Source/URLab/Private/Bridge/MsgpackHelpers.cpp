@@ -73,7 +73,8 @@ void PackJsonObjectInner(clmdep_msgpack::packer<Stream>& Packer,
 	Packer.pack_map(Obj->Values.Num());
 	for (const auto& Kv : Obj->Values)
 	{
-		const FString& Key = Kv.Key;
+		// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+		const FString Key(*Kv.Key);
 		// Special-case keys with kBinSuffix: emit real msgpack bin rather
 		// than the base64-as-string form the JSON tree carries.
 		if (Key.EndsWith(kBinSuffix, ESearchCase::CaseSensitive))

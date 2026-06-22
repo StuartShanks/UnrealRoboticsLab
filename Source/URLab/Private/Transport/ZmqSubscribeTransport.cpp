@@ -369,13 +369,15 @@ void UURLabZmqSubscribeTransport::PreStep(mjModel* m, mjData* d)
 					const TSharedPtr<FJsonObject>* JointObj = nullptr;
 					if (!Entry.Value->TryGetObject(JointObj) || !JointObj || !JointObj->IsValid())
 						continue;
+					// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+					const FString Key(*Entry.Key);
 					double V = 0.0;
 					if ((*JointObj)->TryGetNumberField(TEXT("kp"), V))
-						KpMap->SetNumberField(Entry.Key, V);
+						KpMap->SetNumberField(Key, V);
 					if ((*JointObj)->TryGetNumberField(TEXT("kv"), V))
-						KvMap->SetNumberField(Entry.Key, V);
+						KvMap->SetNumberField(Key, V);
 					if ((*JointObj)->TryGetNumberField(TEXT("torque_limit"), V))
-						TlMap->SetNumberField(Entry.Key, V);
+						TlMap->SetNumberField(Key, V);
 				}
 				if (KpMap->Values.Num() > 0)
 					Reshaped->SetObjectField(TEXT("kp"), KpMap);

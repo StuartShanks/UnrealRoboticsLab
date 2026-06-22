@@ -989,14 +989,17 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 				if (!Pair.Value->TryGetObject(ArtObj) || !ArtObj || !ArtObj->IsValid())
 					continue;
 
+				// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+				const FString Key(*Pair.Key);
+
 				FString CtlMode;
 				if ((*ArtObj)->TryGetStringField(TEXT("control_mode"), CtlMode))
-					TmpReq.PerArticulationControlMode.Add(Pair.Key, CtlMode);
+					TmpReq.PerArticulationControlMode.Add(Key, CtlMode);
 
 				const TArray<TSharedPtr<FJsonValue>>* CtrlList = nullptr;
 				if ((*ArtObj)->TryGetArrayField(TEXT("ctrl"), CtrlList) && CtrlList)
 				{
-					if (AMjArticulation* Art = Cast<AMjArticulation>(Mgr->GetArticulation(Pair.Key)))
+					if (AMjArticulation* Art = Cast<AMjArticulation>(Mgr->GetArticulation(Key)))
 					{
 						TArray<UMjActuator*> Acts = Art->GetActuators();
 						for (int32 i = 0; i < CtrlList->Num() && i < Acts.Num(); ++i)
@@ -1008,7 +1011,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 							FString Prefix = Art->GetName() + TEXT("_");
 							if (Local.StartsWith(Prefix))
 								Local = Local.Mid(Prefix.Len());
-							TmpReq.PerArticulationCtrl.FindOrAdd(Pair.Key).Add(
+							TmpReq.PerArticulationCtrl.FindOrAdd(Key).Add(
 								{Local, (float)(*CtrlList)[i]->AsNumber()});
 						}
 					}
@@ -1057,13 +1060,15 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 		{
 			for (const auto& Kv : (*CamObj)->Values)
 			{
+				// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+				const FString Key(*Kv.Key);
 				FString Mode;
 				if (Kv.Value.IsValid() && Kv.Value->TryGetString(Mode))
 				{
 					ECameraInclude E = ECameraInclude::Latest;
 					if (Mode.Equals(TEXT("sync"), ESearchCase::IgnoreCase))
 						E = ECameraInclude::Sync;
-					CameraSpec.Add(Kv.Key, E);
+					CameraSpec.Add(Key, E);
 				}
 			}
 		}
@@ -1188,18 +1193,21 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 			if (!Pair.Value->TryGetObject(ArtObj) || !ArtObj || !ArtObj->IsValid())
 				continue;
 
+			// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+			const FString Key(*Pair.Key);
+
 			// control_mode override
 			FString CtlMode;
 			if ((*ArtObj)->TryGetStringField(TEXT("control_mode"), CtlMode))
 			{
-				Cmd->Request.PerArticulationControlMode.Add(Pair.Key, CtlMode);
+				Cmd->Request.PerArticulationControlMode.Add(Key, CtlMode);
 			}
 
 			const TArray<TSharedPtr<FJsonValue>>* CtrlList = nullptr;
 			if ((*ArtObj)->TryGetArrayField(TEXT("ctrl"), CtrlList) && CtrlList)
 			{
 				// Positional ctrl array: indexed in articulation actuator order.
-				if (AMjArticulation* Art = Cast<AMjArticulation>(Mgr->GetArticulation(Pair.Key)))
+				if (AMjArticulation* Art = Cast<AMjArticulation>(Mgr->GetArticulation(Key)))
 				{
 					TArray<UMjActuator*> Acts = Art->GetActuators();
 					for (int32 i = 0; i < CtrlList->Num() && i < Acts.Num(); ++i)
@@ -1211,7 +1219,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 						FString Prefix = Art->GetName() + TEXT("_");
 						if (LocalName.StartsWith(Prefix))
 							LocalName = LocalName.Mid(Prefix.Len());
-						Cmd->Request.PerArticulationCtrl.FindOrAdd(Pair.Key).Add(
+						Cmd->Request.PerArticulationCtrl.FindOrAdd(Key).Add(
 							{LocalName, (float)(*CtrlList)[i]->AsNumber()});
 					}
 				}
@@ -1223,8 +1231,8 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 			{
 				for (auto& KV : (*CtrlMap)->Values)
 				{
-					Cmd->Request.PerArticulationCtrl.FindOrAdd(Pair.Key).Add(
-						{KV.Key, (float)KV.Value->AsNumber()});
+					Cmd->Request.PerArticulationCtrl.FindOrAdd(Key).Add(
+						{FString(*KV.Key), (float)KV.Value->AsNumber()});
 				}
 			}
 
@@ -1232,13 +1240,13 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleStep(const TSharedPtr<FJsonOb
 			const TSharedPtr<FJsonObject>* XfrcMap = nullptr;
 			if ((*ArtObj)->TryGetObjectField(TEXT("xfrc_applied"), XfrcMap) && XfrcMap && XfrcMap->IsValid())
 			{
-				TMap<FString, TArray<double>>& BodyMap = Cmd->Request.PerArticulationXfrc.FindOrAdd(Pair.Key);
+				TMap<FString, TArray<double>>& BodyMap = Cmd->Request.PerArticulationXfrc.FindOrAdd(Key);
 				for (auto& KV : (*XfrcMap)->Values)
 				{
 					const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
 					if (KV.Value->TryGetArray(Arr) && Arr && Arr->Num() == 6)
 					{
-						TArray<double>& Six = BodyMap.FindOrAdd(KV.Key);
+						TArray<double>& Six = BodyMap.FindOrAdd(FString(*KV.Key));
 						Six.SetNum(6);
 						for (int i = 0; i < 6; ++i)
 							Six[i] = (*Arr)[i]->AsNumber();
@@ -1824,7 +1832,8 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleReset(const TSharedPtr<FJsonO
 		{
 			for (auto& APair : (*PerArt)->Values)
 			{
-				AMjArticulation* Art = Mgr->GetArticulation(APair.Key);
+				// UE 5.8: FJsonObject keys are UE::FSharedString; materialize an FString.
+				AMjArticulation* Art = Mgr->GetArticulation(FString(*APair.Key));
 				if (!Art)
 					continue;
 				const TSharedPtr<FJsonObject>* QObj = nullptr;
@@ -1834,7 +1843,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleReset(const TSharedPtr<FJsonO
 				FString Prefix = Art->GetName() + TEXT("_");
 				for (auto& JPair : (*QObj)->Values)
 				{
-					FString FullName = Prefix + JPair.Key;
+					FString FullName = Prefix + FString(*JPair.Key);
 					int Jid = mj_name2id(m, mjOBJ_JOINT, TCHAR_TO_UTF8(*FullName));
 					if (Jid < 0)
 						Jid = mj_name2id(m, mjOBJ_JOINT, TCHAR_TO_UTF8(*JPair.Key));
