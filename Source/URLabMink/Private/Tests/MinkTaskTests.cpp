@@ -288,6 +288,10 @@ bool FMinkTaskFrameTest::RunTest(const FString& Parameters)
 		AddExpectedErrorPlain(TEXT("FMinkFrameTask position cost should be >= 0"));
 		TestFalse(TEXT("negative position cost => SetPositionCost false"), Task.SetPositionCost(NegativePositionCost));
 
+		const FMinkVec NegativeOrientationCost = FMinkVec::Constant(3, -1.0);
+		AddExpectedErrorPlain(TEXT("FMinkFrameTask position cost should be >= 0")); // parity: mink v1.2.0's orientation setter really says "position cost" (upstream copy-paste quirk)
+		TestFalse(TEXT("negative orientation cost => SetOrientationCost false"), Task.SetOrientationCost(NegativeOrientationCost));
+
 		mj_deleteModel(Model);
 	}
 
