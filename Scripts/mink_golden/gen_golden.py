@@ -227,11 +227,56 @@ def gen_qp():
     return {"cases": cases}
 
 
+def _valid_q(rng, model):
+    q = model.qpos0.copy() + 0.3 * rng.standard_normal(model.nq)
+    for jnt in range(model.njnt):
+        t, adr = model.jnt_type[jnt], model.jnt_qposadr[jnt]
+        if t == mujoco.mjtJoint.mjJNT_FREE:
+            q[adr + 3 : adr + 7] /= np.linalg.norm(q[adr + 3 : adr + 7])
+        elif t == mujoco.mjtJoint.mjJNT_BALL:
+            q[adr : adr + 4] /= np.linalg.norm(q[adr : adr + 4])
+    return q
+
+
+def _task_case(cfg, task):
+    err = task.compute_error(cfg)
+    jac = task.compute_jacobian(cfg)
+    H, c = task.compute_qp_objective(cfg)
+    res = task.compute_qp_residual(cfg)
+    out = {"error": j(err), "jacobian": j(jac), "H": j(H), "c": j(c)}
+    if res is not None:
+        wj, we, mu = res
+        out["residual"] = {"wjac": j(wj), "werr": j(we), "mu": j(mu)}
+    return out
+
+
+def gen_task_posture():
+    rng = np.random.default_rng(20260705)
+    out = {"models": {}}
+    for model_name in ("arm3", "floating"):
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for cost, gain, lm in [(1.0, 1.0, 0.0), (0.5, 0.7, 0.1), ("vector", 1.0, 0.05)]:
+            cost_vec = (np.abs(rng.standard_normal(model.nv)) if cost == "vector"
+                        else np.array([cost]))
+            task = mink.PostureTask(model, cost=cost_vec, gain=gain, lm_damping=lm)
+            target = _valid_q(rng, model)
+            task.set_target(target)
+            q = _valid_q(rng, model)
+            cfg.update(q=q)
+            cases.append({"q": j(q), "cost": j(cost_vec), "gain": gain, "lm": lm,
+                          "target_q": j(target), **_task_case(cfg, task)})
+        out["models"][model_name] = cases
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
     "utils": gen_utils,
     "qp": gen_qp,
+    "task_posture": gen_task_posture,
     # Later tasks register: task_*, limit_*, solve_ik
 }
 
