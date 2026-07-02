@@ -27,6 +27,7 @@
 #include "Tasks/MinkComTask.h"
 #include "Tasks/MinkDampingTask.h"
 #include "Tasks/MinkDofFreezingTask.h"
+#include "Tasks/MinkEqualityConstraintTask.h"
 #include "Tasks/MinkFrameTask.h"
 #include "Tasks/MinkKineticEnergyRegularizationTask.h"
 #include "Tasks/MinkPostureTask.h"
@@ -889,6 +890,143 @@ bool FMinkTaskKineticEnergyTest::RunTest(const FString& Parameters)
 		FMinkObjective Objective;
 		AddExpectedErrorPlain(TEXT("No integration timestep set for FMinkKineticEnergyRegularizationTask"));
 		TestFalse(TEXT("unset dt => ComputeQpObjective false"), Task.ComputeQpObjective(Cfg, Objective));
+
+		mj_deleteModel(Model);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkTaskEqualityTest,
+	"URLab.Mink.Tasks.Equality",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMinkTaskEqualityTest::RunTest(const FString& Parameters)
+{
+	TSharedPtr<FJsonObject> Root;
+	if (!MinkLoadFixture(TEXT("task_equality"), Root))
+	{
+		AddError(TEXT("task_equality.json missing — run gen_golden.py"));
+		return false;
+	}
+	const TSharedPtr<FJsonObject> Models = Root->GetObjectField(TEXT("models"));
+
+	static const TArray<FString> ModelNames = {TEXT("equality")};
+	for (const FString& ModelName : ModelNames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>& Cases = Models->GetArrayField(ModelName);
+		TestTrue(FString::Printf(TEXT("%s cases non-empty"), *ModelName), Cases.Num() > 0);
+		if (Cases.Num() == 0)
+		{
+			continue;
+		}
+
+		mjModel* Model = MinkLoadModel(ModelName + TEXT(".xml"));
+		if (Model == nullptr)
+		{
+			AddError(FString::Printf(TEXT("failed to load model '%s'"), *ModelName));
+			continue;
+		}
+
+		{
+			FMinkConfiguration Cfg(Model);
+
+			for (const TSharedPtr<FJsonValue>& CaseVal : Cases)
+			{
+				const TSharedPtr<FJsonObject> Case = CaseVal->AsObject();
+
+				TArray<FString> EqualityNames;
+				for (const TSharedPtr<FJsonValue>& V : Case->GetArrayField(TEXT("equality_names")))
+				{
+					EqualityNames.Add(V->AsString());
+				}
+				const FMinkVec CostVec = MinkJsonVec(Case->GetArrayField(TEXT("cost")));
+				const FMinkVec Q = MinkJsonVec(Case->GetArrayField(TEXT("q")));
+
+				FMinkEqualityConstraintTask Task(Model, CostVec, EqualityNames);
+				if (!TestTrue(TEXT("task.bIsValid"), Task.bIsValid))
+				{
+					continue;
+				}
+				Cfg.Update(Q.data());
+
+				FMinkVec Error;
+				if (TestTrue(TEXT("ComputeError"), Task.ComputeError(Cfg, Error)))
+				{
+					TestTrue(TEXT("error non-empty"), Error.size() > 0);
+					MinkExpectNear(*this, TEXT("error"), Error, MinkJsonVec(Case->GetArrayField(TEXT("error"))),
+						TOL_OBJ);
+				}
+
+				FMinkMat Jacobian;
+				if (TestTrue(TEXT("ComputeJacobian"), Task.ComputeJacobian(Cfg, Jacobian)))
+				{
+					TestTrue(TEXT("jacobian non-empty"), Jacobian.rows() > 0 && Jacobian.cols() > 0);
+					MinkExpectNear(*this, TEXT("jacobian"), Jacobian,
+						MinkJsonMat(Case->GetArrayField(TEXT("jacobian"))), TOL_OBJ);
+				}
+
+				FMinkObjective Objective;
+				if (TestTrue(TEXT("ComputeQpObjective"), Task.ComputeQpObjective(Cfg, Objective)))
+				{
+					TestTrue(TEXT("H non-empty"), Objective.H.rows() > 0 && Objective.H.cols() > 0);
+					TestTrue(TEXT("c non-empty"), Objective.C.size() > 0);
+					MinkExpectNear(*this, TEXT("H"), Objective.H, MinkJsonMat(Case->GetArrayField(TEXT("H"))),
+						TOL_OBJ);
+					MinkExpectNear(*this, TEXT("c"), Objective.C, MinkJsonVec(Case->GetArrayField(TEXT("c"))),
+						TOL_OBJ);
+				}
+
+				FMinkResidual Residual;
+				if (TestTrue(TEXT("ComputeQpResidual == Ok"),
+						Task.ComputeQpResidual(Cfg, Residual) == EMinkTaskStatus::Ok))
+				{
+					const TSharedPtr<FJsonObject> ResidualJson = Case->GetObjectField(TEXT("residual"));
+					TestTrue(TEXT("residual non-empty"), Residual.WeightedError.size() > 0);
+					MinkExpectNear(*this, TEXT("residual.wjac"), Residual.WeightedJacobian,
+						MinkJsonMat(ResidualJson->GetArrayField(TEXT("wjac"))), TOL_OBJ);
+					MinkExpectNear(*this, TEXT("residual.werr"), Residual.WeightedError,
+						MinkJsonVec(ResidualJson->GetArrayField(TEXT("werr"))), TOL_OBJ);
+
+					const double ExpectedMu = ResidualJson->GetNumberField(TEXT("mu"));
+					FMinkMat ActualMuMat(1, 1);
+					ActualMuMat(0, 0) = Residual.Mu;
+					FMinkMat ExpectedMuMat(1, 1);
+					ExpectedMuMat(0, 0) = ExpectedMu;
+					MinkExpectNear(*this, TEXT("residual.mu"), ActualMuMat, ExpectedMuMat, TOL_OBJ);
+				}
+			}
+		}
+
+		mj_deleteModel(Model);
+	}
+
+	// Ctor validation: unknown name / out-of-range id / duplicate ids all => bIsValid false.
+	{
+		mjModel* Model = MinkLoadModel(TEXT("equality.xml"));
+		if (Model == nullptr)
+		{
+			AddError(TEXT("failed to load model 'equality'"));
+			return false;
+		}
+
+		FMinkVec Cost(1);
+		Cost(0) = 1.0;
+
+		TArray<FString> UnknownName = {TEXT("no_such_eq")};
+		AddExpectedErrorPlain(TEXT("Equality constraint 'no_such_eq' not found."));
+		FMinkEqualityConstraintTask UnknownNameTask(Model, Cost, UnknownName);
+		TestFalse(TEXT("unknown name => bIsValid false"), UnknownNameTask.bIsValid);
+
+		TArray<int32> OutOfRangeIds = {(int32)Model->neq};
+		AddExpectedErrorPlain(TEXT("out of range"));
+		FMinkEqualityConstraintTask OutOfRangeTask(Model, Cost, {}, OutOfRangeIds);
+		TestFalse(TEXT("out-of-range id => bIsValid false"), OutOfRangeTask.bIsValid);
+
+		TArray<int32> DuplicateIds = {0, 0};
+		AddExpectedErrorPlain(TEXT("Duplicate equality constraint IDs provided"));
+		FMinkEqualityConstraintTask DuplicateTask(Model, Cost, {}, DuplicateIds);
+		TestFalse(TEXT("duplicate ids => bIsValid false"), DuplicateTask.bIsValid);
 
 		mj_deleteModel(Model);
 	}

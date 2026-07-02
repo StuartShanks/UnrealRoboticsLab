@@ -82,7 +82,10 @@ public:
 	FMinkTask(const FMinkVec& InCost, double InGain, double InLmDamping);
 
 	bool bIsValid = true;
-	FMinkVec Cost;
+	// mutable: FMinkEqualityConstraintTask mutates this per-configuration inside its const
+	// ComputeError/ComputeJacobian (mirrors python EqualityConstraintTask._update_active_constraints
+	// setting self.cost from what is conceptually a read-only compute call).
+	mutable FMinkVec Cost;
 	double Gain = 1.0;
 	double LmDamping = 0.0;
 

@@ -1,0 +1,21 @@
+<mujoco model="equality">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="a" pos="0 0 0.5">
+      <joint name="ja" type="hinge" axis="0 1 0" range="-3 3" limited="true"/>
+      <geom name="ga" type="capsule" fromto="0 0 0 0.3 0 0" size="0.03"/>
+      <body name="b" pos="0.3 0 0">
+        <joint name="jb" type="hinge" axis="0 1 0" range="-3 3" limited="true"/>
+        <geom name="gb" type="capsule" fromto="0 0 0 0.3 0 0" size="0.03"/>
+      </body>
+    </body>
+    <body name="c" pos="0.6 0 0.5">
+      <joint name="jc" type="hinge" axis="0 1 0" range="-3 3" limited="true"/>
+      <geom name="gc" type="capsule" fromto="0 0 0 0.2 0 0" size="0.03"/>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="eq_connect" body1="b" body2="c" anchor="0.3 0 0"/>
+    <joint name="eq_joint" joint1="ja" joint2="jc" polycoef="0 1 0 0 0"/>
+  </equality>
+</mujoco>

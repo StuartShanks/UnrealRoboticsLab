@@ -472,6 +472,35 @@ def gen_task_kinetic_energy():
     return out
 
 
+def gen_task_equality():
+    rng = np.random.default_rng(20260712)
+    out = {"models": {}}
+    model = load_model("equality")
+    cfg = mink.Configuration(model)
+    # (equality_names, cost)
+    variants = [
+        ([], [1.0]),
+        (["eq_connect"], [1.0]),
+        ([], [1.0, 0.5]),
+    ]
+    cases = []
+    for equality_names, cost in variants:
+        cost_vec = np.array(cost)
+        task = mink.EqualityConstraintTask(
+            model, cost=cost_vec,
+            equalities=(equality_names or None),
+        )
+        for _ in range(3):
+            q = _valid_q(rng, model)
+            cfg.update(q=q)
+            cases.append({
+                "q": j(q), "equality_names": equality_names, "cost": j(cost_vec),
+                **_task_case(cfg, task),
+            })
+    out["models"]["equality"] = cases
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
@@ -484,6 +513,7 @@ LAYERS = {
     "task_damping": gen_task_damping,
     "task_dof_freezing": gen_task_dof_freezing,
     "task_kinetic_energy": gen_task_kinetic_energy,
+    "task_equality": gen_task_equality,
     # Later tasks register: limit_*, solve_ik
 }
 
