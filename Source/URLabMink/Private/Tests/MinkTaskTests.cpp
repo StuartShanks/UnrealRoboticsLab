@@ -25,7 +25,10 @@
 #include "MinkConfiguration.h"
 #include "MinkTestUtils.h"
 #include "Tasks/MinkComTask.h"
+#include "Tasks/MinkDampingTask.h"
+#include "Tasks/MinkDofFreezingTask.h"
 #include "Tasks/MinkFrameTask.h"
+#include "Tasks/MinkKineticEnergyRegularizationTask.h"
 #include "Tasks/MinkPostureTask.h"
 #include "Tasks/MinkRelativeFrameTask.h"
 
@@ -565,6 +568,323 @@ bool FMinkTaskComTest::RunTest(const FString& Parameters)
 		const FMinkVec NegativeCost = FMinkVec::Constant(3, -1.0);
 		AddExpectedErrorPlain(TEXT("FMinkComTask cost must be >= 0"));
 		TestFalse(TEXT("negative cost => SetCost false"), Task.SetCost(NegativeCost));
+
+		mj_deleteModel(Model);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkTaskDampingTest,
+	"URLab.Mink.Tasks.Damping",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMinkTaskDampingTest::RunTest(const FString& Parameters)
+{
+	TSharedPtr<FJsonObject> Root;
+	if (!MinkLoadFixture(TEXT("task_damping"), Root))
+	{
+		AddError(TEXT("task_damping.json missing — run gen_golden.py"));
+		return false;
+	}
+	const TSharedPtr<FJsonObject> Models = Root->GetObjectField(TEXT("models"));
+
+	static const TArray<FString> ModelNames = {TEXT("arm3"), TEXT("floating")};
+	for (const FString& ModelName : ModelNames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>& Cases = Models->GetArrayField(ModelName);
+		TestTrue(FString::Printf(TEXT("%s cases non-empty"), *ModelName), Cases.Num() > 0);
+		if (Cases.Num() == 0)
+		{
+			continue;
+		}
+
+		mjModel* Model = MinkLoadModel(ModelName + TEXT(".xml"));
+		if (Model == nullptr)
+		{
+			AddError(FString::Printf(TEXT("failed to load model '%s'"), *ModelName));
+			continue;
+		}
+
+		{
+			FMinkConfiguration Cfg(Model);
+
+			for (const TSharedPtr<FJsonValue>& CaseVal : Cases)
+			{
+				const TSharedPtr<FJsonObject> Case = CaseVal->AsObject();
+
+				const FMinkVec CostVec = MinkJsonVec(Case->GetArrayField(TEXT("cost")));
+				const FMinkVec Q = MinkJsonVec(Case->GetArrayField(TEXT("q")));
+
+				FMinkDampingTask Task(Model, CostVec);
+				if (!TestTrue(TEXT("task.bIsValid"), Task.bIsValid))
+				{
+					continue;
+				}
+				Cfg.Update(Q.data());
+
+				FMinkVec Error;
+				if (TestTrue(TEXT("ComputeError"), Task.ComputeError(Cfg, Error)))
+				{
+					MinkExpectNear(*this, TEXT("error"), Error, MinkJsonVec(Case->GetArrayField(TEXT("error"))),
+						TOL_OBJ);
+				}
+
+				FMinkMat Jacobian;
+				if (TestTrue(TEXT("ComputeJacobian"), Task.ComputeJacobian(Cfg, Jacobian)))
+				{
+					MinkExpectNear(*this, TEXT("jacobian"), Jacobian,
+						MinkJsonMat(Case->GetArrayField(TEXT("jacobian"))), TOL_OBJ);
+				}
+
+				FMinkObjective Objective;
+				if (TestTrue(TEXT("ComputeQpObjective"), Task.ComputeQpObjective(Cfg, Objective)))
+				{
+					MinkExpectNear(*this, TEXT("H"), Objective.H, MinkJsonMat(Case->GetArrayField(TEXT("H"))),
+						TOL_OBJ);
+					MinkExpectNear(*this, TEXT("c"), Objective.C, MinkJsonVec(Case->GetArrayField(TEXT("c"))),
+						TOL_OBJ);
+				}
+
+				FMinkResidual Residual;
+				if (TestTrue(TEXT("ComputeQpResidual == Ok"),
+						Task.ComputeQpResidual(Cfg, Residual) == EMinkTaskStatus::Ok))
+				{
+					const TSharedPtr<FJsonObject> ResidualJson = Case->GetObjectField(TEXT("residual"));
+					MinkExpectNear(*this, TEXT("residual.wjac"), Residual.WeightedJacobian,
+						MinkJsonMat(ResidualJson->GetArrayField(TEXT("wjac"))), TOL_OBJ);
+					MinkExpectNear(*this, TEXT("residual.werr"), Residual.WeightedError,
+						MinkJsonVec(ResidualJson->GetArrayField(TEXT("werr"))), TOL_OBJ);
+
+					const double ExpectedMu = ResidualJson->GetNumberField(TEXT("mu"));
+					FMinkMat ActualMuMat(1, 1);
+					ActualMuMat(0, 0) = Residual.Mu;
+					FMinkMat ExpectedMuMat(1, 1);
+					ExpectedMuMat(0, 0) = ExpectedMu;
+					MinkExpectNear(*this, TEXT("residual.mu"), ActualMuMat, ExpectedMuMat, TOL_OBJ);
+				}
+			}
+		}
+
+		mj_deleteModel(Model);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkTaskDofFreezingTest,
+	"URLab.Mink.Tasks.DofFreezing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMinkTaskDofFreezingTest::RunTest(const FString& Parameters)
+{
+	TSharedPtr<FJsonObject> Root;
+	if (!MinkLoadFixture(TEXT("task_dof_freezing"), Root))
+	{
+		AddError(TEXT("task_dof_freezing.json missing — run gen_golden.py"));
+		return false;
+	}
+	const TSharedPtr<FJsonObject> Models = Root->GetObjectField(TEXT("models"));
+
+	static const TArray<FString> ModelNames = {TEXT("arm3"), TEXT("floating")};
+	for (const FString& ModelName : ModelNames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>& Cases = Models->GetArrayField(ModelName);
+		TestTrue(FString::Printf(TEXT("%s cases non-empty"), *ModelName), Cases.Num() > 0);
+		if (Cases.Num() == 0)
+		{
+			continue;
+		}
+
+		mjModel* Model = MinkLoadModel(ModelName + TEXT(".xml"));
+		if (Model == nullptr)
+		{
+			AddError(FString::Printf(TEXT("failed to load model '%s'"), *ModelName));
+			continue;
+		}
+
+		{
+			FMinkConfiguration Cfg(Model);
+
+			for (const TSharedPtr<FJsonValue>& CaseVal : Cases)
+			{
+				const TSharedPtr<FJsonObject> Case = CaseVal->AsObject();
+
+				TArray<int32> DofIndices;
+				for (const TSharedPtr<FJsonValue>& V : Case->GetArrayField(TEXT("dof_indices")))
+				{
+					DofIndices.Add((int32)V->AsNumber());
+				}
+				const double Gain = Case->GetNumberField(TEXT("gain"));
+				const FMinkVec Q = MinkJsonVec(Case->GetArrayField(TEXT("q")));
+
+				FMinkDofFreezingTask Task(Model, DofIndices, Gain);
+				if (!TestTrue(TEXT("task.bIsValid"), Task.bIsValid))
+				{
+					continue;
+				}
+				Cfg.Update(Q.data());
+
+				FMinkVec Error;
+				if (TestTrue(TEXT("ComputeError"), Task.ComputeError(Cfg, Error)))
+				{
+					MinkExpectNear(*this, TEXT("error"), Error, MinkJsonVec(Case->GetArrayField(TEXT("error"))),
+						TOL_OBJ);
+				}
+
+				FMinkMat Jacobian;
+				if (TestTrue(TEXT("ComputeJacobian"), Task.ComputeJacobian(Cfg, Jacobian)))
+				{
+					MinkExpectNear(*this, TEXT("jacobian"), Jacobian,
+						MinkJsonMat(Case->GetArrayField(TEXT("jacobian"))), TOL_OBJ);
+				}
+
+				FMinkObjective Objective;
+				if (TestTrue(TEXT("ComputeQpObjective"), Task.ComputeQpObjective(Cfg, Objective)))
+				{
+					MinkExpectNear(*this, TEXT("H"), Objective.H, MinkJsonMat(Case->GetArrayField(TEXT("H"))),
+						TOL_OBJ);
+					MinkExpectNear(*this, TEXT("c"), Objective.C, MinkJsonVec(Case->GetArrayField(TEXT("c"))),
+						TOL_OBJ);
+				}
+
+				FMinkResidual Residual;
+				if (TestTrue(TEXT("ComputeQpResidual == Ok"),
+						Task.ComputeQpResidual(Cfg, Residual) == EMinkTaskStatus::Ok))
+				{
+					const TSharedPtr<FJsonObject> ResidualJson = Case->GetObjectField(TEXT("residual"));
+					MinkExpectNear(*this, TEXT("residual.wjac"), Residual.WeightedJacobian,
+						MinkJsonMat(ResidualJson->GetArrayField(TEXT("wjac"))), TOL_OBJ);
+					MinkExpectNear(*this, TEXT("residual.werr"), Residual.WeightedError,
+						MinkJsonVec(ResidualJson->GetArrayField(TEXT("werr"))), TOL_OBJ);
+
+					const double ExpectedMu = ResidualJson->GetNumberField(TEXT("mu"));
+					FMinkMat ActualMuMat(1, 1);
+					ActualMuMat(0, 0) = Residual.Mu;
+					FMinkMat ExpectedMuMat(1, 1);
+					ExpectedMuMat(0, 0) = ExpectedMu;
+					MinkExpectNear(*this, TEXT("residual.mu"), ActualMuMat, ExpectedMuMat, TOL_OBJ);
+				}
+			}
+		}
+
+		mj_deleteModel(Model);
+	}
+
+	// Validation: duplicate indices and out-of-range indices both => bIsValid false.
+	{
+		mjModel* Model = MinkLoadModel(TEXT("arm3.xml"));
+		if (Model == nullptr)
+		{
+			AddError(TEXT("failed to load model 'arm3'"));
+			return false;
+		}
+
+		TArray<int32> EmptyIndices;
+		AddExpectedErrorPlain(TEXT("FMinkDofFreezingTask requires at least one DOF index."));
+		FMinkDofFreezingTask EmptyTask(Model, EmptyIndices);
+		TestFalse(TEXT("empty indices => bIsValid false"), EmptyTask.bIsValid);
+
+		TArray<int32> OutOfRangeIndices = {0, Model->nv};
+		AddExpectedErrorPlain(TEXT("is out of range"));
+		FMinkDofFreezingTask OutOfRangeTask(Model, OutOfRangeIndices);
+		TestFalse(TEXT("out-of-range index => bIsValid false"), OutOfRangeTask.bIsValid);
+
+		TArray<int32> DuplicateIndices = {0, 1, 0};
+		AddExpectedErrorPlain(TEXT("Duplicate DOF indices found"));
+		FMinkDofFreezingTask DuplicateTask(Model, DuplicateIndices);
+		TestFalse(TEXT("duplicate indices => bIsValid false"), DuplicateTask.bIsValid);
+
+		mj_deleteModel(Model);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkTaskKineticEnergyTest,
+	"URLab.Mink.Tasks.KineticEnergy",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMinkTaskKineticEnergyTest::RunTest(const FString& Parameters)
+{
+	TSharedPtr<FJsonObject> Root;
+	if (!MinkLoadFixture(TEXT("task_kinetic_energy"), Root))
+	{
+		AddError(TEXT("task_kinetic_energy.json missing — run gen_golden.py"));
+		return false;
+	}
+	const TSharedPtr<FJsonObject> Models = Root->GetObjectField(TEXT("models"));
+
+	static const TArray<FString> ModelNames = {TEXT("arm3"), TEXT("floating")};
+	for (const FString& ModelName : ModelNames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>& Cases = Models->GetArrayField(ModelName);
+		TestTrue(FString::Printf(TEXT("%s cases non-empty"), *ModelName), Cases.Num() > 0);
+		if (Cases.Num() == 0)
+		{
+			continue;
+		}
+
+		mjModel* Model = MinkLoadModel(ModelName + TEXT(".xml"));
+		if (Model == nullptr)
+		{
+			AddError(FString::Printf(TEXT("failed to load model '%s'"), *ModelName));
+			continue;
+		}
+
+		{
+			FMinkConfiguration Cfg(Model);
+
+			for (const TSharedPtr<FJsonValue>& CaseVal : Cases)
+			{
+				const TSharedPtr<FJsonObject> Case = CaseVal->AsObject();
+
+				const double Cost = Case->GetNumberField(TEXT("cost"));
+				const double Dt = Case->GetNumberField(TEXT("dt"));
+				const FMinkVec Q = MinkJsonVec(Case->GetArrayField(TEXT("q")));
+
+				FMinkKineticEnergyRegularizationTask Task(Cost);
+				if (!TestTrue(TEXT("task.bIsValid"), Task.bIsValid))
+				{
+					continue;
+				}
+				Task.SetDt(Dt);
+				Cfg.Update(Q.data());
+
+				FMinkObjective Objective;
+				if (TestTrue(TEXT("ComputeQpObjective"), Task.ComputeQpObjective(Cfg, Objective)))
+				{
+					MinkExpectNear(*this, TEXT("H"), Objective.H, MinkJsonMat(Case->GetArrayField(TEXT("H"))),
+						TOL_OBJ);
+					MinkExpectNear(*this, TEXT("c"), Objective.C, MinkJsonVec(Case->GetArrayField(TEXT("c"))),
+						TOL_OBJ);
+				}
+			}
+		}
+
+		mj_deleteModel(Model);
+	}
+
+	// Validation: negative cost => bIsValid false; unset dt => ComputeQpObjective false.
+	{
+		mjModel* Model = MinkLoadModel(TEXT("arm3.xml"));
+		if (Model == nullptr)
+		{
+			AddError(TEXT("failed to load model 'arm3'"));
+			return false;
+		}
+
+		AddExpectedErrorPlain(TEXT("FMinkKineticEnergyRegularizationTask cost should be >= 0"));
+		FMinkKineticEnergyRegularizationTask InvalidTask(-1.0);
+		TestFalse(TEXT("negative cost => bIsValid false"), InvalidTask.bIsValid);
+
+		FMinkKineticEnergyRegularizationTask Task(1e-4);
+		TestTrue(TEXT("Task.bIsValid"), Task.bIsValid);
+
+		FMinkConfiguration Cfg(Model);
+		FMinkObjective Objective;
+		AddExpectedErrorPlain(TEXT("No integration timestep set for FMinkKineticEnergyRegularizationTask"));
+		TestFalse(TEXT("unset dt => ComputeQpObjective false"), Task.ComputeQpObjective(Cfg, Objective));
 
 		mj_deleteModel(Model);
 	}
