@@ -200,11 +200,39 @@ def gen_utils():
     return out
 
 
+def gen_qp():
+    """Random strictly-convex QPs solved by the SAME backend family mink uses
+    on the Python side (Goldfarb-Idnani via `quadprog`)."""
+    import qpsolvers
+
+    rng = np.random.default_rng(20260704)
+    cases = []
+    for n, n_ineq, n_eq in [(3, 0, 0), (5, 4, 0), (6, 8, 2), (9, 12, 3), (9, 0, 2)]:
+        R = rng.standard_normal((n, n))
+        H = R.T @ R + 1e-6 * np.eye(n)
+        c = rng.standard_normal(n)
+        G = rng.standard_normal((n_ineq, n)) if n_ineq else None
+        h = (np.abs(rng.standard_normal(n_ineq)) + 0.1) if n_ineq else None
+        A = rng.standard_normal((n_eq, n)) if n_eq else None
+        b = 0.1 * rng.standard_normal(n_eq) if n_eq else None
+        x = qpsolvers.solve_qp(H, c, G, h, A, b, solver="quadprog")
+        assert x is not None
+        # NOTE: the inequality bound is stored as "h_ineq", not "h" — Unreal's FJsonObject is
+        # keyed by FString, whose GetTypeHash/operator== are case-insensitive, so a sibling "h"
+        # field would collide with "H" (the Hessian) and silently clobber it on the C++ side.
+        cases.append({"H": j(H), "c": j(c), "G": j(G) if G is not None else None,
+                      "h_ineq": j(h) if h is not None else None,
+                      "A": j(A) if A is not None else None,
+                      "b": j(b) if b is not None else None, "x": j(x)})
+    return {"cases": cases}
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
     "utils": gen_utils,
-    # Later tasks register: qp, task_*, limit_*, solve_ik
+    "qp": gen_qp,
+    # Later tasks register: task_*, limit_*, solve_ik
 }
 
 
