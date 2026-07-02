@@ -416,6 +416,62 @@ def gen_task_com():
     return out
 
 
+def gen_task_damping():
+    rng = np.random.default_rng(20260709)
+    out = {"models": {}}
+    for model_name in ("arm3", "floating"):
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for cost in (1.0, "vector"):
+            cost_vec = (np.abs(rng.standard_normal(model.nv)) if cost == "vector"
+                        else np.array([cost]))
+            task = mink.DampingTask(model, cost_vec)
+            q = _valid_q(rng, model)
+            cfg.update(q=q)
+            cases.append({"q": j(q), "cost": j(cost_vec), **_task_case(cfg, task)})
+        out["models"][model_name] = cases
+    return out
+
+
+def gen_task_dof_freezing():
+    rng = np.random.default_rng(20260710)
+    out = {"models": {}}
+    dof_indices_by_model = {"arm3": [0, 2], "floating": [0, 1, 7]}
+    for model_name, dof_indices in dof_indices_by_model.items():
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for gain in (1.0, 0.6):
+            task = mink.DofFreezingTask(model, dof_indices=dof_indices, gain=gain)
+            q = _valid_q(rng, model)
+            cfg.update(q=q)
+            cases.append({
+                "q": j(q), "dof_indices": dof_indices, "gain": gain,
+                **_task_case(cfg, task),
+            })
+        out["models"][model_name] = cases
+    return out
+
+
+def gen_task_kinetic_energy():
+    rng = np.random.default_rng(20260711)
+    out = {"models": {}}
+    for model_name in ("arm3", "floating"):
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        task = mink.KineticEnergyRegularizationTask(cost=1e-4)
+        task.set_dt(0.02)
+        cases = []
+        for _ in range(2):
+            q = _valid_q(rng, model)
+            cfg.update(q=q)
+            H, c = task.compute_qp_objective(cfg)
+            cases.append({"q": j(q), "cost": 1e-4, "dt": 0.02, "H": j(H), "c": j(c)})
+        out["models"][model_name] = cases
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
@@ -425,7 +481,10 @@ LAYERS = {
     "task_frame": gen_task_frame,
     "task_relative_frame": gen_task_relative_frame,
     "task_com": gen_task_com,
-    # Later tasks register: task_*, limit_*, solve_ik
+    "task_damping": gen_task_damping,
+    "task_dof_freezing": gen_task_dof_freezing,
+    "task_kinetic_energy": gen_task_kinetic_energy,
+    # Later tasks register: limit_*, solve_ik
 }
 
 
