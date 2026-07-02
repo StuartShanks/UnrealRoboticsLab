@@ -128,9 +128,83 @@ def gen_lie():
     return {"so3": so3, "se3": se3}
 
 
+def gen_configuration():
+    rng = np.random.default_rng(20260703)
+    result = {"models": {}}
+    frames = {
+        "arm3": [("ee", "site"), ("link2", "body"), ("g3", "geom")],
+        "floating": [("tip", "site"), ("head", "body"), ("gb", "geom")],
+    }
+    for model_name, frame_list in frames.items():
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for i in range(4):
+            q = model.qpos0.copy() + 0.3 * rng.standard_normal(model.nq)
+            # Normalize free/ball quats so q is a valid configuration.
+            for jnt in range(model.njnt):
+                t, adr = model.jnt_type[jnt], model.jnt_qposadr[jnt]
+                if t == mujoco.mjtJoint.mjJNT_FREE:
+                    q[adr + 3 : adr + 7] /= np.linalg.norm(q[adr + 3 : adr + 7])
+                elif t == mujoco.mjtJoint.mjJNT_BALL:
+                    q[adr : adr + 4] /= np.linalg.norm(q[adr : adr + 4])
+            cfg.update(q=q)
+            v = rng.standard_normal(model.nv)
+            case = {
+                "q": j(q),
+                "frames": [
+                    {"name": n, "type": t,
+                     "jac": j(cfg.get_frame_jacobian(n, t)),
+                     "pose": j(cfg.get_transform_frame_to_world(n, t).wxyz_xyz)}
+                    for n, t in frame_list
+                ],
+                "transform": {
+                    "src": frame_list[0][0], "src_type": frame_list[0][1],
+                    "dst": frame_list[1][0], "dst_type": frame_list[1][1],
+                    "pose": j(cfg.get_transform(frame_list[0][0], frame_list[0][1],
+                                                frame_list[1][0], frame_list[1][1]).wxyz_xyz)},
+                "integrate": {"v": j(v), "dt": 0.02, "q_out": j(cfg.integrate(v, 0.02))},
+                "inertia": j(cfg.get_inertia_matrix()),
+            }
+            cases.append(case)
+        entry = {"cases": cases}
+        if model.nkey:
+            cfg.update_from_keyframe("home")
+            entry["keyframe"] = {"name": "home", "q": j(cfg.q)}
+        result["models"][model_name] = entry
+    return result
+
+
+def gen_utils():
+    out = {"models": {}}
+    for model_name in ("arm3", "floating"):
+        model = load_model(model_name)
+        q_ids, v_ids = mink.get_freejoint_dims(model)
+        entry = {
+            "freejoint_q_ids": q_ids, "freejoint_v_ids": v_ids,
+            "subtree": [
+                {"body": model.body(bid).name,
+                 "body_ids": mink.get_subtree_body_ids(model, bid),
+                 "geom_ids": mink.get_subtree_geom_ids(model, bid),
+                 "joint_ids": mink.get_subtree_joint_ids(model, bid)}
+                for bid in range(model.nbody)
+            ],
+        }
+        if model_name == "floating":
+            data = mujoco.MjData(model)
+            mujoco.mj_kinematics(model, data)
+            mink.move_mocap_to_frame(model, data, "mocap_target", "tip", "site")
+            entry["move_mocap"] = {"mocap": "mocap_target", "frame": "tip", "type": "site",
+                                   "pos": j(data.mocap_pos[0]), "quat": j(data.mocap_quat[0])}
+        out["models"][model_name] = entry
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
-    # Later tasks register: configuration, utils, qp, task_*, limit_*, solve_ik
+    "configuration": gen_configuration,
+    "utils": gen_utils,
+    # Later tasks register: qp, task_*, limit_*, solve_ik
 }
 
 
