@@ -16,6 +16,11 @@
 	"Installed": true,
 	"Modules": [
 		{
+			"Name": "URLabMink",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "URLab",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
