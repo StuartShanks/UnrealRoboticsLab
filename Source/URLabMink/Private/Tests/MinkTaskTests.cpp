@@ -859,6 +859,10 @@ bool FMinkTaskKineticEnergyTest::RunTest(const FString& Parameters)
 					MinkExpectNear(*this, TEXT("c"), Objective.C, MinkJsonVec(Case->GetArrayField(TEXT("c"))),
 						TOL_OBJ);
 				}
+
+				FMinkResidual Residual;
+				TestTrue(TEXT("KE task inherits dense fallback (NoResidualForm)"),
+					Task.ComputeQpResidual(Cfg, Residual) == EMinkTaskStatus::NoResidualForm);
 			}
 		}
 
