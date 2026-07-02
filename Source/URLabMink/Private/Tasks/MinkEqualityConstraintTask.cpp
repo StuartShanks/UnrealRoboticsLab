@@ -159,7 +159,7 @@ bool FMinkEqualityConstraintTask::SetCost(const FMinkVec& NewCost)
 	return true;
 }
 
-void FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfiguration& Configuration) const
+bool FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfiguration& Configuration) const
 {
 	const mjData* Data = Configuration.Data;
 
@@ -169,10 +169,20 @@ void FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfigurati
 	{
 		if (Data->efc_type[Row] == mjCNSTR_EQUALITY && EqIds.Contains(Data->efc_id[Row]))
 		{
+			const int32 EqId = Data->efc_id[Row];
+			// Upstream mink v1.2.0 raises IndexError here (cost indexed by raw eq id);
+			// we convert to a controlled failure per the port's error model.
+			const int32 IdIndex = EqIds.Find(EqId);
+			if (IdIndex >= CostPerEq.size())
+			{
+				UE_LOG(LogURLabMink, Error,
+					TEXT("[FMinkEqualityConstraintTask] equality id %d exceeds cost table size %d (upstream mink indexes cost by raw eq id — non-prefix selections are unsupported)"),
+					EqId, (int32)CostPerEq.size());
+				return false;
+			}
+
 			ActiveRows.Add(Row);
-			// Mirrors python's self.cost = self._cost[active_eq_ids]: indexed by the row's own
-			// (raw model) equality id, not by its position in EqIds.
-			RowCosts.Add(CostPerEq(Data->efc_id[Row]));
+			RowCosts.Add(CostPerEq(IdIndex));
 		}
 	}
 
@@ -181,11 +191,15 @@ void FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfigurati
 	{
 		Cost(Index) = RowCosts[Index];
 	}
+	return true;
 }
 
 bool FMinkEqualityConstraintTask::ComputeError(const FMinkConfiguration& Configuration, FMinkVec& Out) const
 {
-	UpdateActiveConstraints(Configuration);
+	if (!UpdateActiveConstraints(Configuration))
+	{
+		return false;
+	}
 
 	const int32 K = ActiveRows.Num();
 	Out.resize(K);
@@ -198,7 +212,10 @@ bool FMinkEqualityConstraintTask::ComputeError(const FMinkConfiguration& Configu
 
 bool FMinkEqualityConstraintTask::ComputeJacobian(const FMinkConfiguration& Configuration, FMinkMat& Out) const
 {
-	UpdateActiveConstraints(Configuration);
+	if (!UpdateActiveConstraints(Configuration))
+	{
+		return false;
+	}
 
 	const mjModel* Model = Configuration.Model;
 	const mjData* Data = Configuration.Data;

@@ -62,9 +62,9 @@ public:
 
 private:
 	/** Scans Data->efc_type / Data->efc_id for rows belonging to our resolved EqIds, mirrors Python's
-	 * _update_active_constraints. Populates ActiveRows and mutates the base Cost to
-	 * CostPerEq[Data->efc_id[row]] per active row (mirrors self.cost = self._cost[active_eq_ids]). */
-	void UpdateActiveConstraints(const FMinkConfiguration&) const;
+	 * _update_active_constraints. Populates ActiveRows and mutates the base Cost per active row.
+	 * Returns false if a row's equality id exceeds the cost table size (unsupported non-prefix selection). */
+	bool UpdateActiveConstraints(const FMinkConfiguration&) const;
 
 	const mjModel* ModelRef;
 	TArray<int32> EqIds;              // resolved, validated (active at qpos0)
