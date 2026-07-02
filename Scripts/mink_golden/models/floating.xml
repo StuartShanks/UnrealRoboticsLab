@@ -1,0 +1,21 @@
+<mujoco model="floating">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="mocap_target" mocap="true" pos="0.5 0 1">
+      <geom name="gm" type="sphere" size="0.02" contype="0" conaffinity="0"/>
+    </body>
+    <body name="base" pos="0 0 1">
+      <freejoint name="root"/>
+      <geom name="gb" type="box" size="0.1 0.1 0.05"/>
+      <body name="head" pos="0 0 0.2">
+        <joint name="neck" type="ball" range="0 1.0" limited="true"/>
+        <geom name="gh" type="sphere" size="0.06"/>
+        <body name="antenna" pos="0 0 0.1">
+          <joint name="ant" type="hinge" axis="1 0 0" range="-1 1" limited="true"/>
+          <geom name="ga" type="capsule" fromto="0 0 0 0 0 0.15" size="0.01"/>
+          <site name="tip" pos="0 0 0.15" size="0.005"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
