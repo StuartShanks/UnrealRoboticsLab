@@ -271,12 +271,66 @@ def gen_task_posture():
     return out
 
 
+def gen_task_frame():
+    rng = np.random.default_rng(20260706)
+    out = {"models": {}}
+    frames_by_model = {
+        "arm3": [("ee", "site")],
+        "floating": [("tip", "site"), ("head", "body")],
+    }
+    # (position_cost, orientation_cost, gain, lm_damping, use_config_target)
+    variants = [
+        (1.0, 1.0, 1.0, 0.0, False),
+        ("vec3", "vec3", 1.0, 0.0, False),
+        (1.0, 1.0, 1.0, 0.1, False),
+        (1.0, 1.0, 0.5, 0.0, False),
+        (1.0, 1.0, 1.0, 0.0, True),
+    ]
+    for model_name, frame_list in frames_by_model.items():
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for frame_name, frame_type in frame_list:
+            for position_cost, orientation_cost, gain, lm, use_config_target in variants:
+                pos_cost_vec = (np.abs(rng.standard_normal(3)) if position_cost == "vec3"
+                                else np.array([position_cost]))
+                ori_cost_vec = (np.abs(rng.standard_normal(3)) if orientation_cost == "vec3"
+                                else np.array([orientation_cost]))
+                task = mink.FrameTask(
+                    frame_name=frame_name, frame_type=frame_type,
+                    position_cost=pos_cost_vec, orientation_cost=ori_cost_vec,
+                    gain=gain, lm_damping=lm,
+                )
+                if use_config_target:
+                    target_q = _valid_q(rng, model)
+                    cfg.update(q=target_q)
+                    task.set_target_from_configuration(cfg)
+                    target = task.transform_target_to_world
+                else:
+                    quat = rng.standard_normal(4)
+                    quat /= np.linalg.norm(quat)
+                    pos = rng.standard_normal(3)
+                    target = SE3.from_rotation_and_translation(SO3(wxyz=quat), pos)
+                    task.set_target(target)
+                q = _valid_q(rng, model)
+                cfg.update(q=q)
+                cases.append({
+                    "q": j(q), "frame": frame_name, "frame_type": frame_type,
+                    "position_cost": j(pos_cost_vec), "orientation_cost": j(ori_cost_vec),
+                    "gain": gain, "lm": lm, "target": j(target.wxyz_xyz),
+                    **_task_case(cfg, task),
+                })
+        out["models"][model_name] = cases
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
     "utils": gen_utils,
     "qp": gen_qp,
     "task_posture": gen_task_posture,
+    "task_frame": gen_task_frame,
     # Later tasks register: task_*, limit_*, solve_ik
 }
 
