@@ -144,3 +144,6 @@ build.log
 # Local docs preview env + build output (Scripts/docs.ps1 / docs.sh)
 .venv-docs/
 /site/
+
+# mink golden-fixture generator venv (Scripts/mink_golden/README.md)
+Scripts/mink_golden/.venv/

@@ -1,0 +1,14 @@
+absl-py==2.4.0
+daqp==0.8.7
+etils==1.14.0
+fsspec==2026.6.0
+glfw==2.10.0
+mink==1.2.0
+mujoco==3.9.0
+numpy==2.5.0
+PyOpenGL==3.1.10
+qpsolvers==4.12.0
+quadprog==0.1.13
+scipy==1.18.0
+typing_extensions==4.16.0
+zipp==4.1.0

@@ -1,0 +1,23 @@
+<mujoco model="arm3">
+  <compiler angle="radian"/>
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="2 2 0.1"/>
+    <body name="link1" pos="0 0 0.1">
+      <joint name="j1" type="hinge" axis="0 0 1" range="-2.9 2.9" limited="true"/>
+      <geom name="g1" type="capsule" fromto="0 0 0 0.3 0 0" size="0.04"/>
+      <body name="link2" pos="0.3 0 0">
+        <joint name="j2" type="hinge" axis="0 1 0" range="-1.9 1.9" limited="true"/>
+        <geom name="g2" type="capsule" fromto="0 0 0 0.28 0 0" size="0.035"/>
+        <body name="link3" pos="0.28 0 0">
+          <joint name="j3" type="hinge" axis="0 1 0" range="-2.4 2.4" limited="true"/>
+          <geom name="g3" type="capsule" fromto="0 0 0 0.2 0 0" size="0.03"/>
+          <site name="ee" pos="0.2 0 0" size="0.01"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <keyframe>
+    <key name="home" qpos="0 0.4 -0.8"/>
+  </keyframe>
+</mujoco>
