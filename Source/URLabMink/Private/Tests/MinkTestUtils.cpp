@@ -22,10 +22,36 @@
 
 #include "MinkTestUtils.h"
 
+#include <limits>
+
 #include "HAL/PlatformFileManager.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonSerializer.h"
+
+namespace
+{
+/** gen_golden.py's j() encodes non-finite floats (only ever produced by the collision-avoidance
+ * limit's h vector, for skipped rows) as the strings "Infinity"/"-Infinity" rather than the bare
+ * (invalid-JSON) `Infinity` token json.dumps would otherwise emit. Every other fixture value is
+ * a plain JSON number, so this is a strict superset of AsNumber(). */
+double MinkJsonNumber(const TSharedPtr<FJsonValue>& Value)
+{
+	if (Value->Type == EJson::String)
+	{
+		const FString S = Value->AsString();
+		if (S == TEXT("Infinity"))
+		{
+			return std::numeric_limits<double>::infinity();
+		}
+		if (S == TEXT("-Infinity"))
+		{
+			return -std::numeric_limits<double>::infinity();
+		}
+	}
+	return Value->AsNumber();
+}
+} // namespace
 
 FString MinkGoldenDir()
 {
@@ -73,7 +99,7 @@ FMinkVec MinkJsonVec(const TArray<TSharedPtr<FJsonValue>>& A)
 	FMinkVec V(A.Num());
 	for (int32 i = 0; i < A.Num(); ++i)
 	{
-		V(i) = A[i]->AsNumber();
+		V(i) = MinkJsonNumber(A[i]);
 	}
 	return V;
 }
@@ -88,7 +114,7 @@ FMinkMat MinkJsonMat(const TArray<TSharedPtr<FJsonValue>>& A)
 		const TArray<TSharedPtr<FJsonValue>> Row = A[r]->AsArray();
 		for (int32 c = 0; c < Cols; ++c)
 		{
-			M(r, c) = Row[c]->AsNumber();
+			M(r, c) = MinkJsonNumber(Row[c]);
 		}
 	}
 	return M;
@@ -105,12 +131,18 @@ bool MinkExpectNear(
 		return false;
 	}
 
+	// Non-finite Expected entries only ever occur in the collision-avoidance limit's h vector
+	// (skipped rows are left at +inf); they're excluded from the reference magnitude so an
+	// intentional +inf sentinel doesn't blow out the tolerance for every other (finite) entry.
 	double MaxAbsExpected = 1.0;
 	for (int32 r = 0; r < Expected.rows(); ++r)
 	{
 		for (int32 c = 0; c < Expected.cols(); ++c)
 		{
-			MaxAbsExpected = FMath::Max(MaxAbsExpected, FMath::Abs(Expected(r, c)));
+			if (FMath::IsFinite(Expected(r, c)))
+			{
+				MaxAbsExpected = FMath::Max(MaxAbsExpected, FMath::Abs(Expected(r, c)));
+			}
 		}
 	}
 	const double Threshold = Tol * MaxAbsExpected;
@@ -122,7 +154,18 @@ bool MinkExpectNear(
 	{
 		for (int32 c = 0; c < Actual.cols(); ++c, ++FlatIndex)
 		{
-			const double Diff = FMath::Abs(Actual(r, c) - Expected(r, c));
+			// inf - inf is NaN, so a non-finite Expected entry needs an exact-equality check
+			// instead of a subtraction; exact +inf/+inf (or -inf/-inf) equality is well-defined
+			// IEEE-754 and is exactly what "this row was skipped, same as Python" means here.
+			double Diff;
+			if (!FMath::IsFinite(Expected(r, c)))
+			{
+				Diff = (Actual(r, c) == Expected(r, c)) ? 0.0 : TNumericLimits<double>::Max();
+			}
+			else
+			{
+				Diff = FMath::Abs(Actual(r, c) - Expected(r, c));
+			}
 			if (Diff > MaxDiff)
 			{
 				MaxDiff = Diff;

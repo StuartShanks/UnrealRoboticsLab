@@ -26,6 +26,7 @@
 #include "MinkTestUtils.h"
 #include "Limits/MinkConfigurationLimit.h"
 #include "Limits/MinkVelocityLimit.h"
+#include "Limits/MinkCollisionAvoidanceLimit.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -33,6 +34,10 @@
 // file-static in MinkTaskTests.cpp; with unity builds concatenating all Private/*.cpp into one
 // translation unit, redefining it here would collide. Match its value locally instead.
 static const double TOL_OBJ_LIMITS = 1e-8;
+
+// Unity-unique name for the CollisionAvoidance test's own tolerance constant (see the note
+// above — every sibling test file picks its own name to avoid unity-build redefinition).
+static const double TOL_OBJ_CA = 1e-8;
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkLimitConfigurationTest,
 	"URLab.Mink.Limits.Configuration",
@@ -219,6 +224,131 @@ bool FMinkLimitVelocityTest::RunTest(const FString& Parameters)
 		mj_deleteModel(Model);
 	}
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkLimitCollisionAvoidanceTest,
+	"URLab.Mink.Limits.CollisionAvoidance",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMinkLimitCollisionAvoidanceTest::RunTest(const FString& Parameters)
+{
+	TSharedPtr<FJsonObject> Root;
+	if (!MinkLoadFixture(TEXT("limit_collision"), Root))
+	{
+		AddError(TEXT("limit_collision.json missing — run gen_golden.py"));
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>& Cases =
+		Root->GetObjectField(TEXT("models"))->GetArrayField(TEXT("scene_collision"));
+	TestTrue(TEXT("scene_collision cases non-empty"), Cases.Num() > 0);
+	if (Cases.Num() == 0)
+	{
+		return false;
+	}
+
+	mjModel* Model = MinkLoadModel(TEXT("scene_collision.xml"));
+	if (Model == nullptr)
+	{
+		AddError(TEXT("failed to load model 'scene_collision'"));
+		return false;
+	}
+
+	// Mirrors gen_limit_collision's single geom_pairs spec, exercised across every case.
+	FMinkGeomGroup ArmGroup;
+	ArmGroup.Names = {TEXT("g1"), TEXT("g2"), TEXT("g3")};
+	FMinkGeomGroup ObstacleGroup;
+	ObstacleGroup.Names = {TEXT("obstacle1"), TEXT("obstacle2"), TEXT("floor")};
+	FMinkGeomGroup SelfA;
+	SelfA.Names = {TEXT("g1")};
+	FMinkGeomGroup SelfB;
+	SelfB.Names = {TEXT("g3")};
+	TArray<FMinkCollisionPair> GeomPairs;
+	GeomPairs.Emplace(ArmGroup, ObstacleGroup);
+	GeomPairs.Emplace(SelfA, SelfB);
+
+	{
+		FMinkConfiguration Cfg(Model);
+
+		for (const TSharedPtr<FJsonValue>& CaseVal : Cases)
+		{
+			const TSharedPtr<FJsonObject> Case = CaseVal->AsObject();
+
+			const FString CaseLabel = FString::Printf(
+				TEXT("%s/%s"), *Case->GetStringField(TEXT("q_label")), *Case->GetStringField(TEXT("variant")));
+
+			const double Gain = Case->GetNumberField(TEXT("gain"));
+			const double MinDist = Case->GetNumberField(TEXT("min_dist"));
+			const double DetectionDist = Case->GetNumberField(TEXT("detection_dist"));
+			const double BoundRelaxation = Case->GetNumberField(TEXT("bound_relaxation"));
+			const double Dt = Case->GetNumberField(TEXT("dt"));
+			const FMinkVec Q = MinkJsonVec(Case->GetArrayField(TEXT("q")));
+
+			TArray<TPair<int32, int32>> ExpectedPairs;
+			for (const TSharedPtr<FJsonValue>& PairVal : Case->GetArrayField(TEXT("geom_id_pairs")))
+			{
+				const TArray<TSharedPtr<FJsonValue>> P = PairVal->AsArray();
+				ExpectedPairs.Emplace(static_cast<int32>(P[0]->AsNumber()), static_cast<int32>(P[1]->AsNumber()));
+			}
+			const FMinkMat ExpectedG = MinkJsonMat(Case->GetArrayField(TEXT("G")));
+			const FMinkVec ExpectedH = MinkJsonVec(Case->GetArrayField(TEXT("h")));
+
+			Cfg.Update(Q.data());
+
+			// Pass 1: linear scan (bBroadphase = false).
+			{
+				FMinkCollisionAvoidanceLimit Limit(
+					Model, GeomPairs, Gain, MinDist, DetectionDist, BoundRelaxation, /*bBroadphase=*/false);
+				if (!TestTrue(FString::Printf(TEXT("%s: Limit.bIsValid (linear)"), *CaseLabel), Limit.bIsValid))
+				{
+					continue;
+				}
+
+				const TArray<TPair<int32, int32>>& ActualPairs = Limit.GetGeomIdPairs();
+				bool bPairsEqual = ActualPairs.Num() == ExpectedPairs.Num();
+				for (int32 Index = 0; bPairsEqual && Index < ActualPairs.Num(); ++Index)
+				{
+					bPairsEqual = ActualPairs[Index].Key == ExpectedPairs[Index].Key
+							   && ActualPairs[Index].Value == ExpectedPairs[Index].Value;
+				}
+				TestTrue(FString::Printf(TEXT("%s: geom_id_pairs exact match"), *CaseLabel), bPairsEqual);
+
+				FMinkInequality Inequality;
+				if (TestTrue(FString::Printf(TEXT("%s: ComputeQpInequalities (linear)"), *CaseLabel),
+						Limit.ComputeQpInequalities(Cfg, Dt, Inequality)))
+				{
+					TestTrue(TEXT("G non-empty"), Inequality.G.IsSet() && Inequality.G->rows() > 0
+													  && Inequality.G->cols() > 0);
+					TestTrue(TEXT("h non-empty"), Inequality.H.IsSet() && Inequality.H->size() > 0);
+					MinkExpectNear(*this, TEXT("G (linear)"), *Inequality.G, ExpectedG, TOL_OBJ_CA);
+					MinkExpectNear(*this, TEXT("h (linear)"), *Inequality.H, ExpectedH, TOL_OBJ_CA);
+				}
+			}
+
+			// Pass 2: forced broadphase (BroadphaseMinPairs = 0) — must match the exact same
+			// fixture, proving the broadphase is a pure pre-filter.
+			{
+				FMinkCollisionAvoidanceLimit Limit(
+					Model, GeomPairs, Gain, MinDist, DetectionDist, BoundRelaxation, /*bBroadphase=*/true);
+				Limit.BroadphaseMinPairs = 0;
+				if (!TestTrue(FString::Printf(TEXT("%s: Limit.bIsValid (broadphase)"), *CaseLabel), Limit.bIsValid))
+				{
+					continue;
+				}
+
+				FMinkInequality Inequality;
+				if (TestTrue(FString::Printf(TEXT("%s: ComputeQpInequalities (broadphase)"), *CaseLabel),
+						Limit.ComputeQpInequalities(Cfg, Dt, Inequality)))
+				{
+					MinkExpectNear(*this, TEXT("G (broadphase)"), *Inequality.G, ExpectedG, TOL_OBJ_CA);
+					MinkExpectNear(*this, TEXT("h (broadphase)"), *Inequality.H, ExpectedH, TOL_OBJ_CA);
+				}
+			}
+		}
+	}
+
+	mj_deleteModel(Model);
 	return true;
 }
 
