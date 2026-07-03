@@ -2933,6 +2933,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetIkTarget(const TSharedPtr<
 			Cfg.FrameName = ResolvedFrame;
 			Cfg.FrameType = EMinkFrameType::Body;
 			Cfg.OrientationCost = bHasQuat ? 1.0 : 0.0;
+			TSet<int32> DriveJointIds;
 			for (UMjJoint* J : Art->GetJoints())
 			{
 				if (!J)
@@ -2943,12 +2944,29 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetIkTarget(const TSharedPtr<
 				const char* Nm = mj_id2name(m, mjOBJ_JOINT, Id);
 				if (Nm)
 					Cfg.DriveJointNames.Add(UTF8_TO_TCHAR(Nm));
+				DriveJointIds.Add(Id);
 			}
 
 			TUniquePtr<FMinkEndEffectorIK> NewDriver = MakeUnique<FMinkEndEffectorIK>(m, Cfg);
 			if (!NewDriver->IsValid())
 				return MakeError(TEXT("ik_build_failed"),
 					FString::Printf(TEXT("Could not build IK for frame '%s'"), *ResolvedFrame));
+
+			// Neutralize the driven joints' actuators so they don't fight the
+			// kinematic qpos writes each step (same rationale as the fake-IK
+			// controller's bDisableActuators). Zero gain + bias => zero output
+			// force regardless of ctrl. Persists until the model is rebuilt.
+			for (int32 a = 0; a < m->nu; ++a)
+			{
+				if (m->actuator_trntype[a] != mjTRN_JOINT)
+					continue;
+				if (!DriveJointIds.Contains(m->actuator_trnid[2 * a]))
+					continue;
+				for (int32 g = 0; g < mjNGAIN; ++g)
+					m->actuator_gainprm[a * mjNGAIN + g] = 0.0;
+				for (int32 b = 0; b < mjNBIAS; ++b)
+					m->actuator_biasprm[a * mjNBIAS + b] = 0.0;
+			}
 
 			IkDriver = MoveTemp(NewDriver);
 			IkArtName = ArtKey;
