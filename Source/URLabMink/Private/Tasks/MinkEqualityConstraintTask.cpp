@@ -170,10 +170,11 @@ bool FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfigurati
 		if (Data->efc_type[Row] == mjCNSTR_EQUALITY && EqIds.Contains(Data->efc_id[Row]))
 		{
 			const int32 EqId = Data->efc_id[Row];
+			// Mirrors python's self.cost = self._cost[active_eq_ids]: indexed by the row's own
+			// (raw model) equality id, not by its position in EqIds.
 			// Upstream mink v1.2.0 raises IndexError here (cost indexed by raw eq id);
 			// we convert to a controlled failure per the port's error model.
-			const int32 IdIndex = EqIds.Find(EqId);
-			if (IdIndex >= CostPerEq.size())
+			if (EqId >= CostPerEq.size())
 			{
 				UE_LOG(LogURLabMink, Error,
 					TEXT("[FMinkEqualityConstraintTask] equality id %d exceeds cost table size %d (upstream mink indexes cost by raw eq id — non-prefix selections are unsupported)"),
@@ -182,7 +183,7 @@ bool FMinkEqualityConstraintTask::UpdateActiveConstraints(const FMinkConfigurati
 			}
 
 			ActiveRows.Add(Row);
-			RowCosts.Add(CostPerEq(IdIndex));
+			RowCosts.Add(CostPerEq(EqId));
 		}
 	}
 
