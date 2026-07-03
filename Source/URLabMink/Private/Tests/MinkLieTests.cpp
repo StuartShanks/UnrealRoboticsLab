@@ -44,7 +44,9 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 	}
 	const TSharedPtr<FJsonObject> So3 = Root->GetObjectField(TEXT("so3"));
 
-	for (const auto& V : So3->GetArrayField(TEXT("exp")))
+	const TArray<TSharedPtr<FJsonValue>>& ExpArr = So3->GetArrayField(TEXT("exp"));
+	TestTrue(TEXT("so3.exp cases non-empty"), ExpArr.Num() > 0);
+	for (const auto& V : ExpArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec T = MinkJsonVec(C->GetArrayField(TEXT("tangent")));
@@ -52,14 +54,18 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.exp"),
 			Eigen::Map<const Eigen::Vector4d>(G.Wxyz), MinkJsonVec(C->GetArrayField(TEXT("wxyz"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("log")))
+	const TArray<TSharedPtr<FJsonValue>>& LogArr = So3->GetArrayField(TEXT("log"));
+	TestTrue(TEXT("so3.log cases non-empty"), LogArr.Num() > 0);
+	for (const auto& V : LogArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec Q = MinkJsonVec(C->GetArrayField(TEXT("wxyz")));
 		MinkExpectNear(*this, TEXT("so3.log"),
 			FMinkSO3::FromWxyz(Q.data()).Log(), MinkJsonVec(C->GetArrayField(TEXT("tangent"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("matrix")))
+	const TArray<TSharedPtr<FJsonValue>>& MatrixArr = So3->GetArrayField(TEXT("matrix"));
+	TestTrue(TEXT("so3.matrix cases non-empty"), MatrixArr.Num() > 0);
+	for (const auto& V : MatrixArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec Q = MinkJsonVec(C->GetArrayField(TEXT("wxyz")));
@@ -70,7 +76,9 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.matrix.from_matrix"),
 			Eigen::Map<const Eigen::Vector4d>(Back.Wxyz), MinkJsonVec(C->GetArrayField(TEXT("wxyz_back"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("multiply")))
+	const TArray<TSharedPtr<FJsonValue>>& MultiplyArr = So3->GetArrayField(TEXT("multiply"));
+	TestTrue(TEXT("so3.multiply cases non-empty"), MultiplyArr.Num() > 0);
+	for (const auto& V : MultiplyArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec A = MinkJsonVec(C->GetArrayField(TEXT("a")));
@@ -79,7 +87,9 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.multiply"),
 			Eigen::Map<const Eigen::Vector4d>(Result.Wxyz), MinkJsonVec(C->GetArrayField(TEXT("out"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("apply")))
+	const TArray<TSharedPtr<FJsonValue>>& ApplyArr = So3->GetArrayField(TEXT("apply"));
+	TestTrue(TEXT("so3.apply cases non-empty"), ApplyArr.Num() > 0);
+	for (const auto& V : ApplyArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec Q = MinkJsonVec(C->GetArrayField(TEXT("wxyz")));
@@ -87,7 +97,9 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.apply"),
 			FMinkSO3::FromWxyz(Q.data()).Apply(Vec.head<3>()), MinkJsonVec(C->GetArrayField(TEXT("out"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("inverse")))
+	const TArray<TSharedPtr<FJsonValue>>& InverseArr = So3->GetArrayField(TEXT("inverse"));
+	TestTrue(TEXT("so3.inverse cases non-empty"), InverseArr.Num() > 0);
+	for (const auto& V : InverseArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec Q = MinkJsonVec(C->GetArrayField(TEXT("wxyz")));
@@ -95,28 +107,36 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.inverse"),
 			Eigen::Map<const Eigen::Vector4d>(Result.Wxyz), MinkJsonVec(C->GetArrayField(TEXT("out"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("ljac")))
+	const TArray<TSharedPtr<FJsonValue>>& LjacArr = So3->GetArrayField(TEXT("ljac"));
+	TestTrue(TEXT("so3.ljac cases non-empty"), LjacArr.Num() > 0);
+	for (const auto& V : LjacArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec T = MinkJsonVec(C->GetArrayField(TEXT("tangent")));
 		MinkExpectNear(*this, TEXT("so3.ljac"),
 			FMinkSO3::Ljac(T.head<3>()), MinkJsonMat(C->GetArrayField(TEXT("m"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("ljacinv")))
+	const TArray<TSharedPtr<FJsonValue>>& LjacinvArr = So3->GetArrayField(TEXT("ljacinv"));
+	TestTrue(TEXT("so3.ljacinv cases non-empty"), LjacinvArr.Num() > 0);
+	for (const auto& V : LjacinvArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec T = MinkJsonVec(C->GetArrayField(TEXT("tangent")));
 		MinkExpectNear(*this, TEXT("so3.ljacinv"),
 			FMinkSO3::Ljacinv(T.head<3>()), MinkJsonMat(C->GetArrayField(TEXT("m"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("rpy")))
+	const TArray<TSharedPtr<FJsonValue>>& RpyArr = So3->GetArrayField(TEXT("rpy"));
+	TestTrue(TEXT("so3.rpy cases non-empty"), RpyArr.Num() > 0);
+	for (const auto& V : RpyArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec Q = MinkJsonVec(C->GetArrayField(TEXT("wxyz")));
 		MinkExpectNear(*this, TEXT("so3.rpy"),
 			FMinkSO3::FromWxyz(Q.data()).AsRpyRadians(), MinkJsonVec(C->GetArrayField(TEXT("rpy"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("rminus")))
+	const TArray<TSharedPtr<FJsonValue>>& RMinusArr = So3->GetArrayField(TEXT("rminus"));
+	TestTrue(TEXT("so3.rminus cases non-empty"), RMinusArr.Num() > 0);
+	for (const auto& V : RMinusArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec A = MinkJsonVec(C->GetArrayField(TEXT("a")));
@@ -125,7 +145,9 @@ bool FMinkLieSO3Test::RunTest(const FString& Parameters)
 		MinkExpectNear(*this, TEXT("so3.rminus"),
 			Result, MinkJsonVec(C->GetArrayField(TEXT("out"))), TOL_LIE);
 	}
-	for (const auto& V : So3->GetArrayField(TEXT("interpolate")))
+	const TArray<TSharedPtr<FJsonValue>>& InterpolateArr = So3->GetArrayField(TEXT("interpolate"));
+	TestTrue(TEXT("so3.interpolate cases non-empty"), InterpolateArr.Num() > 0);
+	for (const auto& V : InterpolateArr)
 	{
 		const auto C = V->AsObject();
 		const FMinkVec A = MinkJsonVec(C->GetArrayField(TEXT("a")));
