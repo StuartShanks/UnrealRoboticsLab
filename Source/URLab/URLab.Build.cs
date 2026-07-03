@@ -98,7 +98,8 @@ public class URLab : ModuleRules
 			// pre-built static rpc.lib. Used by MjMsgpackHelpers for
 			// the step server's binary wire format. JSON fallback is
 			// kept for debugging via the hello "encoding" flag.
-			"RPCLib"
+			"RPCLib",
+			"URLabMink"
 		});
 
 		DynamicallyLoadedModuleNames.AddRange(new string[]
