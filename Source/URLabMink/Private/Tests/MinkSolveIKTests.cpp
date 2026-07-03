@@ -30,6 +30,9 @@
 #include "Tasks/MinkDampingTask.h"
 #include "Tasks/MinkComTask.h"
 #include "Tasks/MinkDofFreezingTask.h"
+#include "Limits/MinkLimit.h"
+#include "Limits/MinkConfigurationLimit.h"
+#include "Limits/MinkCollisionAvoidanceLimit.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -164,6 +167,79 @@ bool BuildConstraintsFromJson(const TSharedPtr<FJsonObject>& Scenario, const mjM
 	}
 	return true;
 }
+
+/** Reconstructs the "limits" JSON field, which is either the plain string mode ("default" ->
+ * nullptr, meaning MinkSolveIK's own default single ConfigurationLimit; "none" -> an explicit
+ * empty array) or — for the collision-avoidance scenario — a rich object descriptor naming an
+ * explicit ["configuration"?, "collision"?] limit list (mirrors gen_solve_ik's limits_desc).
+ * When explicit, OutLimitPtrs is populated and bOutExplicit is set so the caller passes
+ * &OutLimitPtrs rather than nullptr/&EmptyLimits. */
+bool BuildLimitsFromJson(const TSharedPtr<FJsonObject>& Scenario, const mjModel* Model,
+	TArray<TUniquePtr<FMinkLimit>>& OutOwnedLimits, TArray<const FMinkLimit*>& OutLimitPtrs, bool& bOutExplicit,
+	FString& OutLimitsMode)
+{
+	const TSharedPtr<FJsonObject>* LimitsObj = nullptr;
+	if (!Scenario->TryGetObjectField(TEXT("limits"), LimitsObj) || LimitsObj == nullptr)
+	{
+		bOutExplicit = false;
+		OutLimitsMode = Scenario->GetStringField(TEXT("limits"));
+		return true;
+	}
+
+	bOutExplicit = true;
+	const TSharedPtr<FJsonObject>& D = *LimitsObj;
+
+	if (D->HasField(TEXT("configuration")))
+	{
+		const TSharedPtr<FJsonObject> ConfigDesc = D->GetObjectField(TEXT("configuration"));
+		const double Gain = ConfigDesc->GetNumberField(TEXT("gain"));
+
+		TUniquePtr<FMinkConfigurationLimit> Limit = MakeUnique<FMinkConfigurationLimit>(Model, Gain);
+		if (!Limit->bIsValid)
+		{
+			return false;
+		}
+		OutLimitPtrs.Add(Limit.Get());
+		OutOwnedLimits.Add(MoveTemp(Limit));
+	}
+
+	if (D->HasField(TEXT("collision")))
+	{
+		const TSharedPtr<FJsonObject> CollisionDesc = D->GetObjectField(TEXT("collision"));
+		const double Gain = CollisionDesc->GetNumberField(TEXT("gain"));
+		const double MinDist = CollisionDesc->GetNumberField(TEXT("min_dist"));
+		const double DetectionDist = CollisionDesc->GetNumberField(TEXT("detection_dist"));
+		const double BoundRelaxation = CollisionDesc->GetNumberField(TEXT("bound_relaxation"));
+
+		TArray<FMinkCollisionPair> GeomPairs;
+		for (const TSharedPtr<FJsonValue>& PairVal : CollisionDesc->GetArrayField(TEXT("geom_pairs")))
+		{
+			const TArray<TSharedPtr<FJsonValue>> PairArr = PairVal->AsArray();
+			FMinkGeomGroup GroupA;
+			for (const TSharedPtr<FJsonValue>& NameVal : PairArr[0]->AsArray())
+			{
+				GroupA.Names.Add(NameVal->AsString());
+			}
+			FMinkGeomGroup GroupB;
+			for (const TSharedPtr<FJsonValue>& NameVal : PairArr[1]->AsArray())
+			{
+				GroupB.Names.Add(NameVal->AsString());
+			}
+			GeomPairs.Emplace(MoveTemp(GroupA), MoveTemp(GroupB));
+		}
+
+		TUniquePtr<FMinkCollisionAvoidanceLimit> Limit =
+			MakeUnique<FMinkCollisionAvoidanceLimit>(Model, GeomPairs, Gain, MinDist, DetectionDist, BoundRelaxation);
+		if (!Limit->bIsValid)
+		{
+			return false;
+		}
+		OutLimitPtrs.Add(Limit.Get());
+		OutOwnedLimits.Add(MoveTemp(Limit));
+	}
+
+	return true;
+}
 } // namespace
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMinkSolveIKGoldenTest,
@@ -198,7 +274,17 @@ bool FMinkSolveIKGoldenTest::RunTest(const FString& Parameters)
 		const double Damping = Scenario->GetNumberField(TEXT("damping"));
 		const double Dt = Scenario->GetNumberField(TEXT("dt"));
 		const int32 Steps = static_cast<int32>(Scenario->GetNumberField(TEXT("steps")));
-		const FString LimitsMode = Scenario->GetStringField(TEXT("limits"));
+
+		TArray<TUniquePtr<FMinkLimit>> OwnedLimits;
+		TArray<const FMinkLimit*> LimitPtrs;
+		bool bExplicitLimits = false;
+		FString LimitsMode;
+		if (!TestTrue(TEXT("BuildLimitsFromJson"),
+				BuildLimitsFromJson(Scenario, Model, OwnedLimits, LimitPtrs, bExplicitLimits, LimitsMode)))
+		{
+			mj_deleteModel(Model);
+			continue;
+		}
 
 		TArray<TUniquePtr<FMinkBaseTask>> OwnedTasks;
 		TArray<const FMinkBaseTask*> TaskPtrs;
@@ -220,9 +306,11 @@ bool FMinkSolveIKGoldenTest::RunTest(const FString& Parameters)
 		const TArray<const FMinkTask*>* ConstraintsArg = ConstraintPtrs.Num() > 0 ? &ConstraintPtrs : nullptr;
 
 		// "default" -> nullptr (MinkSolveIK defaults to a ConfigurationLimit); "none" -> an
-		// explicit empty array (no limits at all).
+		// explicit empty array (no limits at all); an object descriptor -> the explicit
+		// [configuration?, collision?] list just built above.
 		TArray<const FMinkLimit*> EmptyLimits;
-		const TArray<const FMinkLimit*>* LimitsArg = LimitsMode == TEXT("none") ? &EmptyLimits : nullptr;
+		const TArray<const FMinkLimit*>* LimitsArg =
+			bExplicitLimits ? &LimitPtrs : (LimitsMode == TEXT("none") ? &EmptyLimits : nullptr);
 
 		{
 			FMinkConfiguration Cfg(Model, Q0.data());

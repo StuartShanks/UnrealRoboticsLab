@@ -25,6 +25,7 @@ fixture; randomness only ever runs here, seeded."""
 
 import argparse
 import json
+import math
 import pathlib
 
 import mink
@@ -41,13 +42,26 @@ def load_model(name: str) -> mujoco.MjModel:
     return mujoco.MjModel.from_xml_path(str(MODELS / f"{name}.xml"))
 
 
+def _sanitize_inf(v):
+    """json.dumps emits bare `Infinity`/`-Infinity` tokens for non-finite floats, which is not
+    valid strict JSON and breaks FJsonSerializer::Deserialize on the whole file. Only the
+    collision-avoidance limit's h vector ever contains real infinities (skipped rows); encode
+    those as the strings "Infinity"/"-Infinity" instead — MinkJsonVec/MinkJsonMat on the C++ side
+    special-case those two strings back to +/-infinity."""
+    if isinstance(v, list):
+        return [_sanitize_inf(e) for e in v]
+    if isinstance(v, float) and math.isinf(v):
+        return "Infinity" if v > 0 else "-Infinity"
+    return v
+
+
 def j(x):
     """numpy -> plain python for exact-round-trip json."""
     if isinstance(x, np.ndarray):
-        return x.tolist()
+        return _sanitize_inf(x.tolist())
     if isinstance(x, (np.floating, np.integer)):
-        return x.item()
-    return x
+        return _sanitize_inf(x.item())
+    return _sanitize_inf(x)
 
 
 def sample_tangents(rng, dim):
@@ -564,11 +578,85 @@ def gen_limit_velocity():
     return out
 
 
+def gen_limit_collision():
+    model_name = "scene_collision"
+    model = load_model(model_name)
+    cfg = mink.Configuration(model)
+
+    # Single geom_pairs spec exercised across every case below: g1/g2/g3 vs the two static
+    # obstacles and the floor, plus a self-collision pair (g1 vs g3). Filtering (welded/
+    # parent-child/contype-conaffinity) is entirely mink's own _construct_geom_id_pairs; g1 ends
+    # up excluded from every obstacle/floor pair here because link1's parent IS the worldbody
+    # that owns floor/obstacle1/obstacle2 (parent-child check), leaving 7 surviving pairs.
+    geom_pairs = [(["g1", "g2", "g3"], ["obstacle1", "obstacle2", "floor"]), (["g1"], ["g3"])]
+
+    # Four q's, found by grid-searching mj_geomDistance over this exact model (all within each
+    # joint's own range) to geometrically exercise distinct regimes:
+    #   home:                 the arm3 "home" keyframe (elbow/wrist already penetrate the floor).
+    #   stretch_obstacle1:    g2 brought within ~4cm of obstacle1 (sweet spot for the
+    #                         detection_dist=0.05 variant, out of range for the default 0.01).
+    #   near_floor:           g3 brought within ~2cm of the floor, not penetrating.
+    #   near_self_collision:  j2/j3 folded to their range limits so g1-g3 (self collision) closes
+    #                         to ~1.2cm, while g2/g3 deeply penetrate the floor as a bonus case.
+    q_cases = [
+        ("home", [0.0, 0.4, -0.8]),
+        ("stretch_obstacle1", [-0.1, -1.2, -0.2]),
+        ("near_floor", [-0.3, -0.5, 1.6666666666666667]),
+        ("near_self_collision", [0.0, 1.9, 2.4]),
+    ]
+
+    # (label, gain, minimum_distance_from_collisions, collision_detection_distance,
+    #  bound_relaxation) — each variant overrides exactly one field from the defaults.
+    param_variants = [
+        ("defaults", 0.85, 0.005, 0.01, 0.0),
+        ("gain_0.5", 0.5, 0.005, 0.01, 0.0),
+        ("min_dist_0.01", 0.85, 0.01, 0.01, 0.0),
+        ("detection_0.05", 0.85, 0.005, 0.05, 0.0),
+        ("bound_relaxation_0.01", 0.85, 0.005, 0.01, 0.01),
+    ]
+
+    dt = 0.02
+    cases = []
+    for q_label, q_list in q_cases:
+        q = np.array(q_list)
+        cfg.update(q=q)
+        for variant_label, gain, min_dist, detection, relax in param_variants:
+            limit = mink.CollisionAvoidanceLimit(
+                model,
+                geom_pairs,
+                gain=gain,
+                minimum_distance_from_collisions=min_dist,
+                collision_detection_distance=detection,
+                bound_relaxation=relax,
+            )
+            # Deviation #5: sort the deduped geom-id pairs ascending so the C++ port (which
+            # sorts identically in its ctor) produces rows in the same order.
+            limit.geom_id_pairs.sort()
+            limit.max_num_contacts = len(limit.geom_id_pairs)
+            constraint = limit.compute_qp_inequalities(cfg, dt=dt)
+            cases.append({
+                "q_label": q_label,
+                "variant": variant_label,
+                "q": j(q),
+                "gain": gain,
+                "min_dist": min_dist,
+                "detection_dist": detection,
+                "bound_relaxation": relax,
+                "dt": dt,
+                "geom_id_pairs": [[int(a), int(b)] for a, b in limit.geom_id_pairs],
+                "G": j(constraint.G),
+                "h": j(constraint.h),
+            })
+
+    return {"models": {model_name: cases}, "geom_pairs": geom_pairs}
+
+
 def gen_solve_ik():
     rng = np.random.default_rng(20260706)
     scenarios = []
 
-    def run(model_name, q0, tasks_desc, limits_mode, constraints_desc, damping, dt, steps=10):
+    def run(model_name, q0, tasks_desc, limits_mode, constraints_desc, damping, dt, steps=10,
+            limits_desc=None):
         model = load_model(model_name)
         cfg = mink.Configuration(model)
         cfg.update(q=q0)
@@ -600,8 +688,16 @@ def gen_solve_ik():
             vi = mink.solve_ik(traj_cfg, tasks, dt, solver="quadprog", damping=damping,
                                limits=limits, constraints=constraints)
             traj_cfg.integrate_inplace(vi, dt)
+        # "limits" is normally the plain string mode ("default"/"none"); when limits_mode is an
+        # explicit list of Limit objects (as for the collision-avoidance scenario), the caller
+        # passes limits_desc — a JSON-serializable dict describing exactly how to reconstruct
+        # that same explicit list on the C++ side — which is stored instead of the string.
+        if limits_desc is not None:
+            limits_json = limits_desc
+        else:
+            limits_json = limits_mode if isinstance(limits_mode, str) else "default"
         scenarios.append({"model": model_name, "q0": j(q0), "tasks": t_json,
-                          "limits": limits_mode if isinstance(limits_mode, str) else "default",
+                          "limits": limits_json,
                           "constraints": c_json, "damping": damping, "dt": dt,
                           "v": j(v), "steps": steps, "q_final": j(traj_cfg.q)})
 
@@ -627,6 +723,43 @@ def gen_solve_ik():
               mink.SO3.identity(), np.array([0.3, 0.2, 1.5])).wxyz_xyz)},
          {"type": "posture", "cost": 1e-3, "target_q": j(q0)}],
         "default", None, 1e-12, 0.01)
+
+    # Collision-avoidance scenario: an explicit [ConfigurationLimit, CollisionAvoidanceLimit]
+    # list (not the "default"/"none" shorthand), driving the ee toward obstacle1 so the
+    # collision limit actually engages during the integration loop.
+    scene = load_model("scene_collision")
+    scene_home = scene.key_qpos[0].copy()
+    config_limit = mink.ConfigurationLimit(scene, gain=0.95)
+    collision_geom_pairs = [(["g1", "g2", "g3"], ["obstacle1", "obstacle2", "floor"]), (["g1"], ["g3"])]
+    collision_gain, collision_min_dist = 0.5, 0.01
+    collision_detection, collision_relax = 0.05, 0.01
+    collision_limit = mink.CollisionAvoidanceLimit(
+        scene, collision_geom_pairs, gain=collision_gain,
+        minimum_distance_from_collisions=collision_min_dist,
+        collision_detection_distance=collision_detection,
+        bound_relaxation=collision_relax,
+    )
+    collision_limit.geom_id_pairs.sort()
+    collision_limit.max_num_contacts = len(collision_limit.geom_id_pairs)
+    scene_ee_target = j(mink.SE3.from_rotation_and_translation(
+        mink.SO3.identity(), np.array([0.35, 0.1, 0.3])).wxyz_xyz)
+    run("scene_collision", scene_home,
+        [{"type": "frame", "frame": "ee", "frame_type": "site", "position_cost": 1.0,
+          "orientation_cost": 0.1, "lm": 0.01, "target": scene_ee_target},
+         {"type": "posture", "cost": 1e-3, "target_q": j(scene_home)}],
+        [config_limit, collision_limit], None, 1e-12, 0.02,
+        limits_desc={
+            "configuration": {"gain": 0.95},
+            "collision": {
+                "gain": collision_gain,
+                "min_dist": collision_min_dist,
+                "detection_dist": collision_detection,
+                "bound_relaxation": collision_relax,
+                "geom_pairs": collision_geom_pairs,
+                "geom_id_pairs": [[int(a), int(b)] for a, b in collision_limit.geom_id_pairs],
+            },
+        })
+
     return {"scenarios": scenarios}
 
 
@@ -645,6 +778,7 @@ LAYERS = {
     "task_equality": gen_task_equality,
     "limit_configuration": gen_limit_configuration,
     "limit_velocity": gen_limit_velocity,
+    "limit_collision": gen_limit_collision,
     "solve_ik": gen_solve_ik,
 }
 
