@@ -501,6 +501,69 @@ def gen_task_equality():
     return out
 
 
+def gen_limit_configuration():
+    rng = np.random.default_rng(20260713)
+    out = {"models": {}}
+    # (gain, min_distance_from_limits)
+    variants = [(0.95, 0.0), (0.5, 0.05)]
+    for model_name in ("arm3", "floating"):
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cases = []
+        for gain, min_distance_from_limits in variants:
+            limit = mink.ConfigurationLimit(
+                model, gain=gain, min_distance_from_limits=min_distance_from_limits
+            )
+            for _ in range(3):
+                q = _valid_q(rng, model)
+                cfg.update(q=q)
+                constraint = limit.compute_qp_inequalities(cfg, dt=0.0)
+                cases.append({
+                    "gain": gain,
+                    "min_distance_from_limits": min_distance_from_limits,
+                    "q": j(q),
+                    "G": j(constraint.G) if constraint.G is not None else None,
+                    "h": j(constraint.h) if constraint.h is not None else None,
+                })
+        out["models"][model_name] = cases
+    return out
+
+
+def gen_limit_velocity():
+    rng = np.random.default_rng(20260714)
+    out = {"models": {}}
+    # (velocities dict (insertion order matters), dt)
+    velocities_by_model = {
+        "arm3": {"j1": 3.14, "j2": 2.0, "j3": 2.0},
+        "floating": {"neck": [1, 1, 1], "ant": 2.0},
+    }
+    dts = [0.02, 0.005]
+    for model_name, velocities in velocities_by_model.items():
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        # Store the joint order explicitly as a list of [name, [values...]] pairs so the C++
+        # test rebuilds the exact same ordered TArray<TPair<FString, FMinkVec>> (JSON objects
+        # preserve insertion order in Python, but we want this to be unambiguous on the C++
+        # side too).
+        joint_order = [[name, list(np.atleast_1d(vel).astype(float))] for name, vel in velocities.items()]
+        limit = mink.VelocityLimit(model, velocities=velocities)
+        cases = []
+        for dt in dts:
+            for _ in range(3):
+                q = _valid_q(rng, model)
+                cfg.update(q=q)
+                constraint = limit.compute_qp_inequalities(cfg, dt=dt)
+                cases.append({
+                    "joint_order": j(joint_order),
+                    "dt": dt,
+                    "q": j(q),
+                    "G": j(constraint.G) if constraint.G is not None else None,
+                    "h": j(constraint.h) if constraint.h is not None else None,
+                })
+        out["models"][model_name] = cases
+    return out
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
@@ -514,7 +577,9 @@ LAYERS = {
     "task_dof_freezing": gen_task_dof_freezing,
     "task_kinetic_energy": gen_task_kinetic_energy,
     "task_equality": gen_task_equality,
-    # Later tasks register: limit_*, solve_ik
+    "limit_configuration": gen_limit_configuration,
+    "limit_velocity": gen_limit_velocity,
+    # Later tasks register: solve_ik
 }
 
 
