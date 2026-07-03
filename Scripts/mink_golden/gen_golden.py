@@ -564,6 +564,72 @@ def gen_limit_velocity():
     return out
 
 
+def gen_solve_ik():
+    rng = np.random.default_rng(20260706)
+    scenarios = []
+
+    def run(model_name, q0, tasks_desc, limits_mode, constraints_desc, damping, dt, steps=10):
+        model = load_model(model_name)
+        cfg = mink.Configuration(model)
+        cfg.update(q=q0)
+        tasks, t_json = [], []
+        for d in tasks_desc:
+            if d["type"] == "frame":
+                t = mink.FrameTask(d["frame"], d["frame_type"], d["position_cost"],
+                                   d["orientation_cost"], d.get("gain", 1.0), d.get("lm", 0.0))
+                t.set_target(mink.SE3(wxyz_xyz=np.array(d["target"])))
+            elif d["type"] == "posture":
+                t = mink.PostureTask(model, d["cost"], d.get("gain", 1.0), d.get("lm", 0.0))
+                t.set_target(np.array(d["target_q"]))
+            elif d["type"] == "damping":
+                t = mink.DampingTask(model, d["cost"])
+            elif d["type"] == "com":
+                t = mink.ComTask(d["cost"]); t.set_target(np.array(d["target_com"]))
+            tasks.append(t); t_json.append(d)
+        limits = None if limits_mode == "default" else ([] if limits_mode == "none" else limits_mode)
+        constraints = None
+        c_json = None
+        if constraints_desc:
+            constraints = [mink.DofFreezingTask(model, d["dofs"]) for d in constraints_desc]
+            c_json = constraints_desc
+        v = mink.solve_ik(cfg, tasks, dt, solver="quadprog", damping=damping,
+                          limits=limits, constraints=constraints)
+        q = q0.copy()
+        traj_cfg = mink.Configuration(model); traj_cfg.update(q=q0)
+        for _ in range(steps):
+            vi = mink.solve_ik(traj_cfg, tasks, dt, solver="quadprog", damping=damping,
+                               limits=limits, constraints=constraints)
+            traj_cfg.integrate_inplace(vi, dt)
+        scenarios.append({"model": model_name, "q0": j(q0), "tasks": t_json,
+                          "limits": limits_mode if isinstance(limits_mode, str) else "default",
+                          "constraints": c_json, "damping": damping, "dt": dt,
+                          "v": j(v), "steps": steps, "q_final": j(traj_cfg.q)})
+
+    arm = load_model("arm3")
+    home = arm.key_qpos[0].copy()
+    ee_target = j(mink.SE3.from_rotation_and_translation(
+        mink.SO3.identity(), np.array([0.45, 0.1, 0.35])).wxyz_xyz)
+    run("arm3", home,
+        [{"type": "frame", "frame": "ee", "frame_type": "site", "position_cost": 1.0,
+          "orientation_cost": 0.2, "lm": 0.01, "target": ee_target},
+         {"type": "posture", "cost": 1e-2, "target_q": j(home)}],
+        "default", None, 1e-12, 0.02)
+    run("arm3", home,
+        [{"type": "frame", "frame": "ee", "frame_type": "site", "position_cost": 1.0,
+          "orientation_cost": 0.0, "lm": 0.1, "target": ee_target},
+         {"type": "damping", "cost": 1e-1}],
+        "none", [{"dofs": [0]}], 1e-3, 0.02)
+    flt = load_model("floating")
+    q0 = flt.qpos0.copy()
+    run("floating", q0,
+        [{"type": "frame", "frame": "tip", "frame_type": "site", "position_cost": 1.0,
+          "orientation_cost": 0.5, "target": j(mink.SE3.from_rotation_and_translation(
+              mink.SO3.identity(), np.array([0.3, 0.2, 1.5])).wxyz_xyz)},
+         {"type": "posture", "cost": 1e-3, "target_q": j(q0)}],
+        "default", None, 1e-12, 0.01)
+    return {"scenarios": scenarios}
+
+
 LAYERS = {
     "lie": gen_lie,
     "configuration": gen_configuration,
@@ -579,7 +645,7 @@ LAYERS = {
     "task_equality": gen_task_equality,
     "limit_configuration": gen_limit_configuration,
     "limit_velocity": gen_limit_velocity,
-    # Later tasks register: solve_ik
+    "solve_ik": gen_solve_ik,
 }
 
 
