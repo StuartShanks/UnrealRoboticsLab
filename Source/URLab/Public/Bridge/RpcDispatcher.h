@@ -20,6 +20,9 @@
 #include "Containers/Queue.h"
 #include <atomic>
 
+// Live end-effector IK driver (URLabMink); held by TUniquePtr, defined in the .cpp.
+class FMinkEndEffectorIK;
+
 class AAMjManager;
 class AMjReplayManager;
 struct FMjStepRequest;
@@ -204,6 +207,22 @@ private:
 	bool bPuppetHandlerInstalled = false;
 	bool bDirectHandlerInstalled = false;
 
+	// --- Live end-effector IK (mink) ------------------------------------------
+	/** Solver driver for the currently targeted articulation/frame; rebuilt when
+	 *  the target articulation or frame changes. */
+	TUniquePtr<FMinkEndEffectorIK> IkDriver;
+	/** Target pose in MuJoCo world coords (metres, wxyz), guarded by CallbackMutex. */
+	double IkTargetPos[3] = {0.0, 0.0, 0.0};
+	double IkTargetQuat[4] = {1.0, 0.0, 0.0, 0.0};
+	bool bIkHasOrientation = false;
+	/** True while the pre-step callback should solve+apply IK each step. */
+	std::atomic<bool> bIkActive{false};
+	/** The pre-step callback is registered on the engine exactly once. */
+	bool bIkCallbackInstalled = false;
+	/** Identifies the driver's current build so we know when to rebuild. */
+	FString IkArtName;
+	FString IkFrame;
+
 	void InstallPuppetHandler();
 	void UninstallPuppetHandler();
 	void InstallDirectHandler();
@@ -236,6 +255,7 @@ private:
 	TSharedPtr<FJsonObject> HandleSetTwist(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetQpos(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetMocapPose(const TSharedPtr<FJsonObject>& Req);
+	TSharedPtr<FJsonObject> HandleSetIkTarget(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleReadMocapPose(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleGetContacts(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleListKeyframes(const TSharedPtr<FJsonObject>& Req);
