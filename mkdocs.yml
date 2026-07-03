@@ -99,6 +99,7 @@ nav:
     - Debug Visualization: guides/debug.md
     - Interaction: guides/interaction.md
     - Recording & Replay: guides/recording.md
+    - Differential IK (URLabMink): guides/mink.md
   - Python & External Control:
     - Overview: python/index.md
     - Quickstart: python/quickstart.md

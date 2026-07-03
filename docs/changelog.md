@@ -6,6 +6,13 @@ URLab is in **alpha**: the public API and on-disk formats are not yet stable, an
 a milestone can include breaking changes. A first **beta** will follow once the
 feature set settles.
 
+## Unreleased
+
+### Added
+
+- **URLabMink** — 1:1 C++ port of mink v1.2.0 (differential IK: all tasks, all limits, QP
+  solve) with golden-vector numerical parity tests against Python mink.
+
 ## v0.5.0-alpha (2026-06-14)
 
 The render-pipeline, codegen, and tooling milestone.
