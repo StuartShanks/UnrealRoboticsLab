@@ -32,6 +32,9 @@
 #include "MuJoCo/Components/Joints/MjJoint.h"
 #include "MuJoCo/Components/Bodies/MjBody.h"
 #include "MuJoCo/Components/Controllers/MjArticulationController.h"
+#include "MinkEndEffectorIK.h"
+#include "Lie/MinkSE3.h"
+#include "Lie/MinkSO3.h"
 #include "MuJoCo/Input/MjPerturbation.h"
 #include "MuJoCo/Input/MjTwistController.h"
 #include "Transport/NetworkManager.h"
@@ -217,6 +220,10 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 		[this](auto& R) { return HandleSetMocapPose(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("body:string"), TEXT("pos:array"), TEXT("quat:array")},
 		/*Required=*/{TEXT("body")});
+	Reg(TEXT("set_ik_target"), EOpCategory::ManagerRequired, TEXT("ik"),
+		[this](auto& R) { return HandleSetIkTarget(R); },
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("frame:string"), TEXT("pos:array"), TEXT("quat:array?"), TEXT("active:bool")},
+		/*Required=*/{TEXT("pos")});
 	Reg(TEXT("read_mocap_pose"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleReadMocapPose(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("body:string"), TEXT("pos:array"), TEXT("quat:array")},
@@ -2819,6 +2826,189 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetMocapPose(const TSharedPtr
 	Reply->SetStringField(TEXT("body"), Body);
 	Reply->SetArrayField(TEXT("pos"), PosOut);
 	Reply->SetArrayField(TEXT("quat"), QuatOut);
+	return Reply;
+}
+
+// -----------------------------------------------------------------------------
+// set_ik_target — live end-effector IK via URLabMink.
+//
+// Commands the driven articulation's `frame` (default "hand") toward a Cartesian
+// target given in MuJoCo world coordinates (metres, optional wxyz orientation).
+// Lazily builds an FMinkEndEffectorIK for the articulation and installs a single
+// pre-step callback that solves + applies the IK (kinematic) every physics step.
+// -----------------------------------------------------------------------------
+TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetIkTarget(const TSharedPtr<FJsonObject>& Req)
+{
+	AAMjManager* Mgr = OwnerMgr.Get();
+	if (!Mgr || !Mgr->PhysicsEngine || !Mgr->PhysicsEngine->IsInitialized())
+		return MakeError(TEXT("not_ready"), TEXT("Manager not initialised"));
+
+	mjModel* m = Mgr->PhysicsEngine->GetModel();
+	mjData* d = Mgr->PhysicsEngine->GetData();
+	if (!m || !d)
+		return MakeError(TEXT("not_ready"), TEXT("MjModel/MjData missing"));
+
+	// --- request fields -----------------------------------------------------
+	const TArray<TSharedPtr<FJsonValue>>* PosArr = nullptr;
+	if (!Req->TryGetArrayField(TEXT("pos"), PosArr) || !PosArr || PosArr->Num() != 3)
+		return MakeError(TEXT("missing_field"),
+			TEXT("set_ik_target requires 'pos' [3] in MuJoCo world metres"));
+
+	const TArray<TSharedPtr<FJsonValue>>* QuatArr = nullptr;
+	const bool bHasQuat =
+		Req->TryGetArrayField(TEXT("quat"), QuatArr) && QuatArr && QuatArr->Num() == 4;
+
+	FString Frame;
+	Req->TryGetStringField(TEXT("frame"), Frame);
+	if (Frame.IsEmpty())
+		Frame = TEXT("hand");
+
+	bool bActive = true;
+	Req->TryGetBoolField(TEXT("active"), bActive);
+
+	// --- resolve articulation (by name/id, or the sole one) -----------------
+	FString Target;
+	Req->TryGetStringField(TEXT("target"), Target);
+	AMjArticulation* Art = nullptr;
+	if (!Target.IsEmpty())
+	{
+		Art = Mgr->GetArticulation(Target);
+		if (!Art)
+		{
+			for (AMjArticulation* A : Mgr->GetAllArticulations())
+				if (A && A->ActorId.Equals(Target))
+				{
+					Art = A;
+					break;
+				}
+		}
+		if (!Art)
+			return MakeError(TEXT("unknown_articulation"), Target);
+	}
+	else
+	{
+		const TArray<AMjArticulation*> All = Mgr->GetAllArticulations();
+		if (All.Num() == 0)
+			return MakeError(TEXT("no_articulation"), TEXT("No articulation in the level"));
+		if (All.Num() > 1)
+			return MakeError(TEXT("ambiguous"), TEXT("Multiple articulations; pass 'target'"));
+		Art = All[0];
+	}
+
+	// --- resolve the compiled frame body name (prefix-aware) ----------------
+	FString ResolvedFrame;
+	if (mj_name2id(m, mjOBJ_BODY, TCHAR_TO_UTF8(*Frame)) >= 0)
+	{
+		ResolvedFrame = Frame;
+	}
+	else
+	{
+		const FString Slash = TEXT("/") + Frame;
+		for (int32 b = 0; b < m->nbody; ++b)
+		{
+			const char* Bn = mj_id2name(m, mjOBJ_BODY, b);
+			if (!Bn)
+				continue;
+			const FString S = UTF8_TO_TCHAR(Bn);
+			if (S == Frame || S.EndsWith(Slash))
+			{
+				ResolvedFrame = S;
+				break;
+			}
+		}
+	}
+	if (ResolvedFrame.IsEmpty())
+		return MakeError(TEXT("unknown_frame"),
+			FString::Printf(TEXT("Body frame '%s' not found in model"), *Frame));
+
+	const FString ArtKey = Art->GetName();
+
+	// --- (re)build the driver + stash the target, under the step mutex ------
+	{
+		FScopeLock Lock(&Mgr->PhysicsEngine->CallbackMutex);
+
+		if (!IkDriver.IsValid() || IkArtName != ArtKey || IkFrame != ResolvedFrame)
+		{
+			FMinkEndEffectorIKConfig Cfg;
+			Cfg.FrameName = ResolvedFrame;
+			Cfg.FrameType = EMinkFrameType::Body;
+			Cfg.OrientationCost = bHasQuat ? 1.0 : 0.0;
+			for (UMjJoint* J : Art->GetJoints())
+			{
+				if (!J)
+					continue;
+				const int32 Id = J->GetMjID();
+				if (Id < 0 || Id >= m->njnt)
+					continue;
+				const char* Nm = mj_id2name(m, mjOBJ_JOINT, Id);
+				if (Nm)
+					Cfg.DriveJointNames.Add(UTF8_TO_TCHAR(Nm));
+			}
+
+			TUniquePtr<FMinkEndEffectorIK> NewDriver = MakeUnique<FMinkEndEffectorIK>(m, Cfg);
+			if (!NewDriver->IsValid())
+				return MakeError(TEXT("ik_build_failed"),
+					FString::Printf(TEXT("Could not build IK for frame '%s'"), *ResolvedFrame));
+
+			IkDriver = MoveTemp(NewDriver);
+			IkArtName = ArtKey;
+			IkFrame = ResolvedFrame;
+		}
+
+		IkTargetPos[0] = (mjtNum)(*PosArr)[0]->AsNumber();
+		IkTargetPos[1] = (mjtNum)(*PosArr)[1]->AsNumber();
+		IkTargetPos[2] = (mjtNum)(*PosArr)[2]->AsNumber();
+		bIkHasOrientation = bHasQuat;
+		if (bHasQuat)
+			for (int32 i = 0; i < 4; ++i)
+				IkTargetQuat[i] = (mjtNum)(*QuatArr)[i]->AsNumber();
+
+		bIkActive.store(bActive);
+	}
+
+	// --- install the per-step solve callback exactly once -------------------
+	if (!bIkCallbackInstalled)
+	{
+		Mgr->PhysicsEngine->RegisterPreStepCallback(
+			[this](mjModel* Mdl, mjData* Dat)
+			{
+				if (!bIkActive.load() || !IkDriver.IsValid())
+					return;
+				const FMinkVec3 P(IkTargetPos[0], IkTargetPos[1], IkTargetPos[2]);
+				FMinkSE3 TargetSe3;
+				if (bIkHasOrientation)
+				{
+					const double Wxyz[4] = {
+						IkTargetQuat[0], IkTargetQuat[1], IkTargetQuat[2], IkTargetQuat[3]};
+					TargetSe3 = FMinkSE3::FromRotationAndTranslation(FMinkSO3::FromWxyz(Wxyz), P);
+				}
+				else
+				{
+					TargetSe3 = FMinkSE3::FromTranslation(P);
+				}
+				IkDriver->SolveStep(Dat, TargetSe3, Mdl->opt.timestep);
+			});
+		bIkCallbackInstalled = true;
+	}
+
+	// --- reply --------------------------------------------------------------
+	TArray<TSharedPtr<FJsonValue>> PosOut;
+	for (int32 i = 0; i < 3; ++i)
+		PosOut.Add(MakeShared<FJsonValueNumber>(IkTargetPos[i]));
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("set_ik_target_ok"));
+	Reply->SetStringField(TEXT("actor_name"), ArtKey);
+	Reply->SetStringField(TEXT("frame"), ResolvedFrame);
+	Reply->SetArrayField(TEXT("pos"), PosOut);
+	if (bHasQuat)
+	{
+		TArray<TSharedPtr<FJsonValue>> QuatOut;
+		for (int32 i = 0; i < 4; ++i)
+			QuatOut.Add(MakeShared<FJsonValueNumber>(IkTargetQuat[i]));
+		Reply->SetArrayField(TEXT("quat"), QuatOut);
+	}
+	Reply->SetBoolField(TEXT("active"), bActive);
 	return Reply;
 }
 
