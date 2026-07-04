@@ -2713,24 +2713,83 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	if (!Art)
 		return MakeError(TEXT("unknown_articulation"), ArtName);
 
-	UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>();
-	if (!Nav)
+	// Component discovery (FindComponentByClass walks OwnedComponents, which
+	// is game-thread-owned) and the state/distance read are marshalled to the
+	// game thread. The dispatcher runs on the transport worker; marshal +
+	// wait (same pattern as HandleSetNavGoal above), but run inline when
+	// already on the game thread (tests).
+	EMjNavState NavState = EMjNavState::Idle;
+	float DistanceToGoal = 0.0f;
+	bool bHasComponent = false;
+	if (IsInGameThread())
+	{
+		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
+		{
+			bHasComponent = true;
+			NavState = Nav->GetNavState();
+			DistanceToGoal = Nav->GetDistanceToGoal();
+		}
+	}
+	else
+	{
+		// Same stack-use-after-return / FEvent-pool hazard as
+		// HandleSetNavGoal: no reference captures across the AsyncTask
+		// boundary. The articulation is a TWeakObjectPtr, the event is
+		// captured by value, and the results live in a heap-allocated
+		// thread-safe struct kept alive by a TSharedPtr copied into the
+		// lambda — safe however long the task takes to actually run.
+		struct FNavStatusResult
+		{
+			std::atomic<EMjNavState> NavState{EMjNavState::Idle};
+			FThreadSafeBool bHasComponent{false};
+			std::atomic<float> DistanceToGoal{0.0f};
+		};
+		TSharedPtr<FNavStatusResult, ESPMode::ThreadSafe> Result =
+			MakeShared<FNavStatusResult, ESPMode::ThreadSafe>();
+		TWeakObjectPtr<AMjArticulation> WeakArt(Art);
+		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+		AsyncTask(ENamedThreads::GameThread, [WeakArt, Result, Done]() {
+			if (AMjArticulation* ArtPtr = WeakArt.Get())
+			{
+				if (UMjNavComponent* Nav = ArtPtr->FindComponentByClass<UMjNavComponent>())
+				{
+					Result->bHasComponent = true;
+					Result->NavState = Nav->GetNavState();
+					Result->DistanceToGoal = Nav->GetDistanceToGoal();
+				}
+			}
+			Done->Trigger();
+		});
+		Done->Wait(2000);
+		FPlatformProcess::ReturnSynchEventToPool(Done);
+		bHasComponent = Result->bHasComponent;
+		NavState = Result->NavState.load();
+		DistanceToGoal = Result->DistanceToGoal.load();
+	}
+
+	if (!bHasComponent)
 		return MakeError(TEXT("no_nav_component"),
 			FString::Printf(TEXT("Articulation '%s' has no UMjNavComponent"), *ArtName));
 
-	// State + distance are atomics — safe to read from the worker thread.
 	const TCHAR* StateStr = TEXT("idle");
-	switch (Nav->GetNavState())
+	switch (NavState)
 	{
-		case EMjNavState::Navigating: StateStr = TEXT("navigating"); break;
-		case EMjNavState::Arrived:    StateStr = TEXT("arrived"); break;
-		case EMjNavState::Failed:     StateStr = TEXT("failed"); break;
-		default: break;
+		case EMjNavState::Navigating:
+			StateStr = TEXT("navigating");
+			break;
+		case EMjNavState::Arrived:
+			StateStr = TEXT("arrived");
+			break;
+		case EMjNavState::Failed:
+			StateStr = TEXT("failed");
+			break;
+		default:
+			break;
 	}
 	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
 	Reply->SetStringField(TEXT("op"), TEXT("get_nav_status_ok"));
 	Reply->SetStringField(TEXT("state"), StateStr);
-	Reply->SetNumberField(TEXT("distance_to_goal"), Nav->GetDistanceToGoal());
+	Reply->SetNumberField(TEXT("distance_to_goal"), DistanceToGoal);
 	return Reply;
 }
 
@@ -3119,8 +3178,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetIkTarget(const TSharedPtr<
 	if (!bIkCallbackInstalled)
 	{
 		Mgr->PhysicsEngine->RegisterPreStepCallback(
-			[this](mjModel* Mdl, mjData* Dat)
-			{
+			[this](mjModel* Mdl, mjData* Dat) {
 				if (!bIkActive.load() || !IkDriver.IsValid())
 					return;
 				const FMinkVec3 P(IkTargetPos[0], IkTargetPos[1], IkTargetPos[2]);
