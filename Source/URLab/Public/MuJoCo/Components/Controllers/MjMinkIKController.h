@@ -51,7 +51,9 @@ UENUM(BlueprintType)
 enum class EMinkLimitKind : uint8
 {
 	/** Joint range limits (mink ConfigurationLimit). */
-	Configuration
+	Configuration,
+	/** Hard cap on solved joint velocities (mink VelocityLimit). */
+	Velocity
 };
 
 /**
@@ -139,6 +141,16 @@ struct FMinkLimitSpec
 	/** Keep joints at least this far (rad/m) inside their range. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit", meta = (ClampMin = "0.0"))
 	float MinDistance = 0.0f;
+
+	/** Velocity only: max joint speed (rad/s or m/s), applied per selected DOF. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::Velocity", ClampMin = "0.0", UIMin = "0.0", UIMax = "10.0"))
+	float MaxVelocity = 3.0f;
+
+	/** Velocity only: joints to cap. Empty => every hinge/slide/ball joint. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::Velocity"))
+	TArray<TObjectPtr<UMjJoint>> Joints;
 };
 
 /**
@@ -249,4 +261,12 @@ private:
 
 	/** Diagnostic call counter (first calls + every Nth are logged). */
 	int32 DiagCounter = 0;
+
+	/** Solves discarded by the absurd-velocity sanity clamp. */
+	int32 BadSolveCount = 0;
+
+	/** Last mjData.time we integrated at — the engine calls ComputeAndApply on
+	 *  idle physics-thread iterations too, and integrating the open-loop
+	 *  reference on those races it ahead of the sim. */
+	double LastSimTime = -1.0;
 };
