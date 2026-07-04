@@ -57,7 +57,13 @@ public class URLabEditor : ModuleRules
 			"RenderCore",
 			"DesktopPlatform",
 			"Kismet",
-			"ToolMenus"
+			"ToolMenus",
+			// Required to include URLab's public MjTwistController.h, which
+			// transitively includes InputActionValue.h. URLab depends on
+			// EnhancedInput only privately, so that include path isn't
+			// propagated to consumers; MjBaseDriveControllerTests.cpp is the
+			// first URLabEditor test to include that header.
+			"EnhancedInput"
 		});
 	}
 }
