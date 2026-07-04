@@ -29,6 +29,13 @@
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
+#include "MuJoCo/Components/MjComponent.h"
+#include "MuJoCo/Components/Joints/MjJoint.h"
+#include "MuJoCo/Components/Bodies/MjBody.h"
+#include "MuJoCo/Components/Geometry/MjSite.h"
+#include "MuJoCo/Components/Geometry/MjGeom.h"
+#include "MuJoCo/Components/Controllers/MjMinkIKController.h"
+#include "EngineUtils.h"
 #include "Bridge/BridgeServer.h"
 #include "Bridge/BridgeServerProvider.h"
 #include "Bridge/OpRegistry.h"
@@ -1621,6 +1628,222 @@ TSharedPtr<FJsonObject> HandleViewportUntrack(const TSharedPtr<FJsonObject>& /*R
 	Reply->SetBoolField(TEXT("was_tracking"), bWasTracking);
 	return Reply;
 }
+
+// ---- add_controller — attach + configure a UMjMinkIKController from JSON ----
+
+/** Find a UMjComponent of class T on the actor whose MjName (or UE name)
+ *  matches; case-insensitive exact match. */
+template <typename T>
+T* FindMjComponentByName(AActor* Actor, const FString& Name)
+{
+	TArray<T*> Comps;
+	Actor->GetComponents<T>(Comps);
+	for (T* C : Comps)
+	{
+		if (!C)
+			continue;
+		if (C->GetMjName().Equals(Name, ESearchCase::IgnoreCase)
+			|| C->GetName().Equals(Name, ESearchCase::IgnoreCase))
+			return C;
+	}
+	return nullptr;
+}
+
+/**
+ * add_controller: attach a fully-configured MuJoCo Mink IK Controller to an
+ * articulation actor. Idempotent — reconfigures the existing controller if one
+ * is already attached. Component references (frame / mocap body / joints) are
+ * resolved by MjName against the actor's own components; misses are reported
+ * in the reply's `warnings` array rather than failing the whole op.
+ */
+TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
+{
+	if (!GEditor)
+		return MakeJsonError(TEXT("not_in_editor"), TEXT("GEditor null"));
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+		return MakeJsonError(TEXT("no_world"), TEXT("editor world unavailable"));
+
+	// --- resolve the articulation actor (target key, or the sole one) --------
+	FString Key, Err;
+	bool bByName = false;
+	AMjArticulation* Art = nullptr;
+	if (ResolveActorKey(Req, Key, bByName, Err))
+	{
+		for (TActorIterator<AMjArticulation> It(World); It; ++It)
+		{
+			AMjArticulation* A = *It;
+			if (A && (A->ActorId.Equals(Key) || A->GetName().Equals(Key)
+					|| A->GetActorLabel().Equals(Key)))
+			{
+				Art = A;
+				break;
+			}
+		}
+		if (!Art)
+			return MakeJsonError(TEXT("unknown_articulation"), Key);
+	}
+	else
+	{
+		int32 N = 0;
+		for (TActorIterator<AMjArticulation> It(World); It; ++It)
+		{
+			Art = *It;
+			++N;
+		}
+		if (N == 0)
+			return MakeJsonError(TEXT("no_articulation"), TEXT("no AMjArticulation in level"));
+		if (N > 1)
+			return MakeJsonError(TEXT("ambiguous"), TEXT("multiple articulations; pass 'target'"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	auto Warn = [&Warnings](const FString& W) {
+		Warnings.Add(MakeShared<FJsonValueString>(W));
+	};
+
+	// --- attach (or reuse) the controller ------------------------------------
+	UMjMinkIKController* Ctrl = Art->FindComponentByClass<UMjMinkIKController>();
+	const bool bWasExisting = (Ctrl != nullptr);
+	if (!Ctrl)
+	{
+		Ctrl = NewObject<UMjMinkIKController>(Art, TEXT("MinkIKController"));
+		if (!Ctrl)
+			return MakeJsonError(TEXT("attach_failed"), TEXT("NewObject returned null"));
+		Art->AddInstanceComponent(Ctrl);
+		Ctrl->RegisterComponent();
+	}
+
+	// helper: resolve a joints name-array field into component refs
+	auto ResolveJoints = [&](const TArray<TSharedPtr<FJsonValue>>* Names,
+						 TArray<TObjectPtr<UMjJoint>>& Out, const TCHAR* Ctx) {
+		Out.Reset();
+		if (!Names)
+			return;
+		for (const TSharedPtr<FJsonValue>& V : *Names)
+		{
+			const FString N = V->AsString();
+			if (UMjJoint* J = FindMjComponentByName<UMjJoint>(Art, N))
+				Out.Add(J);
+			else
+				Warn(FString::Printf(TEXT("%s: joint '%s' not found on actor"), Ctx, *N));
+		}
+	};
+
+	// --- tasks ----------------------------------------------------------------
+	const TArray<TSharedPtr<FJsonValue>>* TasksArr = nullptr;
+	if (Req->TryGetArrayField(TEXT("tasks"), TasksArr) && TasksArr)
+	{
+		Ctrl->Tasks.Reset();
+		for (const TSharedPtr<FJsonValue>& TV : *TasksArr)
+		{
+			const TSharedPtr<FJsonObject>* TO = nullptr;
+			if (!TV->TryGetObject(TO) || !TO->IsValid())
+				continue;
+			const TSharedPtr<FJsonObject>& T = *TO;
+
+			FMinkTaskSpec Spec;
+			FString Kind;
+			T->TryGetStringField(TEXT("kind"), Kind);
+			if (Kind.Equals(TEXT("frame"), ESearchCase::IgnoreCase))
+			{
+				Spec.Kind = EMinkTaskKind::Frame;
+				FString FrameName;
+				T->TryGetStringField(TEXT("frame"), FrameName);
+				UMjComponent* Frame = FindMjComponentByName<UMjSite>(Art, FrameName);
+				if (!Frame)
+					Frame = FindMjComponentByName<UMjBody>(Art, FrameName);
+				if (!Frame)
+					Frame = FindMjComponentByName<UMjGeom>(Art, FrameName);
+				if (Frame)
+					Spec.Frame = Frame;
+				else
+					Warn(FString::Printf(TEXT("frame '%s' not found (site/body/geom)"), *FrameName));
+
+				FString MocapName;
+				if (T->TryGetStringField(TEXT("mocap_body"), MocapName) && !MocapName.IsEmpty())
+				{
+					if (UMjBody* Mb = FindMjComponentByName<UMjBody>(Art, MocapName))
+						Spec.TargetMocapBody = Mb;
+					else
+						Warn(FString::Printf(TEXT("mocap_body '%s' not found"), *MocapName));
+				}
+				double V;
+				if (T->TryGetNumberField(TEXT("position_cost"), V)) Spec.PositionCost = V;
+				if (T->TryGetNumberField(TEXT("orientation_cost"), V)) Spec.OrientationCost = V;
+			}
+			else if (Kind.Equals(TEXT("posture"), ESearchCase::IgnoreCase))
+			{
+				Spec.Kind = EMinkTaskKind::Posture;
+			}
+			else if (Kind.Equals(TEXT("damping"), ESearchCase::IgnoreCase))
+			{
+				Spec.Kind = EMinkTaskKind::Damping;
+			}
+			else
+			{
+				Warn(FString::Printf(TEXT("unknown task kind '%s' — skipped"), *Kind));
+				continue;
+			}
+
+			double V;
+			if (T->TryGetNumberField(TEXT("cost"), V)) Spec.Cost = V;
+			if (T->TryGetNumberField(TEXT("gain"), V)) Spec.Gain = V;
+			if (T->TryGetNumberField(TEXT("lm_damping"), V)) Spec.LmDamping = V;
+			bool B;
+			if (T->TryGetBoolField(TEXT("enabled"), B)) Spec.bEnabled = B;
+
+			const TArray<TSharedPtr<FJsonValue>>* JN = nullptr;
+			T->TryGetArrayField(TEXT("joints"), JN);
+			ResolveJoints(JN, Spec.Joints, *FString::Printf(TEXT("tasks[%d]"), Ctrl->Tasks.Num()));
+
+			Ctrl->Tasks.Add(MoveTemp(Spec));
+		}
+	}
+
+	// --- limits ----------------------------------------------------------------
+	const TArray<TSharedPtr<FJsonValue>>* LimArr = nullptr;
+	if (Req->TryGetArrayField(TEXT("limits"), LimArr) && LimArr)
+	{
+		Ctrl->Limits.Reset();
+		for (const TSharedPtr<FJsonValue>& LV : *LimArr)
+		{
+			const TSharedPtr<FJsonObject>* LO = nullptr;
+			if (!LV->TryGetObject(LO) || !LO->IsValid())
+				continue;
+			FMinkLimitSpec LSpec; // Configuration is the only kind
+			double V;
+			if ((*LO)->TryGetNumberField(TEXT("gain"), V)) LSpec.Gain = V;
+			if ((*LO)->TryGetNumberField(TEXT("min_distance"), V)) LSpec.MinDistance = V;
+			Ctrl->Limits.Add(LSpec);
+		}
+	}
+
+	// --- drive joints + solver params -------------------------------------------
+	const TArray<TSharedPtr<FJsonValue>>* DJ = nullptr;
+	if (Req->TryGetArrayField(TEXT("drive_joints"), DJ))
+		ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"));
+
+	double V;
+	if (Req->TryGetNumberField(TEXT("max_iters"), V)) Ctrl->MaxIters = FMath::Max(1, (int32)V);
+	if (Req->TryGetNumberField(TEXT("qp_damping"), V)) Ctrl->QpDamping = V;
+	if (Req->TryGetNumberField(TEXT("pos_threshold"), V)) Ctrl->PosThreshold = V;
+	if (Req->TryGetNumberField(TEXT("ori_threshold"), V)) Ctrl->OriThreshold = V;
+	bool B;
+	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B)) Ctrl->bSyncFromLiveState = B;
+
+	Art->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("add_controller_ok"));
+	Reply->SetStringField(TEXT("actor_name"), Art->GetName());
+	Reply->SetBoolField(TEXT("was_existing"), bWasExisting);
+	Reply->SetNumberField(TEXT("tasks"), Ctrl->Tasks.Num());
+	Reply->SetNumberField(TEXT("limits"), Ctrl->Limits.Num());
+	Reply->SetNumberField(TEXT("drive_joints"), Ctrl->DriveJoints.Num());
+	Reply->SetArrayField(TEXT("warnings"), Warnings);
+	return Reply;
+}
 } // namespace
 
 namespace URLabEditorOpHandlers
@@ -1758,6 +1981,11 @@ void RegisterAll()
 		GameThreadHandler(&HandleAddQuickConvert),
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string")},
 		/*Required=*/{TEXT("target")});
+	RegEditor(TEXT("add_controller"), TEXT("ik"),
+		GameThreadHandler(&HandleAddController),
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"),
+			TEXT("tasks:int"), TEXT("limits:int"), TEXT("drive_joints:int"), TEXT("warnings:array")},
+		/*Required=*/{});
 	RegEditor(TEXT("remove_quick_convert"), TEXT("outliner"),
 		GameThreadHandler(&HandleRemoveQuickConvert),
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string")},
@@ -1862,6 +2090,7 @@ void UnregisterAll()
 	URLabOpRegistry::UnregisterHandler(TEXT("set_viewport_mode"));
 	URLabOpRegistry::UnregisterHandler(TEXT("track_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("untrack"));
+	URLabOpRegistry::UnregisterHandler(TEXT("add_controller"));
 	StopTrackingCameraInternal();
 }
 } // namespace URLabEditorOpHandlers
