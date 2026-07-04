@@ -29,6 +29,7 @@
 #include "Tasks/MinkDampingTask.h"
 #include "Limits/MinkLimit.h"
 #include "Limits/MinkConfigurationLimit.h"
+#include "Limits/MinkVelocityLimit.h"
 #include "Lie/MinkSE3.h"
 #include "Lie/MinkSO3.h"
 
@@ -222,6 +223,32 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 		{
 			Mink->BuiltLimits.Add(MakeUnique<FMinkConfigurationLimit>(m, (double)L.Gain, (double)L.MinDistance));
 		}
+		else if (L.Kind == EMinkLimitKind::Velocity)
+		{
+			// (joint name, per-DOF cap) pairs; empty Joints => every non-free joint.
+			TArray<TPair<FString, FMinkVec>> Caps;
+			auto AddCap = [&](int32 JntId) {
+				const int32 T = m->jnt_type[JntId];
+				if (T == mjJNT_FREE)
+					return;
+				const int32 W = (T == mjJNT_BALL) ? 3 : 1;
+				const char* Nm = mj_id2name(m, mjOBJ_JOINT, JntId);
+				if (Nm)
+					Caps.Emplace(FString(UTF8_TO_TCHAR(Nm)), FMinkVec::Constant(W, (double)L.MaxVelocity));
+			};
+			if (L.Joints.Num() == 0)
+			{
+				for (int32 j = 0; j < m->njnt; ++j)
+					AddCap(j);
+			}
+			else
+			{
+				for (const UMjJoint* J : L.Joints)
+					if (J && J->GetMjID() >= 0)
+						AddCap(J->GetMjID());
+			}
+			Mink->BuiltLimits.Add(MakeUnique<FMinkVelocityLimit>(m, Caps));
+		}
 	}
 
 	// --- resolve driven actuators --------------------------------------------------
@@ -360,8 +387,17 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	}
 	const TArray<const FMinkLimit*>* LimitsArg = Mink->BuiltLimits.Num() > 0 ? &LimitPtrs : nullptr;
 
-	// Inner solve/integrate loop (mink example pattern), early-out on convergence.
-	const double Dt = m->opt.timestep;
+	// Integrate exactly once per real physics step: the engine also invokes us
+	// on idle physics-thread iterations, which must not advance the reference.
+	const double Now = d->time;
+	if (LastSimTime >= 0.0 && Now <= LastSimTime)
+	{
+		return; // sim didn't advance since our last write — hold ctrl as-is
+	}
+	const double Dt = (LastSimTime < 0.0)
+		? m->opt.timestep
+		: FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
+	LastSimTime = Now;
 	for (int32 It = 0; It < MaxIters; ++It)
 	{
 		const FMinkIKResult R = MinkSolveIK(Config, Active, Dt, (double)QpDamping,
@@ -375,6 +411,24 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 					IkStatusName(R.Status));
 			}
 			return; // hold the previous ctrl; never write a bad solution
+		}
+
+		// Sanity clamp: a legit differential-IK velocity is O(1-10); anything
+		// absurd is a numerically-bad solve — discard the step (hold last ctrl)
+		// and count it, so bad solves become telemetry instead of violence.
+		const double VMax = R.Velocity.size() > 0 ? R.Velocity.cwiseAbs().maxCoeff() : 0.0;
+		if (VMax > 50.0)
+		{
+			++BadSolveCount;
+			if (BadSolveCount <= 10 || BadSolveCount % 100 == 0)
+			{
+				Eigen::Index Worst = 0;
+				R.Velocity.cwiseAbs().maxCoeff(&Worst);
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] BAD SOLVE #%d discarded: |v|max=%.1f at dof %d"),
+					BadSolveCount, VMax, (int32)Worst);
+			}
+			return;
 		}
 		Config.IntegrateInplace(R.Velocity, Dt);
 

@@ -1811,10 +1811,24 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 			const TSharedPtr<FJsonObject>* LO = nullptr;
 			if (!LV->TryGetObject(LO) || !LO->IsValid())
 				continue;
-			FMinkLimitSpec LSpec; // Configuration is the only kind
-			double V;
-			if ((*LO)->TryGetNumberField(TEXT("gain"), V)) LSpec.Gain = V;
-			if ((*LO)->TryGetNumberField(TEXT("min_distance"), V)) LSpec.MinDistance = V;
+			FMinkLimitSpec LSpec;
+			FString LKind;
+			(*LO)->TryGetStringField(TEXT("kind"), LKind);
+			if (LKind.Equals(TEXT("velocity"), ESearchCase::IgnoreCase))
+			{
+				LSpec.Kind = EMinkLimitKind::Velocity;
+				double V;
+				if ((*LO)->TryGetNumberField(TEXT("max_velocity"), V)) LSpec.MaxVelocity = V;
+				const TArray<TSharedPtr<FJsonValue>>* LJ = nullptr;
+				(*LO)->TryGetArrayField(TEXT("joints"), LJ);
+				ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"));
+			}
+			else // configuration (default)
+			{
+				double V;
+				if ((*LO)->TryGetNumberField(TEXT("gain"), V)) LSpec.Gain = V;
+				if ((*LO)->TryGetNumberField(TEXT("min_distance"), V)) LSpec.MinDistance = V;
+			}
 			Ctrl->Limits.Add(LSpec);
 		}
 	}
