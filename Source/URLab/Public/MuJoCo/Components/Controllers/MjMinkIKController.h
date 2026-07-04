@@ -246,4 +246,7 @@ private:
 	/** Manual targets keyed by spec index; guarded by TargetMutex. */
 	TMap<int32, FManualTarget> ManualTargets;
 	FCriticalSection TargetMutex;
+
+	/** Diagnostic call counter (first calls + every Nth are logged). */
+	int32 DiagCounter = 0;
 };
