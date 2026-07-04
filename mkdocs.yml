@@ -100,6 +100,7 @@ nav:
     - Interaction: guides/interaction.md
     - Recording & Replay: guides/recording.md
     - Differential IK (URLabMink): guides/mink.md
+    - Mobile Base Navigation: guides/navigation-demo.md
   - Python & External Control:
     - Overview: python/index.md
     - Quickstart: python/quickstart.md
