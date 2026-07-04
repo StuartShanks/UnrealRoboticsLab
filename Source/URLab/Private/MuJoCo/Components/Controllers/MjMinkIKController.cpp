@@ -390,9 +390,18 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	// Integrate exactly once per real physics step: the engine also invokes us
 	// on idle physics-thread iterations, which must not advance the reference.
 	const double Now = d->time;
-	if (LastSimTime >= 0.0 && Now <= LastSimTime)
+	if (LastSimTime >= 0.0 && Now < LastSimTime)
 	{
-		return; // sim didn't advance since our last write — hold ctrl as-is
+		// Sim time went backwards => the sim was reset (e.g. auto-reset after a
+		// NaN, or a user reset). Re-base the open-loop reference on the live
+		// state so stale ctrl can't slam the respawned robot into divergence.
+		LastSimTime = Now;
+		Config.Update(d->qpos);
+		return;
+	}
+	if (LastSimTime >= 0.0 && Now == LastSimTime)
+	{
+		return; // idle invocation — sim didn't advance; hold ctrl as-is
 	}
 	const double Dt = (LastSimTime < 0.0)
 		? m->opt.timestep
