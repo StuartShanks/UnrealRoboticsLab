@@ -37,6 +37,7 @@
 #include "Lie/MinkSO3.h"
 #include "MuJoCo/Input/MjPerturbation.h"
 #include "MuJoCo/Input/MjTwistController.h"
+#include "MuJoCo/Navigation/MjNavComponent.h"
 #include "Transport/NetworkManager.h"
 #include "Transport/ShmPublishTransport.h"
 #include "Replay/MjReplayManager.h"
@@ -212,6 +213,14 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 	Reg(TEXT("set_twist"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetTwist(R); },
 		{TEXT("op:string")});
+	Reg(TEXT("set_nav_goal"), EOpCategory::ManagerRequired, TEXT("runtime"),
+		[this](auto& R) { return HandleSetNavGoal(R); },
+		/*Reply=*/{TEXT("op:string"), TEXT("accepted:bool")},
+		/*Required=*/{TEXT("articulation"), TEXT("x"), TEXT("y")});
+	Reg(TEXT("get_nav_status"), EOpCategory::ManagerRequired, TEXT("runtime"),
+		[this](auto& R) { return HandleGetNavStatus(R); },
+		/*Reply=*/{TEXT("op:string"), TEXT("state:string"), TEXT("distance_to_goal:float")},
+		/*Required=*/{TEXT("articulation")});
 	Reg(TEXT("set_qpos"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetQpos(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string"), TEXT("actor_id:string?"), TEXT("actor_name:string?"), TEXT("qpos:array"), TEXT("free_base_shortcut:bool")},
@@ -2600,6 +2609,103 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetTwist(const TSharedPtr<FJs
 		A.Add(MakeShared<FJsonValueNumber>(YawRate));
 		Reply->SetArrayField(TEXT("angular"), A);
 	}
+	return Reply;
+}
+
+// =============================================================================
+// set_nav_goal
+// =============================================================================
+
+TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<FJsonObject>& Req)
+{
+	AAMjManager* Mgr = OwnerMgr.Get();
+	if (!Mgr)
+		return MakeError(TEXT("not_ready"), TEXT("Manager missing"));
+
+	FString ArtName;
+	Req->TryGetStringField(TEXT("articulation"), ArtName);
+	double X = 0, Y = 0;
+	Req->TryGetNumberField(TEXT("x"), X);
+	Req->TryGetNumberField(TEXT("y"), Y);
+
+	AMjArticulation* Art = Mgr->GetArticulation(ArtName);
+	if (!Art)
+		return MakeError(TEXT("unknown_articulation"), ArtName);
+
+	// MuJoCo metres → UE cm (X→X·100, Y→−Y·100); Z from the actor's height.
+	const FVector UEGoal((float)(X * 100.0), (float)(-Y * 100.0), Art->GetActorLocation().Z);
+
+	// Navmesh queries and component discovery are game-thread-only. The
+	// dispatcher runs on the transport worker; marshal + wait (camera-op
+	// pattern), but run inline when already on the game thread (tests).
+	bool bAccepted = false;
+	bool bHasComponent = false;
+	auto DoWork = [&]() {
+		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
+		{
+			bHasComponent = true;
+			bAccepted = Nav->SetNavGoal(UEGoal);
+		}
+	};
+	if (IsInGameThread())
+	{
+		DoWork();
+	}
+	else
+	{
+		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+		AsyncTask(ENamedThreads::GameThread, [&DoWork, Done]() {
+			DoWork();
+			Done->Trigger();
+		});
+		Done->Wait(2000);
+		FPlatformProcess::ReturnSynchEventToPool(Done);
+	}
+
+	if (!bHasComponent)
+		return MakeError(TEXT("no_nav_component"),
+			FString::Printf(TEXT("Articulation '%s' has no UMjNavComponent"), *ArtName));
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("set_nav_goal_ok"));
+	Reply->SetBoolField(TEXT("accepted"), bAccepted);
+	return Reply;
+}
+
+// =============================================================================
+// get_nav_status
+// =============================================================================
+
+TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr<FJsonObject>& Req)
+{
+	AAMjManager* Mgr = OwnerMgr.Get();
+	if (!Mgr)
+		return MakeError(TEXT("not_ready"), TEXT("Manager missing"));
+
+	FString ArtName;
+	Req->TryGetStringField(TEXT("articulation"), ArtName);
+	AMjArticulation* Art = Mgr->GetArticulation(ArtName);
+	if (!Art)
+		return MakeError(TEXT("unknown_articulation"), ArtName);
+
+	UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>();
+	if (!Nav)
+		return MakeError(TEXT("no_nav_component"),
+			FString::Printf(TEXT("Articulation '%s' has no UMjNavComponent"), *ArtName));
+
+	// State + distance are atomics — safe to read from the worker thread.
+	const TCHAR* StateStr = TEXT("idle");
+	switch (Nav->GetNavState())
+	{
+		case EMjNavState::Navigating: StateStr = TEXT("navigating"); break;
+		case EMjNavState::Arrived:    StateStr = TEXT("arrived"); break;
+		case EMjNavState::Failed:     StateStr = TEXT("failed"); break;
+		default: break;
+	}
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("get_nav_status_ok"));
+	Reply->SetStringField(TEXT("state"), StateStr);
+	Reply->SetNumberField(TEXT("distance_to_goal"), Nav->GetDistanceToGoal());
 	return Reply;
 }
 

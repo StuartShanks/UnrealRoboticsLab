@@ -253,6 +253,8 @@ private:
 	TSharedPtr<FJsonObject> HandleSetSimSpeed(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetControlSource(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetTwist(const TSharedPtr<FJsonObject>& Req);
+	TSharedPtr<FJsonObject> HandleSetNavGoal(const TSharedPtr<FJsonObject>& Req);
+	TSharedPtr<FJsonObject> HandleGetNavStatus(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetQpos(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetMocapPose(const TSharedPtr<FJsonObject>& Req);
 	TSharedPtr<FJsonObject> HandleSetIkTarget(const TSharedPtr<FJsonObject>& Req);
