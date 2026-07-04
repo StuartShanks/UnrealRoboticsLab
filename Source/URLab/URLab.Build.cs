@@ -90,6 +90,7 @@ public class URLab : ModuleRules
 			"CinematicCamera",
 			"ImageWrapper",
 			"EnhancedInput",
+			"NavigationSystem",
 			"Chaos",
 			"Landscape",
 			"Eigen",
