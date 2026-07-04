@@ -283,9 +283,21 @@ void UMjMinkIKController::SetIKTarget(int32 TaskIndex, FVector WorldPos, FQuat W
 
 void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*/)
 {
+	// Throttled diagnostics: first calls + every 2000th tell us this ran, what
+	// target it saw, and what it wrote — ground truth for remote debugging.
+	const bool bDiag = (DiagCounter < 3) || (DiagCounter % 2000 == 0);
+	++DiagCounter;
+
 	if (!bEnabled || !Mink.IsValid() || !Mink->Config.IsValid() || Mink->BuiltTasks.Num() == 0
 		|| DriveCtrlIds.Num() == 0)
 	{
+		if (bDiag)
+		{
+			UE_LOG(LogURLabRuntime, Warning,
+				TEXT("[MinkIK] call #%d EARLY-OUT: enabled=%d mink=%d tasks=%d drive=%d"),
+				DiagCounter, bEnabled ? 1 : 0, Mink.IsValid() ? 1 : 0,
+				Mink.IsValid() ? Mink->BuiltTasks.Num() : -1, DriveCtrlIds.Num());
+		}
 		return;
 	}
 	FMinkConfiguration& Config = *Mink->Config;
@@ -315,14 +327,17 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		}
 		if (B.AsFrame)
 		{
-			if (B.MocapIndex >= 0)
-			{
-				B.AsFrame->SetTarget(FMinkSE3::FromMocapId(d, B.MocapIndex));
-			}
-			else if (const FManualTarget* T = Manual.Find(B.SpecIndex); T && T->bSet)
+			// A streamed/manual target wins over the mocap body: UMjBody's tick
+			// re-stamps the mocap from its UE transform every frame, so RPC
+			// callers stream targets through ApplyConfig/SetIKTarget instead.
+			if (const FManualTarget* T = Manual.Find(B.SpecIndex); T && T->bSet)
 			{
 				B.AsFrame->SetTarget(FMinkSE3::FromRotationAndTranslation(
 					FMinkSO3::FromWxyz(T->Quat), FMinkVec3(T->Pos[0], T->Pos[1], T->Pos[2])));
+			}
+			else if (B.MocapIndex >= 0)
+			{
+				B.AsFrame->SetTarget(FMinkSE3::FromMocapId(d, B.MocapIndex));
 			}
 			// else: keep the last target (initialised to the bind pose).
 			if (!FirstFrame)
@@ -383,6 +398,30 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		{
 			d->ctrl[DriveCtrlIds[i]] = Q[DriveQposAddrs[i]];
 		}
+	}
+
+	if (bDiag)
+	{
+		FMinkVec3 Tgt(0, 0, 0);
+		int32 Mc = -2;
+		for (const FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
+		{
+			if (B.AsFrame)
+			{
+				Mc = B.MocapIndex;
+				if (B.AsFrame->TransformTargetToWorld.IsSet())
+					Tgt = B.AsFrame->TransformTargetToWorld.GetValue().Translation();
+				break;
+			}
+		}
+		UE_LOG(LogURLabRuntime, Log,
+			TEXT("[MinkIK] call #%d OK: active=%d mocap_idx=%d tgt=(%.3f %.3f %.3f) "
+				 "q_live0=%.3f ctrl_out=(%.3f %.3f %.3f)"),
+			DiagCounter, Active.Num(), Mc, Tgt[0], Tgt[1], Tgt[2],
+			d->qpos[DriveQposAddrs.Num() > 0 ? DriveQposAddrs[0] : 0],
+			DriveCtrlIds.Num() > 0 ? d->ctrl[DriveCtrlIds[0]] : 0.0,
+			DriveCtrlIds.Num() > 1 ? d->ctrl[DriveCtrlIds[1]] : 0.0,
+			DriveCtrlIds.Num() > 2 ? d->ctrl[DriveCtrlIds[2]] : 0.0);
 	}
 }
 
@@ -453,6 +492,53 @@ void UMjMinkIKController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
 		for (int32 i = 0; i < Enabled->Num() && i < Tasks.Num(); ++i)
 		{
 			Tasks[i].bEnabled = (*Enabled)[i]->AsBool();
+		}
+	}
+
+	// Streamed IK target in MuJoCo world coordinates (metres, wxyz). Routed to
+	// the manual-target store, which takes precedence over the mocap body —
+	// the supported way to drive the target over RPC (configure_controller).
+	//   "target_pos":  [x, y, z]           (required to set a target)
+	//   "target_quat": [w, x, y, z]        (optional; identity if omitted)
+	//   "target_task": <spec index>        (optional; default first Frame spec)
+	const TArray<TSharedPtr<FJsonValue>>* TPos = nullptr;
+	if (InParams->TryGetArrayField(TEXT("target_pos"), TPos) && TPos && TPos->Num() == 3)
+	{
+		int32 TaskIdx = INDEX_NONE;
+		double IdxV = 0.0;
+		if (InParams->TryGetNumberField(TEXT("target_task"), IdxV))
+		{
+			TaskIdx = (int32)IdxV;
+		}
+		else
+		{
+			for (int32 i = 0; i < Tasks.Num(); ++i)
+			{
+				if (Tasks[i].Kind == EMinkTaskKind::Frame)
+				{
+					TaskIdx = i;
+					break;
+				}
+			}
+		}
+		if (TaskIdx != INDEX_NONE)
+		{
+			FManualTarget T;
+			for (int32 i = 0; i < 3; ++i)
+			{
+				T.Pos[i] = (*TPos)[i]->AsNumber();
+			}
+			const TArray<TSharedPtr<FJsonValue>>* TQuat = nullptr;
+			if (InParams->TryGetArrayField(TEXT("target_quat"), TQuat) && TQuat && TQuat->Num() == 4)
+			{
+				for (int32 i = 0; i < 4; ++i)
+				{
+					T.Quat[i] = (*TQuat)[i]->AsNumber();
+				}
+			}
+			T.bSet = true;
+			FScopeLock Lock(&TargetMutex);
+			ManualTargets.Add(TaskIdx, T);
 		}
 	}
 }
