@@ -104,6 +104,7 @@ bool UMjNavComponent::SetNavGoal(FVector WorldGoal)
 	Path = P->PathPoints;
 	BestDistToGoalCm = TNumericLimits<float>::Max();
 	TimeSinceProgress = 0.f;
+	DistToGoalM.store(FVector::Dist2D(Start, Path.Last()) / 100.f, std::memory_order_release);
 	SetState(EMjNavState::Navigating);
 	return true;
 }
@@ -113,6 +114,7 @@ void UMjNavComponent::SetPathForTesting(const TArray<FVector>& PathPoints)
 	Path = PathPoints;
 	BestDistToGoalCm = TNumericLimits<float>::Max();
 	TimeSinceProgress = 0.f;
+	DistToGoalM.store(0.f, std::memory_order_release);
 	SetState(EMjNavState::Navigating);
 }
 
