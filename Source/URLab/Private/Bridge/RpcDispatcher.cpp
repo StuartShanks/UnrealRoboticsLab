@@ -2640,26 +2640,51 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 	// pattern), but run inline when already on the game thread (tests).
 	bool bAccepted = false;
 	bool bHasComponent = false;
-	auto DoWork = [&]() {
+	if (IsInGameThread())
+	{
 		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
 		{
 			bHasComponent = true;
 			bAccepted = Nav->SetNavGoal(UEGoal);
 		}
-	};
-	if (IsInGameThread())
-	{
-		DoWork();
 	}
 	else
 	{
+		// Do NOT capture Art / UEGoal / the result bools by reference here:
+		// if Done->Wait(2000) times out, this function returns and its stack
+		// frame (including Art/UEGoal/bAccepted/bHasComponent) is popped
+		// while the still-queued game-thread task is about to dereference
+		// it — stack-use-after-return, plus Done would already be back in
+		// the FEvent pool by the time the task calls Trigger() on it. So:
+		// the articulation is a TWeakObjectPtr (it could also be GC'd during
+		// a stall), the goal/event are captured by value, and the results
+		// live in a heap-allocated thread-safe struct kept alive by a
+		// TSharedPtr copied into the lambda — safe however long the task
+		// takes to actually run.
+		struct FNavGoalResult
+		{
+			FThreadSafeBool bAccepted{false};
+			FThreadSafeBool bHasComponent{false};
+		};
+		TSharedPtr<FNavGoalResult, ESPMode::ThreadSafe> Result =
+			MakeShared<FNavGoalResult, ESPMode::ThreadSafe>();
+		TWeakObjectPtr<AMjArticulation> WeakArt(Art);
 		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
-		AsyncTask(ENamedThreads::GameThread, [&DoWork, Done]() {
-			DoWork();
+		AsyncTask(ENamedThreads::GameThread, [WeakArt, UEGoal, Result, Done]() {
+			if (AMjArticulation* ArtPtr = WeakArt.Get())
+			{
+				if (UMjNavComponent* Nav = ArtPtr->FindComponentByClass<UMjNavComponent>())
+				{
+					Result->bHasComponent = true;
+					Result->bAccepted = Nav->SetNavGoal(UEGoal);
+				}
+			}
 			Done->Trigger();
 		});
 		Done->Wait(2000);
 		FPlatformProcess::ReturnSynchEventToPool(Done);
+		bAccepted = Result->bAccepted;
+		bHasComponent = Result->bHasComponent;
 	}
 
 	if (!bHasComponent)
