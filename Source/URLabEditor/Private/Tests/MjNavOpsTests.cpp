@@ -57,7 +57,7 @@ bool FMjNavOpsNoComponent::RunTest(const FString&)
 	Req->SetNumberField(TEXT("y"), 0.0);
 	TSharedPtr<FJsonObject> Reply = Disp->Dispatch(Req);
 	FString Err;
-	TestTrue(TEXT("error field present"), Reply->TryGetStringField(TEXT("error"), Err));
+	TestTrue(TEXT("code field present"), Reply->TryGetStringField(TEXT("code"), Err));
 	TestEqual(TEXT("no_nav_component"), Err, TEXT("no_nav_component"));
 	S.Cleanup();
 	return true;
