@@ -41,19 +41,12 @@ void UMjIntVelocityActuator::ExportTo(mjsActuator* Element, mjsDefault* def)
 
 	// --- CODEGEN_EXPORT_START ---
 	{
-		// Same class-default preservation as mjs_setToPosition (which this wraps):
-		// nullptr for unauthored pointer params, Element->gainprm[0] for unauthored
-		// kp — never -1 sentinels that clobber <default>-class gains.
-		// NOTE: mjs_setToIntVelocity DISCARDS the inner mjs_setToPosition return
-		// value, so SetToErr can only surface this wrapper's own errors
-		// (actrange/inheritrange conflicts) — kv/dampratio rejections cannot
-		// propagate here. Passing at most one of kv/dampratio avoids them anyway.
-		double kvBuf[1] = {(double)kv};
-		double dampratioBuf[1] = {(double)dampratio};
+		double kvBuf[1] = {bOverride_kv ? (double)kv : -1.0};
+		double dampratioBuf[1] = {bOverride_dampratio ? (double)dampratio : -1.0};
 		const char* SetToErr = mjs_setToIntVelocity(Element, bOverride_kp ? (double)kp : Element->gainprm[0], bOverride_kv ? kvBuf : nullptr, bOverride_dampratio ? dampratioBuf : nullptr, nullptr, bOverride_inheritrange ? (double)inheritrange : 0.0);
 		if (SetToErr && *SetToErr)
 		{
-			UE_LOG(LogURLabExport, Warning, TEXT("[%s] mjs_setToIntVelocity error: %s"), *GetName(), UTF8_TO_TCHAR(SetToErr));
+			UE_LOG(LogURLabBind, Warning, TEXT("mjs_setToIntVelocity on '%s': %s"), *GetName(), UTF8_TO_TCHAR(SetToErr));
 		}
 	}
 	if (bOverride_inheritrange)

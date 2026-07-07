@@ -1937,35 +1937,6 @@ def _setto_consumed_attrs(
     return {param_renames.get(p["name"], p["name"]) for p in sig.get("params", [])}
 
 
-# Comment lines emitted above a check_error-wrapped mjs_setTo* call. They
-# document WHY the nullable/re-assert pattern is load-bearing at the point of
-# use, so a reader of the generated .cpp doesn't need to open this generator.
-# Keyed by function name; owned here (not codegen_rules.json) because the
-# rules file bans hand-written C++/comment literals.
-_SETTO_CHECK_ERROR_NOTES: Dict[str, List[str]] = {
-    "mjs_setToPosition": [
-        "Preserve class-default gains: mjs_addActuator already copied the resolved",
-        "<default> class's gain/bias params onto Element, and mjs_setToPosition",
-        "writes kp unconditionally (gainprm[0]=kp, biasprm[1]=-kp) — so unauthored",
-        "params must never reach the call. Pointer params pass nullptr when not",
-        "overridden, and an unauthored kp re-asserts Element->gainprm[0]. (A -1",
-        "sentinel here compiled kp=-1 => positive feedback: the TidyBot NaN.)",
-        "mjs_setToPosition also rejects kv+dampratio both non-null BEFORE writing",
-        "biasprm[2], so sentinel buffers silently dropped kv; SetToErr surfaces",
-        "any such rejection instead of discarding it.",
-    ],
-    "mjs_setToIntVelocity": [
-        "Same class-default preservation as mjs_setToPosition (which this wraps):",
-        "nullptr for unauthored pointer params, Element->gainprm[0] for unauthored",
-        "kp — never -1 sentinels that clobber <default>-class gains.",
-        "NOTE: mjs_setToIntVelocity DISCARDS the inner mjs_setToPosition return",
-        "value, so SetToErr can only surface this wrapper's own errors",
-        "(actrange/inheritrange conflicts) — kv/dampratio rejections cannot",
-        "propagate here. Passing at most one of kv/dampratio avoids them anyway.",
-    ],
-}
-
-
 def _emit_setto_call(
     subtype_key: str,
     setto_rules: Dict[str, Any],
@@ -1991,29 +1962,9 @@ def _emit_setto_call(
 
     Sentinels: defaults come from ``setto_param_defaults`` in the rules JSON,
     keyed by ``(function_name, param_name)``; otherwise ``-1.0`` for doubles,
-    ``0`` for ints. The default is dropped verbatim, so it may be any C++
-    expression valid at the call site (e.g. ``Element->gainprm[0]`` to
-    re-assert the class-default-inherited value for a param the mjs_setTo*
-    function writes unconditionally — position/intvelocity ``kp``).
-
-    The nullable pattern (``nullable_arrays``, originated on dcmotor) emits
-    ``bOverride_X ? Buf : nullptr`` for array params so the mjs_setTo* call
-    skips unauthored params entirely instead of receiving sentinel buffers.
-    This matters for position/intvelocity: ``mjs_setToPosition`` REJECTS the
-    call ("kv and dampratio cannot both be defined") before writing
-    ``biasprm[2]`` when both pointers are non-null, so the old always-non-null
-    sentinel buffers silently dropped kv; and unauthored params must never
-    clobber gains inherited from the actuator's ``<default>`` class
-    (``mjs_addActuator`` copies them onto Element before ExportTo runs).
-    Scalar UE props wrapped in ``double[1]`` buffers get a plain
-    ``{(double)p}`` init (the pointer gate makes a sentinel unnecessary);
-    TArray-backed buffers additionally gate on ``.Num() > 0``.
-
-    ``check_error`` wraps the call, capturing the returned error string into
-    ``SetToErr`` and logging it via ``UE_LOG(LogURLabExport, Warning, ...)``
-    instead of silently discarding it (the historic ignored-return is how the
-    kv drop above went unnoticed). The host .cpp must include
-    ``Utils/URLabLogging.h`` (all actuator subclass sources do).
+    ``0`` for ints. The dcmotor pattern (``nullable_arrays``) emits
+    ``bOverride_X ? Buf : nullptr`` and uses the ``FillDouble`` helper that
+    lives file-local in ``MjDcMotorActuator.cpp``.
     """
     if setto_rules is None:
         return ""
@@ -2028,7 +1979,16 @@ def _emit_setto_call(
         )
     sig = mjspec["setto_functions"][fn_name]
     if not sig["params"]:
-        return f"    {fn_name}(Element);\n"
+        return (
+            f"    {{\n"
+            f"        const char* SetToErr = {fn_name}(Element);\n"
+            f"        if (SetToErr && *SetToErr)\n"
+            f"        {{\n"
+            f"            UE_LOG(LogURLabBind, Warning, TEXT(\"{fn_name} on '%s': %s\"), "
+            f"*GetName(), UTF8_TO_TCHAR(SetToErr));\n"
+            f"        }}\n"
+            f"    }}\n"
+        )
 
     type_mappings: Dict[str, str] = rules.get("type_mappings", {})
     default_type: str = rules.get("default_type", "float")
@@ -2037,7 +1997,17 @@ def _emit_setto_call(
     projections: Dict[str, str] = setto_rules.get("projections", {})
     nullable_arrays: bool = setto_rules.get("nullable_arrays", False)
     use_filldouble: bool = setto_rules.get("use_filldouble", False)
-    check_error: bool = setto_rules.get("check_error", False)
+    # Params that MuJoCo writes UNCONDITIONALLY by value (e.g. position kp ->
+    # gainprm[0] = kp): there is no sentinel that means "unset", so when the
+    # UPROPERTY isn't overridden we must re-pass the value already inherited
+    # onto the element (via mjs_addActuator's default class), not a sentinel
+    # that would clobber it. Value is the verbatim C++ expression to re-assert.
+    inherit_fields: Dict[str, str] = setto_rules.get("inherit_fields", {})
+    # Pointer params (double x[1]) that MuJoCo skips when passed nullptr
+    # (if (kv) { ... }): pass nullptr when not overridden so the inherited /
+    # type-derived default survives, instead of a non-null pointer to a
+    # sentinel (which trips MuJoCo's validation and gets written literally).
+    nullable_params: set = set(setto_rules.get("nullable_params", []))
 
     schema_attr_set = set(subtype_schema_attrs) | set(base_schema_attrs)
 
@@ -2052,26 +2022,31 @@ def _emit_setto_call(
         default_sentinel = "0" if c_is_int else "-1.0"
         sentinel = fn_defaults.get(pname, default_sentinel)
         proj = projections.get(pname)
+        # What to pass when the UPROPERTY is not overridden: re-assert the
+        # inherited element field for unconditional-write params, else the
+        # sentinel (correct only for params MuJoCo guards with `>= 0` / null).
+        notset = inherit_fields.get(pname, sentinel)
+        is_nullable = pname in nullable_params
 
         if p["array_dim"] is None:
             # Scalar parameter.
             if not param_in_schema:
-                call_args.append(sentinel)
+                call_args.append(notset)
                 continue
             if ue_type == "FVector" and proj:
-                expr = f"bOverride_{ue_prop} ? (double){ue_prop}.{proj} : {sentinel}"
+                expr = f"bOverride_{ue_prop} ? (double){ue_prop}.{proj} : {notset}"
             elif ue_type.startswith("TArray"):
                 # UE side is a TArray (e.g. cylinder.timeconst, where some
                 # actuator subtypes share the TArray<float> mapping but
                 # mjs_setToCylinder takes a scalar). Take element [0].
                 expr = (
                     f"(bOverride_{ue_prop} && {ue_prop}.Num() > 0) ? "
-                    f"(double){ue_prop}[0] : {sentinel}"
+                    f"(double){ue_prop}[0] : {notset}"
                 )
             elif c_is_int:
-                expr = f"bOverride_{ue_prop} ? (int){ue_prop} : {sentinel}"
+                expr = f"bOverride_{ue_prop} ? (int){ue_prop} : {notset}"
             else:
-                expr = f"bOverride_{ue_prop} ? (double){ue_prop} : {sentinel}"
+                expr = f"bOverride_{ue_prop} ? (double){ue_prop} : {notset}"
             call_args.append(expr)
             continue
 
@@ -2080,41 +2055,31 @@ def _emit_setto_call(
         buf_name = f"{pname}Buf"
 
         if nullable_arrays:
-            # DC-motor pattern: pass nullptr when the UPROPERTY is not overridden,
-            # so the mjs_setTo* function skips the param entirely (preserving
-            # whatever the element already carries, e.g. class-default gains)
-            # instead of receiving an always-non-null sentinel buffer.
+            # DC-motor pattern: pass nullptr when the UPROPERTY is not overridden.
             if use_filldouble and param_in_schema:
                 setup_lines.append(
                     f"        double {buf_name}[{dim}];  FillDouble({buf_name}, {ue_prop});"
                 )
                 call_args.append(f"bOverride_{ue_prop} ? {buf_name} : nullptr")
-            elif param_in_schema and not ue_type.startswith("TArray"):
-                # Scalar UE prop in a double[1] buffer (e.g. position kv/dampratio).
-                # The nullptr gate replaces the sentinel: when overridden the buffer
-                # holds the authored value, otherwise the pointer is null.
-                setup_lines.append(
-                    f"        double {buf_name}[{dim}] = {{(double){ue_prop}}};"
-                )
-                call_args.append(f"bOverride_{ue_prop} ? {buf_name} : nullptr")
             elif param_in_schema:
-                # TArray-backed buffer without the FillDouble helper — inline
-                # element-wise init; the arg additionally gates on Num() > 0 so an
-                # authored-but-empty array degrades to nullptr, not a sentinel buffer.
+                # No FillDouble helper — inline element-wise init.
                 inits = ",".join(
                     f" (bOverride_{ue_prop} && {ue_prop}.Num() > {i}) ? (double){ue_prop}[{i}] : {sentinel}"
                     for i in range(dim)
                 )
                 setup_lines.append(f"        double {buf_name}[{dim}] = {{{inits} }};")
-                call_args.append(
-                    f"(bOverride_{ue_prop} && {ue_prop}.Num() > 0) ? {buf_name} : nullptr"
-                )
+                call_args.append(f"bOverride_{ue_prop} ? {buf_name} : nullptr")
             else:
                 # Not even declared on the URLab side — always nullptr.
                 call_args.append("nullptr")
             continue
 
         if not param_in_schema:
+            if is_nullable:
+                # Not authored on the URLab side and MuJoCo skips it on null:
+                # pass nullptr so the inherited / type-derived default survives.
+                call_args.append("nullptr")
+                continue
             # Force-sentinel array.
             inits = ", ".join(sentinel for _ in range(dim))
             setup_lines.append(f"        double {buf_name}[{dim}] = {{ {inits} }};")
@@ -2144,32 +2109,34 @@ def _emit_setto_call(
                 f"        double {buf_name}[1] = {{ bOverride_{ue_prop} ? "
                 f"(double){ue_prop} : {sentinel} }};"
             )
-        call_args.append(buf_name)
+        # Nullable pointer param: pass the buffer only when overridden, else
+        # nullptr so MuJoCo leaves the inherited value untouched. For a TArray
+        # source, an authored-but-empty array is also treated as unset — passing
+        # a sentinel buffer would trip MuJoCo's range check and short-circuit the
+        # setTo (e.g. skipping biastype) instead of just inheriting.
+        if is_nullable:
+            nn = f"bOverride_{ue_prop}"
+            if ue_type.startswith("TArray"):
+                nn = f"(bOverride_{ue_prop} && {ue_prop}.Num() > 0)"
+            call_args.append(f"{nn} ? {buf_name} : nullptr")
+        else:
+            call_args.append(buf_name)
 
     args_str = ", ".join(call_args)
-    if not check_error:
-        if setup_lines:
-            body = "\n".join(setup_lines)
-            return f"    {{\n{body}\n        {fn_name}(Element, {args_str});\n    }}\n"
-        return f"    {fn_name}(Element, {args_str});\n"
-
-    # check_error: capture and surface the returned error string (mjs_setTo*
-    # reports invalid-parameter combinations via its return value ONLY — the
-    # historic ignored return is how the position kv drop went unnoticed).
-    lines: List[str] = ["    {"]
-    for note in _SETTO_CHECK_ERROR_NOTES.get(fn_name, []):
-        lines.append(f"        // {note}")
-    lines.extend(setup_lines)
-    lines.append(f"        const char* SetToErr = {fn_name}(Element, {args_str});")
-    lines.append("        if (SetToErr && *SetToErr)")
-    lines.append("        {")
-    lines.append(
-        f'            UE_LOG(LogURLabExport, Warning, TEXT("[%s] {fn_name} error: %s"), '
-        f"*GetName(), UTF8_TO_TCHAR(SetToErr));"
+    body = "\n".join(setup_lines)
+    if body:
+        body += "\n"
+    # MuJoCo's mjs_setTo* return a diagnostic string on misuse (e.g. a param
+    # out of range). Surface it instead of silently discarding it.
+    call = (
+        f"        const char* SetToErr = {fn_name}(Element, {args_str});\n"
+        f"        if (SetToErr && *SetToErr)\n"
+        f"        {{\n"
+        f"            UE_LOG(LogURLabBind, Warning, TEXT(\"{fn_name} on '%s': %s\"), "
+        f"*GetName(), UTF8_TO_TCHAR(SetToErr));\n"
+        f"        }}\n"
     )
-    lines.append("        }")
-    lines.append("    }")
-    return "\n".join(lines) + "\n"
+    return f"    {{\n{body}{call}    }}\n"
 
 
 def _mjs_fields_for(cat_rules: Dict[str, Any], mjspec: Dict[str, Any] | None) -> set:

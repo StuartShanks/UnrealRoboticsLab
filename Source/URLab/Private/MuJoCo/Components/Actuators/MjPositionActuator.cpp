@@ -41,22 +41,13 @@ void UMjPositionActuator::ExportTo(mjsActuator* Element, mjsDefault* def)
 
 	// --- CODEGEN_EXPORT_START ---
 	{
-		// Preserve class-default gains: mjs_addActuator already copied the resolved
-		// <default> class's gain/bias params onto Element, and mjs_setToPosition
-		// writes kp unconditionally (gainprm[0]=kp, biasprm[1]=-kp) — so unauthored
-		// params must never reach the call. Pointer params pass nullptr when not
-		// overridden, and an unauthored kp re-asserts Element->gainprm[0]. (A -1
-		// sentinel here compiled kp=-1 => positive feedback: the TidyBot NaN.)
-		// mjs_setToPosition also rejects kv+dampratio both non-null BEFORE writing
-		// biasprm[2], so sentinel buffers silently dropped kv; SetToErr surfaces
-		// any such rejection instead of discarding it.
-		double kvBuf[1] = {(double)kv};
-		double dampratioBuf[1] = {(double)dampratio};
+		double kvBuf[1] = {bOverride_kv ? (double)kv : -1.0};
+		double dampratioBuf[1] = {bOverride_dampratio ? (double)dampratio : -1.0};
 		double timeconstBuf[1] = {(bOverride_timeconst && timeconst.Num() > 0) ? (double)timeconst[0] : -1.0};
 		const char* SetToErr = mjs_setToPosition(Element, bOverride_kp ? (double)kp : Element->gainprm[0], bOverride_kv ? kvBuf : nullptr, bOverride_dampratio ? dampratioBuf : nullptr, (bOverride_timeconst && timeconst.Num() > 0) ? timeconstBuf : nullptr, bOverride_inheritrange ? (double)inheritrange : 0.0);
 		if (SetToErr && *SetToErr)
 		{
-			UE_LOG(LogURLabExport, Warning, TEXT("[%s] mjs_setToPosition error: %s"), *GetName(), UTF8_TO_TCHAR(SetToErr));
+			UE_LOG(LogURLabBind, Warning, TEXT("mjs_setToPosition on '%s': %s"), *GetName(), UTF8_TO_TCHAR(SetToErr));
 		}
 	}
 	if (bOverride_inheritrange)
