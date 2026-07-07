@@ -41,10 +41,25 @@ void UMjIntVelocityActuator::ExportTo(mjsActuator* Element, mjsDefault* def)
 
 	// --- CODEGEN_EXPORT_START ---
 	{
-		double kvBuf[1] = {bOverride_kv ? (double)kv : -1.0};
-		double dampratioBuf[1] = {bOverride_dampratio ? (double)dampratio : -1.0};
-		double timeconstBuf[1] = {-1.0};
-		mjs_setToIntVelocity(Element, bOverride_kp ? (double)kp : -1.0, kvBuf, dampratioBuf, timeconstBuf, bOverride_inheritrange ? (double)inheritrange : 0.0);
+		// Same preservation rules as UMjPositionActuator::ExportTo (mjs_setToIntVelocity
+		// forwards to mjs_setToPosition internally): pass nullptr for every unauthored
+		// pointer param so the class/default-inherited biasprm[2]/dynprm survive, and
+		// re-assert Element->gainprm[0] for an unauthored kp instead of the -1.0 sentinel
+		// that used to clobber the inherited gain. The old always-non-null kv+dampratio
+		// sentinels also made the call return an error and drop biasprm[2].
+		double kvBuf[1] = {(double)kv};
+		double dampratioBuf[1] = {(double)dampratio};
+		const char* Err = mjs_setToIntVelocity(Element,
+			bOverride_kp ? (double)kp : Element->gainprm[0],
+			bOverride_kv ? kvBuf : nullptr,
+			bOverride_dampratio ? dampratioBuf : nullptr,
+			nullptr,
+			bOverride_inheritrange ? (double)inheritrange : 0.0);
+		if (Err && *Err)
+		{
+			UE_LOG(LogURLabExport, Warning,
+				TEXT("[UMjIntVelocityActuator::ExportTo] mjs_setToIntVelocity error: %s"), UTF8_TO_TCHAR(Err));
+		}
 	}
 	if (bOverride_inheritrange)
 		Element->inheritrange = inheritrange;
