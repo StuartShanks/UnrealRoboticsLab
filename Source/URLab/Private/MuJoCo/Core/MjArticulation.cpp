@@ -24,6 +24,7 @@
 #include "MuJoCo/Core/MjRenderSnapshot.h"
 #include "MuJoCo/Core/Spec/MjSpecWrapper.h"
 #include "MuJoCo/Components/Controllers/MjArticulationController.h"
+#include "MuJoCo/Components/Controllers/MjEndEffectorController.h"
 #include "MuJoCo/Input/MjTwistController.h"
 #include "Misc/MessageDialog.h"
 #include "Engine/Blueprint.h"
@@ -473,6 +474,18 @@ void AMjArticulation::Setup(mjSpec* Spec, mjVFS* VFS)
 	RegisterAllOf<UMjEquality>(this, *m_wrapper);
 	RegisterAllOf<UMjKeyframe>(this, *m_wrapper);
 
+	// 7b. End-effector (mocap + weld) teleop controllers. These are actor-level
+	//     UActorComponents (not under <worldbody>), so they aren't picked up by
+	//     the IMjSpecElement walk above — inject them explicitly while the child
+	//     spec is still open, before mjs_attach prefixes and merges it.
+	{
+		TArray<UMjEndEffectorController*> EeControllers;
+		GetComponents<UMjEndEffectorController>(EeControllers);
+		for (UMjEndEffectorController* Ee : EeControllers)
+			if (Ee)
+				Ee->InjectMocapAndWeld(*m_wrapper);
+	}
+
 	mjsBody* parentWorld = mjs_findBody(Spec, "world");
 	mjsFrame* attachmentFrame = mjs_addFrame(parentWorld, 0);
 
@@ -645,6 +658,73 @@ void AMjArticulation::PostSetup(mjModel* Model, mjData* Data)
 		UE_LOG(LogURLab, Log, TEXT("AMjArticulation::PostSetup - Bound controller '%s' with %d actuators"),
 			*CachedController->GetClass()->GetName(), CachedController->GetNumBindings());
 	}
+
+	// Resolve any end-effector (mocap + weld) teleop controllers so SetEndEffectorTarget
+	// can route to the right mocap body. m_prefix matches what mjs_attach prepended.
+	{
+		TArray<UMjEndEffectorController*> EeControllers;
+		GetComponents<UMjEndEffectorController>(EeControllers);
+
+		bool bDisableActuators = false;
+		for (UMjEndEffectorController* Ee : EeControllers)
+		{
+			if (!Ee)
+				continue;
+			Ee->ResolveAfterCompile(m_model, m_data, m_prefix);
+			if (Ee->bEnabled && Ee->bDisableActuators && Ee->IsReady())
+				bDisableActuators = true;
+		}
+
+		// Fake-IK teleop: the weld supplies the motion forces, so clamp every
+		// actuator's output force to zero. forcerange=[0,0] + forcelimited zeroes
+		// force for any actuator type (position/motor/etc.) — unlike zeroing ctrl,
+		// which leaves position actuators fighting the weld toward their target.
+		if (bDisableActuators)
+		{
+			int32 NumDisabled = 0;
+			for (const auto& Elem : ActuatorIdMap)
+			{
+				const int32 Id = Elem.Value ? Elem.Value->GetMjID() : -1;
+				if (Id >= 0 && Id < m_model->nu)
+				{
+					m_model->actuator_forcerange[2 * Id + 0] = 0.0;
+					m_model->actuator_forcerange[2 * Id + 1] = 0.0;
+					m_model->actuator_forcelimited[Id] = 1;
+					++NumDisabled;
+				}
+			}
+			UE_LOG(LogURLab, Log,
+				TEXT("AMjArticulation::PostSetup - EE controller present on '%s': neutralized %d actuator(s) so the weld can drive the arm."),
+				*GetName(), NumDisabled);
+		}
+	}
+}
+
+void AMjArticulation::AdoptRuntimeController(UMjArticulationController* Ctrl)
+{
+	if (!Ctrl)
+	{
+		return;
+	}
+	if (!m_model || !m_data)
+	{
+		// Model not compiled yet — PostSetup will bind this controller when it runs.
+		UE_LOG(LogURLab, Warning,
+			TEXT("AMjArticulation::AdoptRuntimeController - %s: no compiled model yet; deferring to PostSetup."),
+			*GetName());
+		return;
+	}
+
+	// Build the controller fully while it is still invisible to the physics thread
+	// (CachedController hasn't been repointed), then publish it with a single
+	// pointer write. ApplyControls only ever touches the currently-published
+	// controller, so it never sees this one mid-Bind.
+	Ctrl->Bind(m_model, m_data, ActuatorIdMap);
+	CachedController = Ctrl;
+
+	UE_LOG(LogURLab, Log,
+		TEXT("AMjArticulation::AdoptRuntimeController - %s adopted '%s' (%d actuator binding(s))."),
+		*GetName(), *Ctrl->GetClass()->GetName(), Ctrl->GetNumBindings());
 }
 
 void AMjArticulation::ApplyControls(bool bSkipController)

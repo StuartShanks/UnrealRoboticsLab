@@ -24,6 +24,7 @@
 
 #include "CoreMinimal.h"
 #include "Templates/PimplPtr.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "MuJoCo/Components/Controllers/MjArticulationController.h"
 #include "MjMinkIKController.generated.h"
 
@@ -227,6 +228,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Mink IK")
 	void SetIKTarget(int32 TaskIndex, FVector WorldPos, FQuat WorldRot);
 
+	/**
+	 * Bump the spec generation so the running solver rebuilds its task stack from
+	 * the current Tasks / Limits / DriveJoints on the next physics step. Call this
+	 * after mutating the spec arrays on a live controller (e.g. add_controller
+	 * reconfigure). Task costs, damping, and joint subsets are baked into the
+	 * solver when it builds, so they only take effect via this; per-task bEnabled,
+	 * targets, and the solver sliders are read live and don't need it.
+	 */
+	void MarkSpecsChanged() { SpecGeneration.Increment(); }
+
 	// --- UMjArticulationController ---
 	virtual void Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap) override;
 	virtual void ComputeAndApply(mjModel* m, mjData* d, uint8 Source) override;
@@ -251,9 +262,22 @@ private:
 	struct FMinkIKState;
 	TPimplPtr<FMinkIKState> Mink;
 
+	/** Rebuilds BuiltTasks / BuiltLimits / driven actuators from the current specs
+	 *  against the live model. Called by Bind, and — on a spec-generation change —
+	 *  from ComputeAndApply on the physics thread, so all solver-state mutation
+	 *  stays on one thread (no lock needed vs ApplyControls). */
+	void RebuildFromSpecs(mjModel* m, mjData* d);
+
 	/** ctrl index / qpos address per driven actuator, resolved at Bind. */
 	TArray<int32> DriveCtrlIds;
 	TArray<int32> DriveQposAddrs;
+
+	/** Spec revision, incremented on the game thread by MarkSpecsChanged() and
+	 *  compared on the physics thread to trigger a live rebuild. */
+	FThreadSafeCounter SpecGeneration;
+
+	/** Generation the live BuiltTasks were built from (physics thread only). */
+	int32 BuiltGeneration = -1;
 
 	/** Manual targets keyed by spec index; guarded by TargetMutex. */
 	TMap<int32, FManualTarget> ManualTargets;

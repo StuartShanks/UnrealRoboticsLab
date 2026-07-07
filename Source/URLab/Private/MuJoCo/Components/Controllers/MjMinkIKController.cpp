@@ -146,8 +146,30 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 
 	Mink = MakePimpl<FMinkIKState>();
 	Mink->Config = MakeUnique<FMinkConfiguration>(m);
+	Mink->Config->Update(d->qpos);
+
+	RebuildFromSpecs(m, d);
+	BuiltGeneration = SpecGeneration.GetValue();
+
+	UE_LOG(LogURLabRuntime, Log,
+		TEXT("[MinkIK] Bound: %d task(s), %d limit(s), %d driven actuator(s), nv=%d."),
+		Mink->BuiltTasks.Num(), Mink->BuiltLimits.Num(), DriveCtrlIds.Num(), m->nv);
+}
+
+void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
+{
+	if (!Mink.IsValid() || !Mink->Config.IsValid() || !m || !d)
+	{
+		return;
+	}
 	FMinkConfiguration& Config = *Mink->Config;
-	Config.Update(d->qpos);
+
+	// Reference is preserved across a live reconfigure; only the solver stack and
+	// driven-actuator resolution are rebuilt from the current specs.
+	Mink->BuiltTasks.Reset();
+	Mink->BuiltLimits.Reset();
+	DriveCtrlIds.Reset();
+	DriveQposAddrs.Reset();
 
 	// --- build tasks from specs -------------------------------------------------
 	for (int32 i = 0; i < Tasks.Num(); ++i)
@@ -292,9 +314,6 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 		}
 	}
 
-	UE_LOG(LogURLabRuntime, Log,
-		TEXT("[MinkIK] Bound: %d task(s), %d limit(s), %d driven actuator(s), nv=%d."),
-		Mink->BuiltTasks.Num(), Mink->BuiltLimits.Num(), DriveCtrlIds.Num(), m->nv);
 }
 
 void UMjMinkIKController::SetIKTarget(int32 TaskIndex, FVector WorldPos, FQuat WorldRot)
@@ -314,6 +333,20 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	// target it saw, and what it wrote — ground truth for remote debugging.
 	const bool bDiag = (DiagCounter < 3) || (DiagCounter % 2000 == 0);
 	++DiagCounter;
+
+	// Live reconfigure: if the specs changed (MarkSpecsChanged bumped the counter
+	// on the game thread), rebuild the solver stack here on the physics thread so
+	// all BuiltTasks mutation stays single-threaded vs ApplyControls — no restart
+	// needed to retune costs/damping/joints.
+	const int32 CurGen = SpecGeneration.GetValue();
+	if (CurGen != BuiltGeneration && Mink.IsValid() && Mink->Config.IsValid())
+	{
+		RebuildFromSpecs(m, d);
+		BuiltGeneration = CurGen;
+		UE_LOG(LogURLabRuntime, Log,
+			TEXT("[MinkIK] hot-reconfigured (gen %d): %d task(s), %d limit(s), %d driven actuator(s)."),
+			CurGen, Mink->BuiltTasks.Num(), Mink->BuiltLimits.Num(), DriveCtrlIds.Num());
+	}
 
 	if (!bEnabled || !Mink.IsValid() || !Mink->Config.IsValid() || Mink->BuiltTasks.Num() == 0
 		|| DriveCtrlIds.Num() == 0)
@@ -422,11 +455,13 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			return; // hold the previous ctrl; never write a bad solution
 		}
 
-		// Sanity clamp: a legit differential-IK velocity is O(1-10); anything
-		// absurd is a numerically-bad solve — discard the step (hold last ctrl)
-		// and count it, so bad solves become telemetry instead of violence.
+		// Kevin's reference applies no clamp — differential-IK convergence
+		// velocities are legitimately large per inner iteration (Newton-style
+		// steps that shrink as the reference converges over max_iters). The ONLY
+		// guard is against a non-finite solve, purely so we never write NaN/inf to
+		// d->ctrl; any finite velocity is integrated, exactly like the demo.
 		const double VMax = R.Velocity.size() > 0 ? R.Velocity.cwiseAbs().maxCoeff() : 0.0;
-		if (VMax > 50.0)
+		if (!FMath::IsFinite(VMax))
 		{
 			++BadSolveCount;
 			if (BadSolveCount <= 10 || BadSolveCount % 100 == 0)
@@ -461,6 +496,39 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		{
 			d->ctrl[DriveCtrlIds[i]] = Q[DriveQposAddrs[i]];
 		}
+	}
+
+	// Dense per-joint trace of the first ~60 steps: for each driven joint print
+	// the target qpos we command (= ctrl), the actual qpos, and the servo error
+	// between them. This is the ground truth for "is the port sending sane ctrl,
+	// and is the sim diverging from it" — the real numbers to eyeball with Buzz.
+	if (DiagCounter <= 60)
+	{
+		FString Line;
+		for (int32 i = 0; i < DriveCtrlIds.Num(); ++i)
+		{
+			const int32 QA = DriveQposAddrs[i];
+			const double Target = (QA < Q.size()) ? (double)Q[QA] : 0.0; // = ctrl written
+			const double Live = d->qpos[QA];
+			Line += FString::Printf(TEXT(" a%d[tgt=%.4f q=%.4f err=%+.4f]"),
+				DriveCtrlIds[i], Target, Live, Target - Live);
+		}
+		// Cartesian error the frame task actually sees (target vs current EE) —
+		// tells us if the huge velocity is a real target/pose mismatch or a
+		// singularity blowing up a tiny error.
+		double FramePos = -1.0, FrameOri = -1.0;
+		if (FirstFrame)
+		{
+			FMinkVec Err;
+			if (FirstFrame->ComputeError(Config, Err) && Err.size() >= 6)
+			{
+				FramePos = Err.head(3).norm();
+				FrameOri = Err.tail(3).norm();
+			}
+		}
+		UE_LOG(LogURLabRuntime, Log,
+			TEXT("[MinkIK] trace #%d t=%.4f sync=%d frameErr(pos=%.4f ori=%.4f)%s"),
+			DiagCounter, d->time, bSyncFromLiveState ? 1 : 0, FramePos, FrameOri, *Line);
 	}
 
 	if (bDiag)

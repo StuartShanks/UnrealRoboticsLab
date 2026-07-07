@@ -1846,6 +1846,18 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	bool B;
 	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B)) Ctrl->bSyncFromLiveState = B;
 
+	// Tell the running solver to rebuild its baked task stack from the specs we
+	// just wrote — costs/damping/joint-subsets are baked at build time, so a live
+	// reconfigure needs this bump (the physics thread rebuilds on the next step).
+	Ctrl->MarkSpecsChanged();
+
+	// A controller created just now wasn't bound/cached by PostSetup (that ran at
+	// Simulate start), so bind + publish it now — no Simulate restart required.
+	if (!bWasExisting)
+	{
+		Art->AdoptRuntimeController(Ctrl);
+	}
+
 	Art->MarkPackageDirty();
 
 	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();

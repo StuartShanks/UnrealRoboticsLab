@@ -506,6 +506,16 @@ public:
 	 */
 	void PostSetup(mjModel* Model, mjData* Data);
 
+	/**
+	 * @brief Bind a controller added after PostSetup (e.g. via the add_controller
+	 * bridge op) and make it the active CachedController, without a Simulate
+	 * restart. The controller is fully bound against the live model *before* it is
+	 * published to CachedController, so the physics thread never observes a
+	 * half-built controller. No-op if the model isn't compiled yet.
+	 * @param Ctrl The controller component to adopt (must belong to this actor).
+	 */
+	void AdoptRuntimeController(class UMjArticulationController* Ctrl);
+
 	/** @brief draws debug lines for collision geoms. */
 	void DrawDebugCollision();
 
