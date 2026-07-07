@@ -93,12 +93,18 @@ task commands the arm to move (ctrl ≠ q), `joint_1`/DOF 3 runs away → the t�
 The base actuators `joint_x/joint_y/joint_th` carry **explicit** `kp` (1e6/1e6/5e4)
 *and* `kv` (5e4/5e4/1e3). Their `kp` and `biasprm[1]` import correctly, but their
 `biasprm[2]` (= −kv) compiles to **0** (native −50000/−50000/−1000). So the velocity
-(damping) term is lost for all position actuators, likely because
-`ExportTo` always passes **non-null** `dampratioBuf`/`timeconstBuf` sentinel pointers
-(`= -1.0`) to `mjs_setToPosition`, which take precedence over `kv`
-(`MjPositionActuator.cpp:44-47`). This is a real fidelity bug but is **not**
-independently destabilizing here — the base actuators (correct high `kp`, `kv = 0`)
-stayed stable; it is the arm `kp = -1` that diverges.
+(damping) term is lost for all position actuators. **Corrected mechanism (was
+"precedence"):** `ExportTo` passes **both** a non-null `kvBuf` *and* a non-null
+`dampratioBuf` (the always-`-1.0` sentinel) to `mjs_setToPosition`. That function
+(`third_party/MuJoCo/src/src/user/user_api.cc:1147-1155`) checks
+`if (dampratio && kv) return "kv and dampratio cannot both be defined";` **before**
+it writes `biasprm[2]` — so it returns an error string and never applies `kv` at all.
+`ExportTo` **ignores that return value**, so the failure is silent and `biasprm[2]`
+keeps whatever was there (0 for the base actuators, or the class-inherited value that
+was likewise never written for the arm). It is *not* that `dampratio` "takes
+precedence"; it is that the presence of both pointers aborts the call early. This is a
+real fidelity bug but is **not** independently destabilizing here — the base actuators
+(correct high `kp`, `kv = 0`) stayed stable; it is the arm `kp = -1` that diverges.
 
 ### Proposed minimal fix for Task 6
 

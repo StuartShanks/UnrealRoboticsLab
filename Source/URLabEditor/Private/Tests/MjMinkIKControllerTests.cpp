@@ -162,6 +162,64 @@ bool FMjMinkIKTidybotImport::RunTest(const FString&)
 		if (JxAct >= 0)
 		{
 			TestEqual(TEXT("joint_x kp == 1e6"), M->actuator_gainprm[JxAct * mjNGAIN + 0], 1000000.0);
+			// kv (biasprm[2] == -kv) must also survive — regression guard for the
+			// always-non-null dampratio sentinel that used to drop biasprm[2].
+			TestEqual(TEXT("joint_x biasprm[2] == -5e4"), M->actuator_biasprm[JxAct * mjNBIAS + 2], -50000.0);
+		}
+	}
+
+	// Regression guard for Task 5 root cause 1: class-inherited actuator gains must
+	// survive import. joint_1 inherits kp/kv from tidybot.xml's <default class=
+	// "large_actuator"><position kp="2000" kv="100"/>. The historic -1 sentinel in
+	// UMjPositionActuator::ExportTo clobbered gainprm[0] to -1 (positive feedback ->
+	// NaN). We assert both against the literal native values AND field-by-field
+	// against MuJoCo's own compile of the same XML (the strongest guard: if the
+	// importer ever diverges from native gains again, this flips red).
+	{
+		const int32 J1Act = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, TEXT("joint_1"));
+		TestTrue(TEXT("joint_1 actuator found"), J1Act >= 0);
+		if (J1Act >= 0)
+		{
+			// Native values from <default class="large_actuator"> in tidybot.xml.
+			TestEqual(TEXT("joint_1 kp (gainprm[0]) == 2000"), M->actuator_gainprm[J1Act * mjNGAIN + 0], 2000.0);
+			TestEqual(TEXT("joint_1 biasprm[1] == -kp == -2000"), M->actuator_biasprm[J1Act * mjNBIAS + 1], -2000.0);
+			TestEqual(TEXT("joint_1 biasprm[2] == -kv == -100"), M->actuator_biasprm[J1Act * mjNBIAS + 2], -100.0);
+		}
+	}
+
+	// Field-by-field gain/bias comparison against the native compile of tidybot.xml.
+	{
+		const FString NativeXml = FPaths::Combine(FPaths::ProjectPluginsDir(),
+			TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot.xml"));
+		char Err[1024] = {0};
+		mjModel* N = mj_loadXML(TCHAR_TO_UTF8(*NativeXml), nullptr, Err, sizeof(Err));
+		if (!TestNotNull(TEXT("native tidybot.xml compiled for gain comparison"), N))
+		{
+			// Non-fatal: literal asserts above already cover the root cause.
+		}
+		else
+		{
+			for (int32 ni = 0; ni < N->nu; ++ni)
+			{
+				const char* NmC = mj_id2name(N, mjOBJ_ACTUATOR, ni);
+				if (!NmC)
+				{
+					continue;
+				}
+				const FString Nm = UTF8_TO_TCHAR(NmC);
+				const int32 mi = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, *Nm);
+				if (!TestTrue(*FString::Printf(TEXT("actuator '%s' present in import"), *Nm), mi >= 0))
+				{
+					continue;
+				}
+				TestEqual(*FString::Printf(TEXT("act '%s' gainprm[0]"), *Nm),
+					M->actuator_gainprm[mi * mjNGAIN + 0], N->actuator_gainprm[ni * mjNGAIN + 0]);
+				TestEqual(*FString::Printf(TEXT("act '%s' biasprm[1]"), *Nm),
+					M->actuator_biasprm[mi * mjNBIAS + 1], N->actuator_biasprm[ni * mjNBIAS + 1]);
+				TestEqual(*FString::Printf(TEXT("act '%s' biasprm[2]"), *Nm),
+					M->actuator_biasprm[mi * mjNBIAS + 2], N->actuator_biasprm[ni * mjNBIAS + 2]);
+			}
+			mj_deleteModel(N);
 		}
 	}
 
