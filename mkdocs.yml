@@ -100,6 +100,7 @@ nav:
     - Interaction: guides/interaction.md
     - Recording & Replay: guides/recording.md
     - Differential IK (URLabMink): guides/mink.md
+    - TidyBot mink-IK Demo: guides/tidybot-mink-ik-demo.md
     - Mobile Base Navigation: guides/navigation-demo.md
   - Python & External Control:
     - Overview: python/index.md

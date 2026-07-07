@@ -147,3 +147,6 @@ build.log
 
 # mink golden-fixture generator venv (Scripts/mink_golden/README.md)
 Scripts/mink_golden/.venv/
+
+# demo run artifacts (screenshots) — Scripts/demos/tidybot_mink_demo.py
+Scripts/demos/output/

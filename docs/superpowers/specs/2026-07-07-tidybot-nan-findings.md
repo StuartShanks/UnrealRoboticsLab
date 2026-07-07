@@ -261,3 +261,105 @@ equilibrium, not commanded away).
   `Scripts/build_and_test_linux.sh --filter URLab.MinkIK.TidyBot`.
 - Only production-code *reads* were done; **no production code was modified**. The only
   committed artifact from Task 5 is this findings document.
+
+---
+
+## Live editor validation (Task 7) — 2026-07-07
+
+**Method:** bridge-driven E2E through the **live editor loop** (PIE, ZMQ bridge,
+physics thread, real time) — the layers the headless `ClosedLoopStable` test
+bypasses. Driver: `Scripts/demos/tidybot_mink_demo.py` (urlab_client, `direct`
+step mode). Editor launched headless-in-background; demo run 3× (reproducible).
+
+### Reproduction
+
+```bash
+# 1. Editor open with the URLab plugin (bridge auto-starts on tcp://localhost:5559):
+/home/stuart/UE_ROOT/UnrealEngine/Engine/Binaries/Linux/UnrealEditor \
+    "/home/stuart/Documents/Unreal Projects/Test/Test.uproject" -log
+# 2. Run the demo with the bridge venv:
+/home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python \
+    Scripts/demos/tidybot_mink_demo.py
+```
+
+### Per-item acceptance (identical across 3 runs)
+
+| Acceptance item | Result | Numbers |
+|---|---|---|
+| Controller configured over RPC (`add_controller`) | **PASS** | tasks=3, limits=1, drive_joints=10, warnings=0 |
+| Sim options survive import **live** | **PASS** | integrator=implicitfast(3), cone=elliptic(1), impratio=10, timestep=0.002 |
+| No resets / no NaN | **PASS** | sim_time monotonic 0→5.002 s (2500 steps), all qpos/qvel finite |
+| `fix_base` path executes (Damping enable/disable) | **PASS** | base moved 0.00 cm (arm also 0 — see defect below) |
+| Near-reach tracking | **FAIL** | EE err @K900 = 0.3837 m (≈ \|REACH\|); base \|xy\| = 0.000 m |
+| Tracking all checkpoints | **FAIL** | K300=0.0073, K900=0.3837, K1000=0.9001, K1600=0.1003, K2200=0.9001, K2500=0.6404 m |
+| Far-circle base drive | **FAIL** | base \|xy\| @end = 0.000 m (never drove) |
+
+`K300=0.0073 m` matches the headless run exactly — but only because at K<300 the
+target = the seed pose (the home EE), so "tracking" there just means "holds home".
+Once the target moves (K≥300) the EE stays put (err → \|REACH\| = 0.38, then grows
+on the far ramp/circle) and the base never translates.
+
+### Root cause — NEW live-only defect (not visible headless)
+
+The live `UMjMinkIKController` binds with its **Frame and DriveJoints component
+references NULL**. Editor log, every PIE start:
+
+```
+[MinkIK] Tasks[0]: Frame task has no resolved frame component — skipped.
+[MinkIK] Bound: 2 task(s), 1 limit(s), 0 driven actuator(s), nv=18.
+[MinkIK] call #N EARLY-OUT: enabled=1 mink=1 tasks=2 drive=0
+```
+
+`add_controller` attaches the controller as a **runtime instance component**
+(`AddInstanceComponent` + `RegisterComponent`) and stores `UPROPERTY TObjectPtr`
+refs — `FMinkTaskSpec.Frame` (the `pinch_site` `UMjSite`) and `DriveJoints` (the
+10 `UMjJoint`s) — resolved against the **editor-world** actor. When the bridge
+enters PIE via `EPlaySessionWorldType::PlayInEditor`
+(`MjEditorOpHandlers.cpp:536`), the world is duplicated into a fresh play world.
+The instance component's **struct data survives** (3 task kinds, costs, enables)
+but its **object pointers into the SCS-built site/joints are dropped** — the exact
+instance-component fragility the EOD report flagged ("instance components die on
+every actor re-drag; follow-up we want: `to_blueprint=true`"). With `S.Frame` null
+the Frame task is skipped (`MjMinkIKController.cpp:185-189`) and with `DriveJoints`
+empty no actuators are driven, so `ComputeAndApply` early-outs and `d->ctrl` keeps
+the `home` keyframe ctrl → arm frozen at home, base ctrl 0.
+
+`add_controller` cannot be reordered to fix this: it always targets
+`GEditor->GetEditorWorldContext().World()` (the editor world), and
+`AMjArticulation::AdoptRuntimeController` (`MjArticulation.cpp:656`) binds against
+the actor's own `m_model` — which the editor actor only has under **Simulate-In-
+Editor** (same-world, refs intact), a mode the bridge does not expose (it hard-
+codes `PlayInEditor`). The EOD's live runs — where the Frame task *was* active and
+NaN'd — were therefore Simulate, not bridge PIE.
+
+### Reconciliation with the residual-risk list
+
+- **Raw control-mode bypass (EOD #2): NOT hit.** The client's `ControllerKind`
+  already includes `mink_ik`; the handshake reports `default_control_mode =
+  ue_controller`; the demo sets `art.control_mode = UE_CONTROLLER`. Log confirms
+  `enabled=1 mink=1` — the mink controller *does* run (it just has no frame/drive
+  refs). No raw bypass, no client-side C++ fallback needed.
+- **Physics-thread staging / cadence: OK.** `direct` step mode advances
+  deterministically (`step(n_steps=10)` batches); sim_time strictly monotonic; the
+  once-per-sim-advance integration and backward-time rebase behaved (no resets).
+  *Note:* entering PIE reverts the server to its live default — the demo must
+  re-issue `set_mode("direct")` + `set_paused(False)` after `sim.start`, else
+  `n_steps` is ignored and sim_time stays 0 (observed, then fixed in the driver).
+- **Mocap re-stamping (EOD #3): avoided.** Targets streamed via
+  `configure_controller` (manual-target precedence); no `set_mocap_pose`.
+- **Step-request drain (EOD #5): avoided** by `direct` mode + large batches.
+
+### Disposition
+
+Import fidelity and the whole non-IK live loop (PIE, RPC attach, direct stepping,
+finiteness, sim-time monotonicity, `fix_base` toggle) are **green live**. The
+`add_controller` → PIE path does **not** track because PIE-world duplication drops
+the instance-component's Frame/DriveJoints refs. Fixing it requires production C++
+(bake the controller into the Blueprint via `to_blueprint=true`, or resolve
+`Frame`/`DriveJoints` by compiled name at `Bind`) — out of scope for this task
+(no production C++ changes authorized beyond the client-enum fallback, which was
+not needed). Filed as the deliverable's live-layer finding.
+
+*Screenshots:* camera capture over the bridge (`step(include_cameras=True)`,
+robot `base`/`wrist` cams) returned no frames in `direct` mode, so
+`Scripts/demos/output/` is empty; not load-bearing for the acceptance numbers.
