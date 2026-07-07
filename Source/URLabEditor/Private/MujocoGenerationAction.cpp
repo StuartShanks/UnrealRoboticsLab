@@ -263,34 +263,64 @@ void UMujocoGenerationAction::GenerateForBlueprintXml(UBlueprint* BP, const FStr
 				FString V;
 				V = Child->GetAttribute(TEXT("timestep"));
 				if (!V.IsEmpty())
+				{
 					Opts.Timestep = FCString::Atof(*V);
+					Opts.bOverride_Timestep = true;
+				}
 				V = Child->GetAttribute(TEXT("gravity"));
 				if (!V.IsEmpty())
+				{
 					ParseVec3(V, Opts.Gravity);
+					Opts.bOverride_Gravity = true;
+				}
 				V = Child->GetAttribute(TEXT("wind"));
 				if (!V.IsEmpty())
+				{
 					ParseVec3(V, Opts.Wind);
+					Opts.bOverride_Wind = true;
+				}
 				V = Child->GetAttribute(TEXT("magnetic"));
 				if (!V.IsEmpty())
+				{
 					ParseVec3(V, Opts.Magnetic);
+					Opts.bOverride_Magnetic = true;
+				}
 				V = Child->GetAttribute(TEXT("density"));
 				if (!V.IsEmpty())
+				{
 					Opts.Density = FCString::Atof(*V);
+					Opts.bOverride_Density = true;
+				}
 				V = Child->GetAttribute(TEXT("viscosity"));
 				if (!V.IsEmpty())
+				{
 					Opts.Viscosity = FCString::Atof(*V);
+					Opts.bOverride_Viscosity = true;
+				}
 				V = Child->GetAttribute(TEXT("impratio"));
 				if (!V.IsEmpty())
+				{
 					Opts.Impratio = FCString::Atof(*V);
+					Opts.bOverride_Impratio = true;
+				}
 				V = Child->GetAttribute(TEXT("tolerance"));
 				if (!V.IsEmpty())
+				{
 					Opts.Tolerance = FCString::Atof(*V);
+					Opts.bOverride_Tolerance = true;
+				}
 				V = Child->GetAttribute(TEXT("iterations"));
 				if (!V.IsEmpty())
+				{
 					Opts.Iterations = FCString::Atoi(*V);
+					Opts.bOverride_Iterations = true;
+				}
 				V = Child->GetAttribute(TEXT("ls_iterations"));
 				if (!V.IsEmpty())
+				{
 					Opts.LsIterations = FCString::Atoi(*V);
+					Opts.bOverride_LsIterations = true;
+				}
 
 				V = Child->GetAttribute(TEXT("noslip_iterations"));
 				if (!V.IsEmpty())
@@ -382,7 +412,6 @@ void UMujocoGenerationAction::GenerateForBlueprintXml(UBlueprint* BP, const FStr
 				UE_LOG(LogURLabEditor, Log, TEXT("Parsed <option>: timestep=%.4f, gravity=%s"),
 					Opts.Timestep, *Opts.Gravity.ToString());
 			}
-			break;
 		}
 	}
 }

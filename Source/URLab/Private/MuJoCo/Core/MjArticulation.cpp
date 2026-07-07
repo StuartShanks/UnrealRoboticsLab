@@ -280,9 +280,15 @@ void AMjArticulation::Setup(mjSpec* Spec, mjVFS* VFS)
 	m_ChildSpec = mj_makeSpec();
 	m_ChildSpec->compiler.degree = false;
 
-	// Apply this articulation's simulation options to the child spec.
-	// mjs_attach will merge these into the root spec at compile time.
-	SimOptions.ApplyToSpec(m_ChildSpec);
+	// Apply this articulation's simulation options to the ROOT spec that is
+	// actually compiled. mjs_attach only merges the child's body/frame subtree
+	// into the root — it does NOT carry the child spec's global <option>
+	// (cone, impratio, timestep, ...). Applying to m_ChildSpec therefore had no
+	// effect on the compiled model (options silently dropped; e.g. TidyBot's
+	// cone=elliptic / impratio=10). Apply to the root spec so options survive.
+	// (Options are global in MuJoCo; with multiple articulations the last one
+	// applied wins, matching single-articulation import — the common case.)
+	SimOptions.ApplyToSpec(Spec);
 
 	m_prefix = GetName() + TEXT("_");
 
