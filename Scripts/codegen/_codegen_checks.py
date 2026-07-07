@@ -770,10 +770,17 @@ def _check_setto_param_coverage(
             fn_defaults = set(setto_defaults.get(fn_name, {}).keys())
             sub_attrs = set(schema_subtype_attrs(schema, cat_name, sub_key))
             schema_attr_set = common_attrs | sub_attrs
+            nullable_arrays = bool(setto_def.get("nullable_arrays"))
             for p in sig.get("params", []):
                 pname = p["name"]
                 ue_prop = renames.get(pname, pname)
                 if ue_prop in schema_attr_set or pname in fn_defaults:
+                    continue
+                if nullable_arrays and p.get("array_dim") is not None:
+                    # Under the nullable pattern an unmapped array param is
+                    # deliberately passed as nullptr (the mjs_setTo* call
+                    # skips it) — that IS its explicit handling; there is
+                    # no sentinel to pin (e.g. intvelocity timeconst).
                     continue
                 _diag_add(
                     f"[diagnostic] {fn_name} param '{pname}' is not "

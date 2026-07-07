@@ -188,6 +188,9 @@ bool FMjMinkIKTidybotImport::RunTest(const FString&)
 	}
 
 	// Field-by-field gain/bias comparison against the native compile of tidybot.xml.
+	// NOTE: the imported fixture is tidybot_scene_ue.xml (= tidybot.xml + scene wrapper
+	// + mocap target body); the actuator definitions are identical, so native
+	// tidybot.xml is a valid gain/bias ground truth (actuators matched by name suffix).
 	{
 		const FString NativeXml = FPaths::Combine(FPaths::ProjectPluginsDir(),
 			TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot.xml"));

@@ -24,11 +24,11 @@
     "axis":               "Axis"
   },
 
-  "_note_setto_param_defaults": "MuJoCo's mjs_setTo* API treats specific scalar defaults as sentinels. These values are how URLab signals 'not overridden, use MuJoCo's default'. Most use -1.0; a few use 0.0 or 0.01. Values are stored as strings because the codegen drops them verbatim into the generated C++ call — typing them as JSON numbers would force a format choice (1 vs 1.0 vs 1.0f) and lose round-trip fidelity.",
+  "_note_setto_param_defaults": "MuJoCo's mjs_setTo* API treats specific scalar defaults as sentinels. These values are how URLab signals 'not overridden, use MuJoCo's default'. Most use -1.0; a few use 0.0 or 0.01. Values are stored as strings because the codegen drops them verbatim into the generated C++ call — typing them as JSON numbers would force a format choice (1 vs 1.0 vs 1.0f) and lose round-trip fidelity. CAUTION: a sentinel is only safe if the mjs_setTo* function actually skips it — mjs_setToPosition/IntVelocity write kp UNCONDITIONALLY (gainprm[0]=kp, biasprm[1]=-kp), so a -1.0 kp sentinel would CLOBBER class-default gains with positive feedback (the TidyBot NaN, task 6). For those, kp falls back to the verbatim expression Element->gainprm[0] (re-assert the value mjs_addActuator inherited from the default class) and the pointer params use nullable_arrays instead of sentinels.",
   "setto_param_defaults": {
-    "mjs_setToPosition":     {"inheritrange": "0.0"},
-    "_note_mjs_setToIntVelocity": "intvelocity's mjs_setTo signature accepts a timeconst array param but MuJoCo's XML schema doesn't expose `timeconst` as an MJCF attr on <intvelocity> (unlike <position>/<cylinder>/<muscle>). Pin it to the -1.0 sentinel so the setto leaves the type-derived default alone.",
-    "mjs_setToIntVelocity":  {"inheritrange": "0.0", "timeconst": "-1.0"},
+    "mjs_setToPosition":     {"inheritrange": "0.0", "kp": "Element->gainprm[0]"},
+    "_note_mjs_setToIntVelocity": "intvelocity's mjs_setTo signature accepts a timeconst array param but MuJoCo's XML schema doesn't expose `timeconst` as an MJCF attr on <intvelocity> (unlike <position>/<cylinder>/<muscle>). With nullable_arrays the unmodeled param is passed as nullptr, which makes mjs_setToPosition leave the type-derived dynprm/dyntype default alone.",
+    "mjs_setToIntVelocity":  {"inheritrange": "0.0", "kp": "Element->gainprm[0]"},
     "mjs_setToDamper":       {"kv": "0.01"},
     "mjs_setToMuscle":       {"tausmooth": "0.0"},
     "mjs_setToAdhesion":     {"gain": "0.0"},
@@ -764,12 +764,17 @@
         {"key": "dcmotor",     "enum_value": "DcMotor",    "class_name": "UMjDcMotorActuator",     "header": "MjDcMotorActuator.h"}
       ],
       "_note_subtype_setto": "Codegen-driven mjs_setTo* call config. Function signatures come from the clang-AST introspect snapshot, projected by _mjspec_from_introspect; the generator emits the call from the signature + the per-subtype config below. NO hand-written C++ literals in this file.",
+      "_note_position_family": "position/intvelocity use the DC-motor nullable_arrays pattern (bOverride_x ? xBuf : nullptr) instead of -1.0 sentinel buffers: mjs_setToPosition errors out ('kv and dampratio cannot both be defined') when BOTH pointers are non-null — before writing biasprm[2] — so sentinel buffers silently dropped kv AND the -1 kp sentinel clobbered class-inherited gains (TidyBot NaN root cause, task 6). check_error logs the returned error string instead of discarding it.",
       "subtype_setto": {
         "general":     null,
         "motor":       {"call": "mjs_setToMotor"},
-        "position":    {"call": "mjs_setToPosition"},
+        "position":    {"call": "mjs_setToPosition",
+                        "nullable_arrays": true,
+                        "check_error": true},
         "velocity":    {"call": "mjs_setToVelocity"},
-        "intvelocity": {"call": "mjs_setToIntVelocity"},
+        "intvelocity": {"call": "mjs_setToIntVelocity",
+                        "nullable_arrays": true,
+                        "check_error": true},
         "damper":      {"call": "mjs_setToDamper"},
         "cylinder":    {"call": "mjs_setToCylinder"},
         "muscle":      {"call": "mjs_setToMuscle",
