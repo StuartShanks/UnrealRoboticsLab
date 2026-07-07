@@ -1682,12 +1682,18 @@ void UMujocoGenerationAction::ParseDefaultsRecursive(const FXmlNode* Node, UBlue
 					ActClass = UMjVelocityActuator::StaticClass();
 				else if (ChildTag == "muscle")
 					ActClass = UMjMuscleActuator::StaticClass();
+				else if (ChildTag == "cylinder")
+					ActClass = UMjCylinderActuator::StaticClass();
+				else if (ChildTag == "damper")
+					ActClass = UMjDamperActuator::StaticClass();
 				else if (ChildTag == "adhesion")
 					ActClass = UMjAdhesionActuator::StaticClass();
 				else if (ChildTag == "intvelocity")
 					ActClass = UMjIntVelocityActuator::StaticClass();
 				else if (ChildTag == "dcmotor")
 					ActClass = UMjDcMotorActuator::StaticClass();
+				else if (ChildTag == "general")
+					ActClass = UMjGeneralActuator::StaticClass();
 
 				USCS_Node* ActNode = BP->SimpleConstructionScript->CreateNode(ActClass, *ActName);
 				DefNode->AddChildNode(ActNode);
