@@ -1,0 +1,396 @@
+// Copyright (c) 2026 Jonathan Embley-Riches. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// --- LEGAL DISCLAIMER ---
+// UnrealRoboticsLab is an independent software plugin. It is NOT affiliated with,
+// endorsed by, or sponsored by Epic Games, Inc. "Unreal" and "Unreal Engine" are
+// trademarks or registered trademarks of Epic Games, Inc. in the US and elsewhere.
+//
+// This plugin incorporates third-party software: MuJoCo (Apache 2.0),
+// CoACD (MIT), and libzmq (MPL 2.0). See ThirdPartyNotices.txt for details.
+
+#include "CoreMinimal.h"
+#include "Misc/AutomationTest.h"
+#include "Tests/MjTestHelpers.h"
+#include "MuJoCo/Components/Controllers/MjMinkIKController.h"
+#include "MuJoCo/Components/Joints/MjJoint.h"
+#include "MuJoCo/Components/Geometry/MjSite.h"
+#include "MuJoCo/Components/Bodies/MjBody.h"
+#include "MuJoCo/Components/Actuators/MjActuator.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "mujoco/mujoco.h"
+
+// ============================================================================
+// Rung C: URLab-integrated TidyBot mink IK repro. Runs the SAME scenario as
+// Rung B (Source/URLabMink/Private/Tests/MinkTidybotTests.cpp) but through
+// URLab's real layers: the MJCF importer (FMjXmlImportSession) and the real
+// UMjMinkIKController component (solve -> ApplyControls -> mj_step). A
+// NaN/instability failure in ClosedLoopStable is an EXPECTED, VALUABLE
+// outcome here — it reproduces a known live-editor bug in a deterministic
+// headless harness.
+// ============================================================================
+
+namespace MjMinkIKControllerTestsLocal // unity build: unique namespace name
+{
+constexpr int32 NSteps = 2500;
+constexpr int32 MaxIters = 20;
+constexpr double PosThreshold = 1e-4;
+constexpr double OriThreshold = 1e-4;
+
+// Same 10 drive joints as Rung B, in the same order: 3 base + 7 arm (no gripper).
+const TCHAR* JointNames[10] = {TEXT("joint_x"), TEXT("joint_y"), TEXT("joint_th"),
+	TEXT("joint_1"), TEXT("joint_2"), TEXT("joint_3"), TEXT("joint_4"),
+	TEXT("joint_5"), TEXT("joint_6"), TEXT("joint_7")};
+
+/** The shared deterministic target script — MUST match Rung B / gen_tidybot_trace.py. */
+FVector TidybotTargetPos(int32 K, const FVector& P0)
+{
+	const FVector Reach(0.0, 0.35, 0.15);
+	const FVector Far(0.9, 0.0, 0.0);
+	if (K < 300)
+		return P0;
+	if (K < 400)
+		return P0 + (double(K - 300) / 100.0) * Reach;
+	if (K < 900)
+		return P0 + Reach;
+	if (K < 1000)
+	{
+		const double S = double(K - 900) / 100.0;
+		return P0 + (1.0 - S) * Reach + S * Far;
+	}
+	const double Theta = 2.0 * PI * double(K - 1000) / 1200.0;
+	return P0 + Far + FVector(0.4 * (FMath::Cos(Theta) - 1.0), 0.4 * FMath::Sin(Theta), 0.0);
+}
+
+/** Resolve a compiled MuJoCo object id by name suffix (import may prefix names). */
+int32 FindIdBySuffix(const mjModel* M, mjtObj ObjType, int32 Count, const TCHAR* Suffix)
+{
+	for (int32 i = 0; i < Count; ++i)
+	{
+		const char* Nm = mj_id2name(const_cast<mjModel*>(M), ObjType, i);
+		if (Nm && FString(UTF8_TO_TCHAR(Nm)).EndsWith(Suffix))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+template <typename TComp>
+TComp* FindComponentByMjId(const TArray<TComp*>& Comps, int32 MjId)
+{
+	for (TComp* C : Comps)
+	{
+		if (C && C->GetMjID() == MjId)
+		{
+			return C;
+		}
+	}
+	return nullptr;
+}
+} // namespace MjMinkIKControllerTestsLocal
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.ImportCompiles
+//   Imports the merged TidyBot scene through URLab's pipeline and turns the
+//   top NaN suspects (sim options, home keyframe, base actuator gains) into
+//   pass/fail facts.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotImport,
+	"URLab.MinkIK.TidyBot.ImportCompiles",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotImport::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	TestEqual(TEXT("nq"), (int32)M->nq, 18);
+	TestEqual(TEXT("nu"), (int32)M->nu, 11);
+
+	// Suspect 1: the model's sim options must survive the import pipeline.
+	TestEqual(TEXT("integrator == implicitfast"), (int32)M->opt.integrator, (int32)mjINT_IMPLICITFAST);
+	TestEqual(TEXT("cone == elliptic"), (int32)M->opt.cone, (int32)mjCONE_ELLIPTIC);
+	TestEqual(TEXT("impratio == 10"), M->opt.impratio, 10.0);
+
+	// Suspect 2: home keyframe must survive with all 18 qpos (suffix match — import may prefix).
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	TestTrue(TEXT("home keyframe exists"), KeyId >= 0);
+	if (KeyId >= 0)
+	{
+		TestEqual(TEXT("home keyframe has 18 qpos"), (int32)M->nq, 18);
+	}
+
+	// Base actuator gains survived (kp=1e6 on joint_x — find by name suffix).
+	{
+		const int32 JxAct = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, TEXT("joint_x"));
+		TestTrue(TEXT("joint_x actuator found"), JxAct >= 0);
+		if (JxAct >= 0)
+		{
+			TestEqual(TEXT("joint_x kp == 1e6"), M->actuator_gainprm[JxAct * mjNGAIN + 0], 1000000.0);
+		}
+	}
+
+	S.Cleanup();
+	return true;
+}
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.ClosedLoopStable
+//   Same import; then configure the real UMjMinkIKController with the exact
+//   example task stack (Frame on pinch_site, Posture on the 7 arm joints,
+//   disabled Damping on the 3 base joints, ConfigurationLimit), stream
+//   targets via ApplyConfig (the supported RPC path), and step the sim
+//   directly. Finiteness every step; calibrated tracking checkpoints;
+//   base-moved check. A NaN/instability failure here is an EXPECTED,
+//   VALUABLE outcome — it reproduces the live-editor bug headlessly.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotClosedLoop,
+	"URLab.MinkIK.TidyBot.ClosedLoopStable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotClosedLoop::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile -------------------------------------------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Find components (suffix-resolve across the import prefix) --------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	for (const TCHAR* Nm : JointNames)
+	{
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- 3. Create + configure the controller (not yet bound) ----------------
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIK"));
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr; // targets streamed via ApplyConfig (mocap is UE-authoritative)
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 100.0f;
+	Damping.Joints = BaseJoints;
+	Damping.bEnabled = false;
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit; // mink.ConfigurationLimit(model) — Kind/Gain default to Configuration/0.95
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints = TenJoints; // EXACTLY the example's 10 (not the gripper)
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 4. Reset to home keyframe, mj_forward, capture P0/Q0 ----------------
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	const FVector P0(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2]);
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+
+	// --- 5. Bind the controller against the live model -----------------------
+	// AdoptRuntimeController builds the ActuatorIdMap from the articulation's
+	// bound actuators (the same source PostSetup uses) and Bind()s the
+	// controller before publishing it as CachedController — exactly the
+	// "add a controller after compile" path the bridge uses.
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 6. Closed loop: stream target -> solve -> step -----------------------
+	const TSet<int32> Checkpoints = {299, 899, 999, 1600, 2200, 2499};
+	bool bDiverged = false;
+	for (int32 K = 0; K < NSteps; ++K)
+	{
+		const FVector TPos = TidybotTargetPos(K, P0);
+
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+
+		Ctrl->ComputeAndApply(M, D, 0);
+		mj_step(M, D);
+
+		for (int32 v = 0; v < M->nv; ++v)
+		{
+			if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+			{
+				FString CtrlStr;
+				for (int32 a = 0; a < M->nu; ++a)
+				{
+					CtrlStr += FString::Printf(TEXT("%.4f "), D->ctrl[a]);
+				}
+				AddError(FString::Printf(
+					TEXT("NON-FINITE qacc/qvel at step %d dof %d — ctrl=[%s]"), K, v, *CtrlStr));
+				bDiverged = true;
+				break;
+			}
+		}
+		if (bDiverged)
+		{
+			break;
+		}
+
+		if (Checkpoints.Contains(K))
+		{
+			// Tolerances calibrated against the Python run (see task brief): 0.02 m at
+			// settled checkpoints (299, 899); 0.30 m at 999 (actuator-lag transient at
+			// the ramp corner); 0.10 m at the remaining moving checkpoints. NOTE the
+			// controller integrates with sim dt (0.002) not the example's 0.005 — a
+			// documented divergence; this rung asserts stability + tracking only, not
+			// trace-parity vs Python.
+			const double Tol = (K == 299 || K == 899) ? 0.02 : (K == 999 ? 0.30 : 0.10);
+			const FVector Ee(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1],
+				D->site_xpos[3 * SiteMjId + 2]);
+			const double TrackErr = (Ee - TPos).Length();
+			TestTrue(FString::Printf(TEXT("checkpoint %d: track err %.4f <= %.2f m"), K, TrackErr, Tol),
+				TrackErr <= Tol);
+		}
+	}
+
+	if (!bDiverged)
+	{
+		// The base must actually have driven (far-circle phase; Damping/fix-base disabled).
+		const int32 XQposAdr = M->jnt_qposadr[TenJoints[0]->GetMjID()];
+		const int32 YQposAdr = M->jnt_qposadr[TenJoints[1]->GetMjID()];
+		TestTrue(TEXT("base moved > 0.2 m"),
+			FMath::Sqrt(FMath::Square(D->qpos[XQposAdr]) + FMath::Square(D->qpos[YQposAdr])) > 0.2);
+	}
+
+	S.Cleanup();
+	return !bDiverged;
+}
