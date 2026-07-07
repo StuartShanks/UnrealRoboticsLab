@@ -60,7 +60,8 @@ def test_position_inherits_kp_and_nulls_unset_pointers(real_rules, real_schema):
     # convention) so the class default survives.
     assert "bOverride_kv ? kvBuf : nullptr" in out
     assert "bOverride_dampratio ? dampratioBuf : nullptr" in out
-    assert "bOverride_timeconst ? timeconstBuf : nullptr" in out
+    # timeconst is TArray-backed: an authored-but-empty array is unset too.
+    assert "(bOverride_timeconst && timeconst.Num() > 0) ? timeconstBuf : nullptr" in out
     # inheritrange override sentinel from setto_param_defaults.
     assert "bOverride_inheritrange ? (double)inheritrange : 0.0" in out
     assert "mjs_setToPosition(Element," in out

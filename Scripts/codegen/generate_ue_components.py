@@ -2110,10 +2110,17 @@ def _emit_setto_call(
                 f"(double){ue_prop} : {sentinel} }};"
             )
         # Nullable pointer param: pass the buffer only when overridden, else
-        # nullptr so MuJoCo leaves the inherited value untouched.
-        call_args.append(
-            f"bOverride_{ue_prop} ? {buf_name} : nullptr" if is_nullable else buf_name
-        )
+        # nullptr so MuJoCo leaves the inherited value untouched. For a TArray
+        # source, an authored-but-empty array is also treated as unset — passing
+        # a sentinel buffer would trip MuJoCo's range check and short-circuit the
+        # setTo (e.g. skipping biastype) instead of just inheriting.
+        if is_nullable:
+            nn = f"bOverride_{ue_prop}"
+            if ue_type.startswith("TArray"):
+                nn = f"(bOverride_{ue_prop} && {ue_prop}.Num() > 0)"
+            call_args.append(f"{nn} ? {buf_name} : nullptr")
+        else:
+            call_args.append(buf_name)
 
     args_str = ", ".join(call_args)
     body = "\n".join(setup_lines)

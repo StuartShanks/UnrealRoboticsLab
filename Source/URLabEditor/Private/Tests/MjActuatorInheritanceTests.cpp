@@ -98,6 +98,12 @@ bool ActuatorParamsMatch(
 		}
 	};
 
+	if (Ref->actuator_dyntype[Act] != Got->actuator_dyntype[Act])
+	{
+		Test.AddError(FString::Printf(TEXT("%s: dyntype ref=%d got=%d"),
+			Label, Ref->actuator_dyntype[Act], Got->actuator_dyntype[Act]));
+		bOk = false;
+	}
 	if (Ref->actuator_gaintype[Act] != Got->actuator_gaintype[Act])
 	{
 		Test.AddError(FString::Printf(TEXT("%s: gaintype ref=%d got=%d"),
@@ -279,6 +285,23 @@ bool FMjActuatorInheritedDamperKvPreserved::RunTest(const FString&)
 
 	TestEqual(TEXT("inherited damper kv -> gainprm[2] == -kv"),
 		(float)S.Model()->actuator_gainprm[2], -7.0f);
+
+	// Canary for the upstream MuJoCo bug this test documents: mj_loadXML
+	// currently drops the same inherited kv to 0 (OneActuator seeds kv=0 for
+	// damper). If this ever fails because native returns -7, upstream fixed
+	// their reader — at that point delete the divergence note (_todo_damper_
+	// inherit) and fold damper back into InheritedGains_MatchNative.
+	FMjTestSession Ref;
+	if (Ref.CompileXml(Xml))
+	{
+		TestEqual(TEXT("native mj_loadXML still drops inherited damper kv (canary)"),
+			(float)Ref.m->actuator_gainprm[2], 0.0f);
+		Ref.Cleanup();
+	}
+	else
+	{
+		AddError(Ref.LastError);
+	}
 
 	S.Cleanup();
 	return true;
