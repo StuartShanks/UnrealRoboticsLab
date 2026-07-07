@@ -647,6 +647,33 @@ void AMjArticulation::PostSetup(mjModel* Model, mjData* Data)
 	}
 }
 
+void AMjArticulation::AdoptRuntimeController(UMjArticulationController* Ctrl)
+{
+	if (!Ctrl)
+	{
+		return;
+	}
+	if (!m_model || !m_data)
+	{
+		// Model not compiled yet — PostSetup will bind this controller when it runs.
+		UE_LOG(LogURLab, Warning,
+			TEXT("AMjArticulation::AdoptRuntimeController - %s: no compiled model yet; deferring to PostSetup."),
+			*GetName());
+		return;
+	}
+
+	// Build the controller fully while it is still invisible to the physics thread
+	// (CachedController hasn't been repointed), then publish it with a single
+	// pointer write. ApplyControls only ever touches the currently-published
+	// controller, so it never sees this one mid-Bind.
+	Ctrl->Bind(m_model, m_data, ActuatorIdMap);
+	CachedController = Ctrl;
+
+	UE_LOG(LogURLab, Log,
+		TEXT("AMjArticulation::AdoptRuntimeController - %s adopted '%s' (%d actuator binding(s))."),
+		*GetName(), *Ctrl->GetClass()->GetName(), Ctrl->GetNumBindings());
+}
+
 void AMjArticulation::ApplyControls(bool bSkipController)
 {
 	// Thread safety: ActuatorIdMap is built during PostSetup (game thread) and
