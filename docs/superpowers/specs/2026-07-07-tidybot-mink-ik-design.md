@@ -72,19 +72,29 @@ slow far circle (forces base motion). No randomness, no wall-clock.
 
 - **Rung A — Python ground truth.** Headless variant of `mobile_tidybot.py` in
   `Scripts/mink_golden` (no viewer, no keyboard; the scripted trajectory drives
-  `pinch_site_target` mocap directly). Dumps a per-step JSONL/CSV trace: sim time,
-  q, ctrl, EE pose, target pose. Proves algorithm+model stability; produces the
-  golden trace.
+  `pinch_site_target` mocap directly). Dumps a per-step trace of both the solve
+  *inputs* (pre-solve q, target pose) and *outputs* (solved velocity, integrated
+  q, ctrl vector, EE pose). Proves algorithm+model stability; produces the golden
+  trace.
 - **Rung B — native C++ 1:1 test** (`URLab.Mink.TidyBot.*`, in URLabMink tests):
   `mj_loadXML` the same scene.xml; replicate the Python loop exactly —
   `mj_resetDataKeyframe(home)`, `configuration.update(qpos)`,
   `posture.SetTargetFromConfiguration`, move-mocap-to-frame, then per step: set
   frame target from mocap → up-to-20-iteration solve/integrate with 1e-4
   thresholds → `d->ctrl[actuator_ids] = q[dof_ids]` (exactly the example's 10
-  named actuators) → `mj_step`. Asserts: all of qpos/qvel/qacc finite every step;
-  EE within 2 cm position / 0.1 rad orientation of the target at trajectory
-  checkpoints (after a settle window); optional per-step trace comparison against
-  Rung A within tolerance.
+  named actuators) → `mj_step`. Asserts, against the Rung A golden trace
+  (**required**, two levels):
+  1. *Solver parity, no chaos compounding:* replay Rung A's recorded per-step
+     solve inputs (q, target) through the C++ port and compare solved velocity /
+     integrated q / ctrl at tight tolerance (`MinkExpectNear` rule, matching the
+     existing golden suite).
+  2. *Closed-loop similarity:* run the full C++ loop (solve → ctrl → `mj_step`);
+     assert all of qpos/qvel/qacc finite every step, EE within 2 cm position /
+     0.1 rad orientation of the target at trajectory checkpoints (after a settle
+     window), and checkpoint EE poses agreeing with the Python closed-loop trace
+     within a stated loose bound. (Bitwise parity over thousands of `mj_step`s is
+     not asserted — contact dynamics are chaotic and qpmad vs daqp may return
+     different-but-valid QP solutions; level 1 is where exactness is enforced.)
   **Decision bit:** NaN here ⇒ port math bug (fix in URLabMink with golden
   evidence). Stable here ⇒ bug is URLab integration.
 - **Rung C — URLab-integrated test** (`FMjTestSession`, URLabEditor tests): import
