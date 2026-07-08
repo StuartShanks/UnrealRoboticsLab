@@ -68,7 +68,6 @@ MODEL_XML = (
     / "mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"
 )
 ACTOR_ID = "tidybot_0"
-LEVEL_NAME = "TidybotMinkDemo"
 
 FRAME_SITE = "pinch_site"
 BASE_JOINTS = ["joint_x", "joint_y", "joint_th"]

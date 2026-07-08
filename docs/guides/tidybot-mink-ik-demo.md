@@ -22,23 +22,37 @@ and traces a 0.4 m circle, and the **base drives** across the floor to keep the
 end-effector on the circle. No sim resets, no NaNs. In the headless test tracking
 error stays 0.007-0.24 m.
 
-!!! danger "Known live-layer limitation (as of 2026-07-07)"
-    Over the **bridge PIE path**, the `add_controller` route does **not** yet
-    track live. `add_controller` attaches the controller as a runtime *instance
-    component*; when the bridge enters PIE (`EPlaySessionWorldType::PlayInEditor`)
-    the world is duplicated and the controller's `Frame` + `DriveJoints`
-    `UPROPERTY` object references are **dropped** (they point into the editor
-    actor's SCS-built site/joints and do not remap into the play world). The
-    controller then binds with **0 tasks that need a frame / 0 driven actuators**
-    (editor log: `[MinkIK] ... Frame task has no resolved frame component —
-    skipped` / `Bound: 2 task(s) ... 0 driven actuator(s)`), so it just holds the
-    `home` `ctrl` — the arm freezes at home and the base never drives. Everything
-    *around* the IK is correct live (import fidelity, PIE, direct stepping, no
-    NaN, `fix_base` path). The headless test binds in the **same** world, so it
-    never hits this. Fixing it needs the controller baked into the Blueprint
-    (`add_controller` `to_blueprint=true`, not yet implemented) or the controller
-    resolving `Frame`/`DriveJoints` **by name at Bind** — both production C++
-    changes. See `docs/superpowers/specs/2026-07-07-tidybot-nan-findings.md`
+!!! success "Live parity demonstrated — under Simulate-In-Editor (2026-07-07)"
+    A controller-driven session validated the demo flow live under
+    **Simulate-In-Editor** (same-world, no PIE duplication): `add_controller`
+    attached pre-Simulate binds correctly at Simulate start (`[MinkIK] Bound: 3
+    task(s), 1 limit(s), 10 driven actuator(s)`), and the sequence reset-to-home →
+    seed target at the true EE pose → stream targets via `configure_controller` +
+    direct-mode step batches tracked at **0.0039 m** settled (K300), **0.0057 m**
+    reach hold (K900), **0.059–0.066 m** on the moving far circle, with the base
+    driving \|xy\| up to **1.094 m** — 2500 steps, all finite, matching the
+    golden-trace profile. Two exceptions: the `fix_base` toggle open bug and the
+    PIE-path limitation, both below.
+
+!!! danger "Known live-layer limitation — the bridge PIE path (as of 2026-07-07)"
+    Over the **bridge PIE path** (`sim.start`, what this script drives), the
+    `add_controller` route does **not** track. `add_controller` attaches the
+    controller as a runtime *instance component*; when the bridge enters PIE
+    (`EPlaySessionWorldType::PlayInEditor`) the world is duplicated and the
+    controller's `Frame` + `DriveJoints` `UPROPERTY` object references are
+    **dropped** (they point into the editor actor's SCS-built site/joints and do
+    not remap into the play world). The controller then binds with **0 tasks that
+    need a frame / 0 driven actuators** (editor log: `[MinkIK] ... Frame task has
+    no resolved frame component — skipped` / `Bound: 2 task(s) ... 0 driven
+    actuator(s)`), so it just holds the `home` `ctrl` — the arm freezes at home
+    and the base never drives. Everything *around* the IK is correct live (import
+    fidelity, PIE, direct stepping, no NaN). The headless test binds in the
+    **same** world, so it never hits this; Simulate-In-Editor also binds
+    same-world, which is why it works (above). Fixing PIE needs the controller
+    baked into the Blueprint (`add_controller` `to_blueprint=true`, not yet
+    implemented) or the controller resolving `Frame`/`DriveJoints` **by name at
+    Bind** — both production C++ changes. See
+    `docs/superpowers/specs/2026-07-07-tidybot-nan-findings.md`
     (Live editor validation) for the full evidence.
 
 ## Prerequisites
@@ -69,8 +83,10 @@ Flags: `--host tcp://localhost` (default), `--port 5559` (default),
 
 The script:
 
-1. `apply_scene` — imports `tidybot_scene_ue.xml`, spawns one robot, saves a
-   `TidybotMinkDemo` level, and `ensure_manager`.
+1. `scene.import_xml` + `scene.spawn_actor` + `scene.ensure_manager` — imports
+   `tidybot_scene_ue.xml` and spawns one robot **into the currently-open editor
+   level**. No level is created or saved (`save_level` fails on the default
+   `/Temp/Untitled` map, and PIE plays the live world anyway).
 2. `add_controller` — attaches + configures the `UMjMinkIKController` over RPC
    with the exact example stack (below).
 3. `sim.start` — enters PIE, verifies sim options, `reset(keyframe_name="home")`.
@@ -107,6 +123,14 @@ mocap body**.
     **UE-authoritative** — good for gizmo-dragging `pinch_site_target` in the
     viewport, surprising over RPC.
 
+**Gizmo-drag path (mocap-driven target): not exercised by this demo.** The
+original plan included dragging `pinch_site_target` in the viewport with a
+`TargetMocapBody`-configured controller variant. Under bridge PIE this check is
+moot: the same ref-loss root cause (the controller binds with 0 driven actuators)
+makes the *target source* irrelevant — no target route can move a robot the
+controller cannot drive. The gizmo path is exercisable only under
+Simulate-In-Editor (same-world bind), interactively.
+
 ## fix_base toggle
 
 Enabling the base Damping task immobilises the base so the arm alone must reach:
@@ -123,6 +147,15 @@ The demo commands a far/high target and asserts the base stays within **2 cm**
 while the end-effector stretches, then toggles Damping back off
 (`task_enabled=[True, True, False]`). This is the scripted equivalent of pressing
 **Enter** in `mobile_tidybot.py`.
+
+!!! bug "Open bug: the fix_base toggle does not activate live (2026-07-07)"
+    In the Simulate-In-Editor validation session, `configure_controller
+    task_enabled=[true,true,true]` **is stored** on the component (the config echo
+    confirms it) but the physics thread keeps solving with `active=2` — the
+    Damping task never joins the stack, and the base moved **78 cm** during the
+    fix_base phase instead of holding < 2 cm. Suspected stale-read / wrong-instance
+    between `ApplyConfig` (ZMQ thread) and `ComputeAndApply` (physics thread).
+    Tracked in the findings doc.
 
 ## Troubleshooting (live-layer landmines)
 

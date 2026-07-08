@@ -363,3 +363,43 @@ not needed). Filed as the deliverable's live-layer finding.
 *Screenshots:* camera capture over the bridge (`step(include_cameras=True)`,
 robot `base`/`wrist` cams) returned no frames in `direct` mode, so
 `Scripts/demos/output/` is empty; not load-bearing for the acceptance numbers.
+
+### Follow-up — Simulate-In-Editor validation (2026-07-07 ~17:00, interactive)
+
+A later controller-driven session over the bridge validated the same demo flow
+under **Simulate-In-Editor** (same-world — no PIE duplication, so the
+instance-component refs survive). This confirms the PIE ref-loss diagnosis above
+by contrast, and demonstrates the demo parity target live:
+
+- `add_controller` attached **pre-Simulate** binds correctly at Simulate start:
+  `[MinkIK] Bound: 3 task(s), 1 limit(s), 10 driven actuator(s)`.
+- Sequence: reset to `home` keyframe → seed target at the true EE pose → stream
+  targets via `configure_controller` + `step` batches (direct mode).
+- **Tracking:** 0.0039 m settled (K300), 0.0057 m reach hold (K900),
+  0.059–0.066 m on the moving far circle; **base drove |xy| up to 1.094 m**;
+  2500 steps, all finite; matches the golden-trace profile.
+  **Demo parity demonstrated live**, with two exceptions:
+
+**OPEN BUG (new) — `fix_base` toggle does not activate live.**
+`configure_controller task_enabled=[true,true,true]` is stored on the component
+(the config echo confirms it), but the physics thread keeps solving with
+`active=2` — the Damping task never joins the solve stack. The base moved
+**78 cm** during the fix_base phase instead of holding < 2 cm. Suspected
+stale-read / wrong-instance between `ApplyConfig` (ZMQ thread) and
+`ComputeAndApply` (physics thread). Evidence trail: config echo shows the stored
+enables; per-solve logging shows `active=2` throughout; base displacement 0.78 m.
+Needs its own investigation (thread-visibility of `Tasks[i].bEnabled`, or the
+solve stack not rebuilding on an enable-only change).
+
+**Session-lifecycle quirks (live-layer notes):**
+
+- Under Simulate, the sim clock stayed frozen / pumped-per-RPC until step-mode
+  fiddling. Upstream `9b48b7c` ("pace live mode off resolved step mode"), since
+  merged into this branch, likely addresses this — **untested**.
+- One editor livelock at ~290% CPU after a direct-mode client session closed
+  (log stopped mid-write); editor killed + relaunched.
+
+**Gizmo-drag check (from the original plan): not exercised.** Under bridge PIE
+the ref-loss root cause (0 driven actuators) makes the target *source*
+irrelevant — no target route can move a robot the controller cannot drive. The
+mocap/gizmo path is exercisable only under Simulate-In-Editor, interactively.
