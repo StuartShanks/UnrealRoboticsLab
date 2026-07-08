@@ -289,6 +289,12 @@ private:
 	/** Solves discarded by the absurd-velocity sanity clamp. */
 	int32 BadSolveCount = 0;
 
+	/** Remaining budget of "[MinkIK] solve failed" warnings this run. Was a
+	 *  function-static in ComputeAndApply — shared across every instance and
+	 *  never reset; now per-instance and reset in Bind() so each bound
+	 *  controller gets a fresh budget. */
+	int32 ErrorLogBudget = 8;
+
 	/** Last mjData.time we integrated at — the engine calls ComputeAndApply on
 	 *  idle physics-thread iterations too, and integrating the open-loop
 	 *  reference on those races it ahead of the sim. */

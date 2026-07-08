@@ -142,17 +142,46 @@ bool FMjMinkIKTidybotImport::RunTest(const FString&)
 	TestEqual(TEXT("nq"), (int32)M->nq, 18);
 	TestEqual(TEXT("nu"), (int32)M->nu, 11);
 
+	// Native compile of tidybot.xml — ground truth for both the home-keyframe
+	// content check (Suspect 2, below) and the field-by-field actuator
+	// gain/bias comparison further down. Loaded once and reused by both.
+	const FString NativeXml = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot.xml"));
+	char NativeErr[1024] = {0};
+	mjModel* NativeModel = mj_loadXML(TCHAR_TO_UTF8(*NativeXml), nullptr, NativeErr, sizeof(NativeErr));
+	TestNotNull(TEXT("native tidybot.xml compiled for keyframe/gain comparison"), NativeModel);
+
 	// Suspect 1: the model's sim options must survive the import pipeline.
 	TestEqual(TEXT("integrator == implicitfast"), (int32)M->opt.integrator, (int32)mjINT_IMPLICITFAST);
 	TestEqual(TEXT("cone == elliptic"), (int32)M->opt.cone, (int32)mjCONE_ELLIPTIC);
 	TestEqual(TEXT("impratio == 10"), M->opt.impratio, 10.0);
 
-	// Suspect 2: home keyframe must survive with all 18 qpos (suffix match — import may prefix).
+	// Suspect 2: home keyframe must survive with matching qpos CONTENT, not just
+	// nq (suffix match — import may prefix). Compares element-by-element against
+	// MuJoCo's own compile of tidybot.xml, tolerance 1e-6.
 	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
 	TestTrue(TEXT("home keyframe exists"), KeyId >= 0);
 	if (KeyId >= 0)
 	{
 		TestEqual(TEXT("home keyframe has 18 qpos"), (int32)M->nq, 18);
+
+		if (NativeModel)
+		{
+			const int32 NativeKeyId = FindIdBySuffix(NativeModel, mjOBJ_KEY, NativeModel->nkey, TEXT("home"));
+			if (TestTrue(TEXT("native home keyframe exists"), NativeKeyId >= 0)
+				&& TestEqual(TEXT("nq matches native for keyframe comparison"), (int32)M->nq, (int32)NativeModel->nq))
+			{
+				const mjtNum* ImportedQpos = M->key_qpos + (size_t)KeyId * M->nq;
+				const mjtNum* NativeQpos = NativeModel->key_qpos + (size_t)NativeKeyId * NativeModel->nq;
+				double MaxAbsDiff = 0.0;
+				for (int32 i = 0; i < M->nq; ++i)
+				{
+					MaxAbsDiff = FMath::Max(MaxAbsDiff, FMath::Abs((double)ImportedQpos[i] - (double)NativeQpos[i]));
+				}
+				TestTrue(FString::Printf(TEXT("home key_qpos matches native element-by-element (max |diff|=%.9f)"), MaxAbsDiff),
+					MaxAbsDiff <= 1e-6);
+			}
+		}
 	}
 
 	// Base actuator gains survived (kp=1e6 on joint_x — find by name suffix).
@@ -187,43 +216,38 @@ bool FMjMinkIKTidybotImport::RunTest(const FString&)
 		}
 	}
 
-	// Field-by-field gain/bias comparison against the native compile of tidybot.xml.
-	// NOTE: the imported fixture is tidybot_scene_ue.xml (= tidybot.xml + scene wrapper
-	// + mocap target body); the actuator definitions are identical, so native
-	// tidybot.xml is a valid gain/bias ground truth (actuators matched by name suffix).
+	// Field-by-field gain/bias comparison against the native compile of tidybot.xml
+	// (NativeModel, loaded once above). NOTE: the imported fixture is
+	// tidybot_scene_ue.xml (= tidybot.xml + scene wrapper + mocap target body); the
+	// actuator definitions are identical, so native tidybot.xml is a valid
+	// gain/bias ground truth (actuators matched by name suffix).
+	if (NativeModel)
 	{
-		const FString NativeXml = FPaths::Combine(FPaths::ProjectPluginsDir(),
-			TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot.xml"));
-		char Err[1024] = {0};
-		mjModel* N = mj_loadXML(TCHAR_TO_UTF8(*NativeXml), nullptr, Err, sizeof(Err));
-		if (!TestNotNull(TEXT("native tidybot.xml compiled for gain comparison"), N))
+		for (int32 ni = 0; ni < NativeModel->nu; ++ni)
 		{
-			// Non-fatal: literal asserts above already cover the root cause.
-		}
-		else
-		{
-			for (int32 ni = 0; ni < N->nu; ++ni)
+			const char* NmC = mj_id2name(NativeModel, mjOBJ_ACTUATOR, ni);
+			if (!NmC)
 			{
-				const char* NmC = mj_id2name(N, mjOBJ_ACTUATOR, ni);
-				if (!NmC)
-				{
-					continue;
-				}
-				const FString Nm = UTF8_TO_TCHAR(NmC);
-				const int32 mi = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, *Nm);
-				if (!TestTrue(*FString::Printf(TEXT("actuator '%s' present in import"), *Nm), mi >= 0))
-				{
-					continue;
-				}
-				TestEqual(*FString::Printf(TEXT("act '%s' gainprm[0]"), *Nm),
-					M->actuator_gainprm[mi * mjNGAIN + 0], N->actuator_gainprm[ni * mjNGAIN + 0]);
-				TestEqual(*FString::Printf(TEXT("act '%s' biasprm[1]"), *Nm),
-					M->actuator_biasprm[mi * mjNBIAS + 1], N->actuator_biasprm[ni * mjNBIAS + 1]);
-				TestEqual(*FString::Printf(TEXT("act '%s' biasprm[2]"), *Nm),
-					M->actuator_biasprm[mi * mjNBIAS + 2], N->actuator_biasprm[ni * mjNBIAS + 2]);
+				continue;
 			}
-			mj_deleteModel(N);
+			const FString Nm = UTF8_TO_TCHAR(NmC);
+			const int32 mi = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, *Nm);
+			if (!TestTrue(*FString::Printf(TEXT("actuator '%s' present in import"), *Nm), mi >= 0))
+			{
+				continue;
+			}
+			TestEqual(*FString::Printf(TEXT("act '%s' gainprm[0]"), *Nm),
+				M->actuator_gainprm[mi * mjNGAIN + 0], NativeModel->actuator_gainprm[ni * mjNGAIN + 0]);
+			TestEqual(*FString::Printf(TEXT("act '%s' biasprm[1]"), *Nm),
+				M->actuator_biasprm[mi * mjNBIAS + 1], NativeModel->actuator_biasprm[ni * mjNBIAS + 1]);
+			TestEqual(*FString::Printf(TEXT("act '%s' biasprm[2]"), *Nm),
+				M->actuator_biasprm[mi * mjNBIAS + 2], NativeModel->actuator_biasprm[ni * mjNBIAS + 2]);
 		}
+	}
+
+	if (NativeModel)
+	{
+		mj_deleteModel(NativeModel);
 	}
 
 	S.Cleanup();
@@ -337,6 +361,9 @@ bool FMjMinkIKTidybotClosedLoop::RunTest(const FString&)
 	FMinkTaskSpec Posture;
 	Posture.Kind = EMinkTaskKind::Posture;
 	Posture.Cost = 1e-3f;
+	// Deliberately narrower than the literal example's cost[3:] (which spans
+	// every non-base DOF, including the gripper): here it's arm joints only.
+	// The gripper is undriven in this rig, so the divergence has no effect.
 	Posture.Joints = ArmJoints;
 
 	FMinkTaskSpec Damping;

@@ -81,9 +81,15 @@ FMinkVec SubsetCost(const mjModel* m, const TArray<TObjectPtr<UMjJoint>>& Joints
 		int32 DofNum = 1;
 		switch (m->jnt_type[J->GetMjID()])
 		{
-			case mjJNT_FREE: DofNum = 6; break;
-			case mjJNT_BALL: DofNum = 3; break;
-			default: DofNum = 1; break;
+			case mjJNT_FREE:
+				DofNum = 6;
+				break;
+			case mjJNT_BALL:
+				DofNum = 3;
+				break;
+			default:
+				DofNum = 1;
+				break;
 		}
 		for (int32 k = 0; k < DofNum && DofAdr + k < m->nv; ++k)
 		{
@@ -97,11 +103,16 @@ const TCHAR* IkStatusName(EMinkIKStatus S)
 {
 	switch (S)
 	{
-		case EMinkIKStatus::Success: return TEXT("Success");
-		case EMinkIKStatus::NoSolutionFound: return TEXT("NoSolutionFound");
-		case EMinkIKStatus::NotWithinConfigurationLimits: return TEXT("NotWithinConfigurationLimits");
-		case EMinkIKStatus::TaskError: return TEXT("TaskError");
-		case EMinkIKStatus::LimitError: return TEXT("LimitError");
+		case EMinkIKStatus::Success:
+			return TEXT("Success");
+		case EMinkIKStatus::NoSolutionFound:
+			return TEXT("NoSolutionFound");
+		case EMinkIKStatus::NotWithinConfigurationLimits:
+			return TEXT("NotWithinConfigurationLimits");
+		case EMinkIKStatus::TaskError:
+			return TEXT("TaskError");
+		case EMinkIKStatus::LimitError:
+			return TEXT("LimitError");
 	}
 	return TEXT("Unknown");
 }
@@ -150,6 +161,7 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 
 	RebuildFromSpecs(m, d);
 	BuiltGeneration = SpecGeneration.GetValue();
+	ErrorLogBudget = 8;
 
 	UE_LOG(LogURLabRuntime, Log,
 		TEXT("[MinkIK] Bound: %d task(s), %d limit(s), %d driven actuator(s), nv=%d."),
@@ -313,7 +325,6 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 			}
 		}
 	}
-
 }
 
 void UMjMinkIKController::SetIKTarget(int32 TaskIndex, FVector WorldPos, FQuat WorldRot)
@@ -437,8 +448,8 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		return; // idle invocation — sim didn't advance; hold ctrl as-is
 	}
 	const double Dt = (LastSimTime < 0.0)
-		? m->opt.timestep
-		: FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
+						? m->opt.timestep
+						: FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
 	LastSimTime = Now;
 	for (int32 It = 0; It < MaxIters; ++It)
 	{
@@ -446,7 +457,6 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			/*bSafetyBreak*/ false, LimitsArg);
 		if (!R.IsSuccess())
 		{
-			static int32 ErrorLogBudget = 8;
 			if (ErrorLogBudget-- > 0)
 			{
 				UE_LOG(LogURLabRuntime, Warning, TEXT("[MinkIK] solve failed: %s — holding last command."),

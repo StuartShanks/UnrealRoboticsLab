@@ -468,7 +468,14 @@ protected:
 	/** Controller cached at PostSetup (game thread) so ApplyControls can
 	 *  read it from the physics thread without iterating OwnedComponents —
 	 *  that iteration races against game-thread component mutations (e.g.
-	 *  the auto-created UMjTwistController) and corrupts nearby heap state. */
+	 *  the auto-created UMjTwistController) and corrupts nearby heap state.
+	 *
+	 *  AdoptRuntimeController republishes this pointer on the game thread
+	 *  while ApplyControls dereferences it on the physics thread. It must
+	 *  stay a UPROPERTY (GC needs to see it), so it can't be
+	 *  std::atomic<>; instead AdoptRuntimeController / ApplyControls pair a
+	 *  manual std::atomic_thread_fence release/acquire around the publish —
+	 *  see the fence comments at both sites. */
 	UPROPERTY(Transient)
 	class UMjArticulationController* CachedController = nullptr;
 

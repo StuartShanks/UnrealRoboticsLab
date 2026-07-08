@@ -20,7 +20,7 @@ Two discriminating experiments prove it:
 |---|---|---|---|
 | Baseline (as imported) | 0 / 1 (wrong) | −1 (wrong) | **UNSTABLE** — NaN-warn DOF 3 @ t=0.674s, qacc→9e9, track 0.33–2.32 m |
 | **Force cone=elliptic + impratio=10** | 1 / 10 (correct) | −1 (wrong) | **STILL UNSTABLE** — NaN-warn DOF 3 @ t=0.666s, qacc→9e9, track 0.40–1.69 m |
-| **Copy native actuator gains** (options left wrong) | 0 / 1 (wrong) | 2000/500 (correct) | **STABLE & TRACKING** — no warn, qacc≤6e3, track 0.0073/0.0078/0.2382/0.050/0.050/0.052 m — **matches Rung B exactly** |
+| **Copy native actuator gains** (options left wrong) | 0 / 1 (wrong) | 2000/500 (correct) | **STABLE & TRACKING** — no warn, qacc≤6e3, track 0.0073/0.0078/0.2382/0.050/0.050/0.052 m — **matches the Rung A golden trace (task-2 record) exactly** |
 
 Options are a red herring for the NaN. Gains are the root cause.
 
@@ -46,9 +46,14 @@ checkpoint 2499: trackErr=0.0525  tol=0.10  maxAbsQacc=5.99e+03  PASS
 Result: 1/1 GREEN
 ```
 
-These numbers are identical (to 4 dp) to Rung B's native run — proving the *only*
-material Rung B→Rung C dynamics delta is the actuator gains, and that the pyramidal
-cone / impratio=1 the importer produces is perfectly stable for this scenario once
+These numbers are identical (to 4 dp) to the **Rung A golden trace** (the pinned
+Python `mobile_tidybot.py` run recorded in `task-2-report.md`'s checkpoint
+table: 0.0073/0.0078/0.2382 m at k=299/899/999) — not to Rung B's own test log,
+which only records pass/fail per checkpoint (`TestTrue`, no numeric output on
+success). Rung B's checkpoints pass at the same tolerances against that same
+Rung A ground truth, so together these confirm the *only* material Rung
+B→Rung C dynamics delta is the actuator gains, and that the pyramidal cone /
+impratio=1 the importer produces is perfectly stable for this scenario once
 gains are correct.
 
 ### Mechanism (file:line)
@@ -173,6 +178,19 @@ tolerance, iterations, ls_iterations` (lines 264-293) — none set their overrid
   attributes listed above.
 - Fix for **fidelity** (correct contact model), not for the TidyBot NaN — the
   forced-elliptic experiment proves it will not stabilize the sim on its own.
+
+### Merge note: cross-robot behavior change
+
+`SimOptions.ApplyToSpec` now writes each articulation's authored options into
+the **shared root spec** (`AMjArticulation::Setup`, `MjArticulation.cpp:291`) —
+previously silently dropped, because `mjs_attach` only merges a child spec's
+body/frame subtree into the root, never its global `<option>` block (see
+Mechanism above). Consequence: any imported robot whose MJCF carries an
+`<option>` element now affects **global** sim options; in a multi-robot scene
+the **last articulation's `Setup()` to run wins**, overwriting any earlier
+articulation's options. The planned resolution path is the vendored-MuJoCo
+bump + `conflict=MERGE` + PR #43 re-scope described in
+`docs/mujoco-attach-policy-impact.txt`.
 
 ---
 
@@ -389,7 +407,13 @@ stale-read / wrong-instance between `ApplyConfig` (ZMQ thread) and
 `ComputeAndApply` (physics thread). Evidence trail: config echo shows the stored
 enables; per-solve logging shows `active=2` throughout; base displacement 0.78 m.
 Needs its own investigation (thread-visibility of `Tasks[i].bEnabled`, or the
-solve stack not rebuilding on an enable-only change).
+solve stack not rebuilding on an enable-only change). Note `Tasks[i].bEnabled`
+is not the only scalar this affects: every field `ApplyConfig` writes
+(`MaxIters`, `QpDamping`, `PosThreshold`/`OriThreshold`, `bSyncFromLiveState`,
+and per-task `bEnabled`) is a plain member written from the ZMQ thread and
+read from the physics thread with no synchronization — the same
+unsynchronized cross-thread pattern, so the eventual fix should cover all of
+them together rather than patching `bEnabled` in isolation.
 
 **Session-lifecycle quirks (live-layer notes):**
 

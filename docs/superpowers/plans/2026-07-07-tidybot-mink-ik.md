@@ -145,7 +145,7 @@ git commit -m "docs(mink-ik): historical notes from the first integration attemp
 ### Task 2: Vendor the TidyBot fixture + Rung A Python trace generator
 
 **Files:**
-- Create: `Scripts/mink_golden/models/stanford_tidybot/` (vendored from mink **v1.2.0 tag**: `scene.xml`, `tidybot.xml`, `README.md`, `assets/**` — 25 STL files)
+- Create: `Scripts/mink_golden/models/stanford_tidybot/` (vendored from mink **v1.2.0 tag**: `scene.xml`, `tidybot.xml`, `README.md`, `assets/**` — 21 STL files)
 - Create: `Scripts/mink_golden/gen_tidybot_trace.py`
 - Create: `Scripts/mink_golden/fixtures/tidybot_trace.json` (generated, committed)
 - Modify: `Scripts/mink_golden/README.md` (document the trace generator + model provenance/licenses)

@@ -58,6 +58,7 @@
 #include "DrawDebugHelpers.h"
 #include "MuJoCo/Utils/MjUtils.h"
 #include "Utils/URLabLogging.h"
+#include <atomic>
 
 AMjArticulation::AMjArticulation()
 {
@@ -673,6 +674,14 @@ void AMjArticulation::AdoptRuntimeController(UMjArticulationController* Ctrl)
 	// pointer write. ApplyControls only ever touches the currently-published
 	// controller, so it never sees this one mid-Bind.
 	Ctrl->Bind(m_model, m_data, ActuatorIdMap);
+
+	// Release fence — pairs with the acquire fence in ApplyControls. Bind()
+	// above is plain (non-atomic) writes into Ctrl's state (task stack,
+	// driven actuators, etc.); this fence guarantees the physics thread sees
+	// all of them once it observes the CachedController write below.
+	// CachedController is a UPROPERTY (must stay GC-visible), so it can't be
+	// std::atomic<> — the fence gives the same publish safety by hand.
+	std::atomic_thread_fence(std::memory_order_release);
 	CachedController = Ctrl;
 
 	UE_LOG(LogURLab, Log,
@@ -735,10 +744,16 @@ void AMjArticulation::ApplyControls(bool bSkipController)
 	// by setting `bSkipController=true` (mirrors a per-step
 	// `control_mode="raw"` from the wire); the staged `NetworkValue`
 	// then lands directly on `d->ctrl` without controller transformation.
+	UMjArticulationController* Controller = CachedController;
+	// Acquire fence — pairs with the release fence in AdoptRuntimeController.
+	// If we observe the pointer AdoptRuntimeController published, this fence
+	// guarantees we also observe every write Bind() made to it before that
+	// publish (see the comment there).
+	std::atomic_thread_fence(std::memory_order_acquire);
 	if (!bSkipController
-		&& CachedController && CachedController->bEnabled && CachedController->IsBound())
+		&& Controller && Controller->bEnabled && Controller->IsBound())
 	{
-		CachedController->ComputeAndApply(m_model, m_data, ControlSource);
+		Controller->ComputeAndApply(m_model, m_data, ControlSource);
 		return;
 	}
 
