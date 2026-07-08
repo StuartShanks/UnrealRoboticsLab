@@ -1,0 +1,103 @@
+MuJoCo upstream commit 410c7316 ("Add policies for global attribute conflict
+resolution upon attach", 2026-06-17) — what it hits and what it doesn't,
+against the TidyBot mink-IK effort's findings.
+=============================================================================
+
+What the commit does (verified from the patch, not the description)
+--------------------------------------------------------------------
+- New enum mjtConflict: WARNING (0, DEFAULT) / MERGE / ERROR. Policy lives on
+  the PARENT spec at spec->compiler.conflict; settable via the new
+  <compiler conflict="warning|merge|error"> XML attribute or programmatically.
+- mjs_attach now calls ResolveConflicts(parent, child, parent_policy) on
+  every attach (user_api.cc:394+). Errors abort the attach; warnings are
+  grouped per attach.
+- Per field (options + enable/disable flags), the resolver:
+  * skips if values are equal;
+  * determines authored-ness via mjs_isAuthored, FALLING BACK to a
+    value-differs-from-default comparison when neither side has tracking —
+    this fallback is what makes it work for programmatic writes like URLab's
+    ApplyToSpec;
+  * child unauthored -> nothing happens;
+  * child authored, parent not: MERGE adopts the child value (with warning);
+    WARNING/ERROR keep the parent value;
+  * both authored: WARNING keeps parent + warns; MERGE resolves per field
+    (min for timestep, max for iterations, HARD ERROR for unmergeable fields
+    like integrator); ERROR aborts.
+
+KEY SUBTLETY: under the DEFAULT policy (warning), child-only-authored options
+are STILL DROPPED — just loudly ("keeping parent value" warning) instead of
+silently. Adoption only happens under MERGE.
+
+What it fixes vs what we hit
+----------------------------
+| What we hit                                        | Fixed by 410c7316?    |
+|----------------------------------------------------|-----------------------|
+| The actual NaN (URLab's export clobbering          | NO. Pure URLab bug;   |
+| class-inherited actuator gains with kp=-1)         | fixed by our Task 6   |
+|                                                    | + PR 75.              |
+|----------------------------------------------------|-----------------------|
+| Importer parsing only the first <option> element   | NO. URLab's           |
+| + never setting bOverride_* flags                  | XML->UPROPERTY layer; |
+| (timestep..ls_iterations, incl. impratio)          | fixed by us; must     |
+|                                                    | stay regardless.      |
+|----------------------------------------------------|-----------------------|
+| mjs_attach dropping the child spec's <option>      | YES — this one,       |
+| block (why our Task-6 fix applies SimOptions to    | EVENTUALLY. Two       |
+| the ROOT spec in AMjArticulation::Setup,           | conditions:           |
+| "last articulation wins")                          | (1) vendored MuJoCo   |
+|                                                    | bump — ours is pinned |
+|                                                    | 2026-06-14, 3 days    |
+|                                                    | BEFORE the commit;    |
+|                                                    | (2) URLab must set    |
+|                                                    | conflict=MERGE on its |
+|                                                    | root spec (default    |
+|                                                    | 'warning' still drops |
+|                                                    | child-only options).  |
+|----------------------------------------------------|-----------------------|
+| PIE ref-loss (instance-component TObjectPtr refs   | NO. UE-side.          |
+| dropped by world duplication -> controller binds   |                       |
+| 0 driven actuators)                                |                       |
+|----------------------------------------------------|-----------------------|
+| fix_base toggle not activating live (task_enabled  | NO. URLab-side, still |
+| stored on component but physics thread stays       | under investigation.  |
+| active=2)                                          |                       |
+|----------------------------------------------------|-----------------------|
+| Live pacing / frozen clock / bridge wedges         | NO. URLab-side        |
+|                                                    | (upstream URLab       |
+|                                                    | 9b48b7c fixed pacing).|
+
+Bottom line
+-----------
+Nothing in our working state changes because of this commit — the branch is
+correct as it stands. Its value is FUTURE CLEANUP:
+
+1. Bump vendored MuJoCo past 410c7316.
+2. Set spec->compiler.conflict = mjCONFLICT_MERGE where URLab creates the
+   root spec (one line).
+3. Restore the original child-spec authoring (SimOptions.ApplyToSpec(m_ChildSpec)
+   in AMjArticulation::Setup) and DELETE our root-spec hack —
+   URLab.MinkIK.TidyBot.ImportCompiles is the regression gate proving the swap.
+4. Re-scope PR #43: under MERGE, both-authored multi-robot conflicts resolve
+   by min/max (NOT priority) and unmergeable fields (integrator, cone) hard-
+   fail the attach — "robot X's settings win" remains inexpressible upstream.
+   PR #43 shrinks to a thin priority PRE-resolver that settles disagreements
+   URLab-side before attach so MuJoCo never sees a both-authored conflict.
+
+Cosmetic note: in the single-robot case, MERGE adoption emits a grouped
+"adopting child value" warning per differing field — harmless; can be
+silenced by pre-seeding the root's options equal to the sole child's (equal
+values short-circuit the resolver).
+
+It also retroactively validates the Task-5/6 diagnosis: DeepMind considered
+the silent option-drop real enough to build a whole conflict-resolution
+scheme around it, three days after we vendored.
+
+Cross-references
+----------------
+- Task-6 findings: docs/superpowers/specs/2026-07-07-tidybot-nan-findings.md
+- Our attach workaround: commit 8ff39eb (root-spec ApplyToSpec in Setup)
+- Parser flag fix (post-#72 port): merge commit 591aaca
+- Actuator gains fix: commits f81142a/8026b28 + PR #75 (supersedes; merged
+  locally at 5c19a2f)
+- URLab PR #43 (SimOptions priority resolver): re-scope candidate
+- Vendored MuJoCo pin: third_party commit 328635d (2026-06-14, mj=67a1ea6)

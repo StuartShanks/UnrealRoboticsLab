@@ -1,0 +1,102 @@
+TidyBot mink IK — the NaN root cause, line by line
+====================================================
+
+Framing note: the model and golden files were never wrong — the NaN was
+manufactured entirely inside URLab's import→export path. The vendored XML
+matters only because it's the *input* that triggers the bug.
+
+1. The model declares arm gains via a default class
+---------------------------------------------------
+Scripts/mink_golden/models/stanford_tidybot/tidybot.xml:24-29:
+
+    <default class="large_actuator">
+      <position kp="2000" kv="100" forcerange="-105 105"/>
+    </default>
+    <default class="small_actuator">
+      <position kp="500" kv="50" forcerange="-52 52"/>
+    </default>
+
+The arm actuators (lines 292-298) carry NO inline kp/kv — they inherit it:
+
+    <position class="large_actuator" name="joint_1" joint="joint_1"/>
+
+The base actuators (lines 289-291) are different:
+
+    <position name="joint_x" joint="joint_x" kp="1000000" kv="50000"/>
+
+— inline attributes. That asymmetry is why only the arm blew up.
+
+2. URLab's importer never resolves class-inherited values
+---------------------------------------------------------
+MjPositionActuator.cpp (pre-fix, ImportFromXml, lines 61-65) reads only the
+element's OWN attributes:
+
+    MjXmlUtils::ReadAttrFloat(Node, TEXT("kp"), kp, bOverride_kp);
+
+For joint_1..7 there is no kp attribute on the element, so bOverride_kp stays
+FALSE. (For joint_x, inline kp=1e6 → bOverride_kp=true → exported correctly.)
+
+3. The export writes a -1 sentinel that MuJoCo takes literally — the smoking gun
+--------------------------------------------------------------------------------
+Source/URLab/Private/MuJoCo/Components/Actuators/MjPositionActuator.cpp:44-48
+(pre-fix, commit f81142a^):
+
+    double kvBuf[1] = {bOverride_kv ? (double)kv : -1.0};
+    double dampratioBuf[1] = {bOverride_dampratio ? (double)dampratio : -1.0};
+    ...
+    mjs_setToPosition(Element, bOverride_kp ? (double)kp : -1.0,
+                      kvBuf, dampratioBuf, ...);
+
+The intent was "-1 means unset." But MuJoCo's API has no such convention.
+
+third_party/MuJoCo/src/src/user/user_api.cc:1149-1150:
+
+    actuator->gainprm[0] = kp;      // <- writes -1 LITERALLY,
+    actuator->biasprm[1] = -kp;     // <- overwriting the class-inherited 2000
+
+So the spec default (kp=2000 inherited via mjs_addActuator(spec, default))
+gets CLOBBERED to gainprm[0] = -1, biasprm[1] = +1.
+
+4. The damping is destroyed too, via a silently ignored error
+-------------------------------------------------------------
+user_api.cc:1153-1155: because ExportTo passed BOTH kvBuf and dampratioBuf
+non-null (always — they're stack arrays), the function RETURNS EARLY with
+"kv and dampratio cannot both be defined" before ever writing biasprm[2]
+(the -kv damping term at line 1159). ExportTo discarded that return value,
+so nobody noticed. Net: no damping either.
+
+5. The physics of the NaN
+-------------------------
+A MuJoCo position actuator's force is:
+
+    gainprm[0]*ctrl + biasprm[1]*q + biasprm[2]*qvel
+
+i.e. normally  kp*(ctrl - q) - kv*qvel.  With the clobbered values it became:
+
+    force = -(ctrl - q)
+
+— a spring that pushes the joint AWAY from its target, with zero damping.
+Positive feedback → exponential runaway → QACC explodes → NaN within ~0.1 s.
+
+This is exactly the EOD report's symptom ("QACC at DOF 3/5" — arm DOFs,
+because only class-inherited actuators were hit), and exactly why the
+posture-only configuration seemed to survive longer while any active
+frame-task target diverged instantly.
+
+The fix (current HEAD, durable in codegen)
+------------------------------------------
+MjPositionActuator.cpp:53-60 now:
+  - passes nullptr for every non-overridden parameter (MuJoCo never sees a
+    sentinel),
+  - re-asserts Element->gainprm[0] for unauthored kp (preserving the
+    class-inherited value through the unconditional write at user_api.cc:1149),
+  - logs the returned error string instead of discarding it.
+
+The pattern lives in Scripts/codegen/codegen_rules.json +
+Scripts/codegen/generate_ue_components.py so regeneration reproduces it —
+guarded by the URLab.MinkIK.TidyBot.ImportCompiles regression asserts
+(joint_1 gainprm[0]==2000, biasprm[1]==-2000, biasprm[2]==-100, plus a
+field-by-field compare against a native mj_loadXML compile).
+
+Full experiment trail (including why the dropped cone/impratio options were
+proven NON-causal): docs/superpowers/specs/2026-07-07-tidybot-nan-findings.md
