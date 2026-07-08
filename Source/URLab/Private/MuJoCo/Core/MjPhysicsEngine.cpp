@@ -474,7 +474,7 @@ void UMjPhysicsEngine::RunMujocoAsync()
 				bool bSkipApplyControls = false;
 				if (AAMjManager* OwnerMgr = Cast<AAMjManager>(GetOwner()))
 				{
-					bSkipApplyControls = (OwnerMgr->StepMode == EStepMode::Puppet);
+					bSkipApplyControls = (OwnerMgr->EffectiveStepMode.load(std::memory_order_acquire) == EStepMode::Puppet);
 				}
 				if (!bSkipApplyControls)
 				{
@@ -521,20 +521,13 @@ void UMjPhysicsEngine::RunMujocoAsync()
 			//   than capping at 1 / timestep Hz. Short timeout keeps the
 			//   bShouldStopTask check responsive on shutdown.
 			// Real-time pacing applies whenever the session is behaving as Live.
-			// Don't read OwnerMgr->StepMode here: that's the *configured* mode
-			// (default Auto) and is never updated when the dispatcher resolves
-			// Auto->Live or a client promotes to Direct/Puppet. In the common
-			// default-Auto live session it reads back as Auto (!= Live), which
-			// would drop us into the event-wait branch below where nothing
-			// signals StepRequestEvent -> the loop wakes only on the 100ms
-			// timeout and steps at a fixed 10Hz regardless of opt.timestep.
-			// bPublishersPaused is the dispatcher's authoritative "not Live"
-			// signal (false in Live / Auto-resolved-Live, true in Direct/Puppet),
-			// kept in sync across hello / set_mode / disconnect.
 			bool bUseRealTimePacing = true;
 			if (AAMjManager* OwnerMgr = Cast<AAMjManager>(GetOwner()))
 			{
-				bUseRealTimePacing = !OwnerMgr->bPublishersPaused.load(std::memory_order_acquire);
+				// Pace off the resolved mode, not the configured StepMode (which
+				// defaults to Auto). Auto resolves to Live, so a freshly-started
+				// live session runs real-time instead of blocking at ~10 Hz.
+				bUseRealTimePacing = (OwnerMgr->EffectiveStepMode.load(std::memory_order_acquire) == EStepMode::Live);
 			}
 			if (bUseRealTimePacing)
 			{
