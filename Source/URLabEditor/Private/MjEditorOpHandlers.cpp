@@ -1841,6 +1841,7 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	double V;
 	if (Req->TryGetNumberField(TEXT("max_iters"), V)) Ctrl->MaxIters = FMath::Max(1, (int32)V);
 	if (Req->TryGetNumberField(TEXT("qp_damping"), V)) Ctrl->QpDamping = V;
+	if (Req->TryGetNumberField(TEXT("integrate_dt_override"), V)) Ctrl->IntegrateDtOverride = FMath::Max(0.0, V);
 	if (Req->TryGetNumberField(TEXT("pos_threshold"), V)) Ctrl->PosThreshold = V;
 	if (Req->TryGetNumberField(TEXT("ori_threshold"), V)) Ctrl->OriThreshold = V;
 	bool B;

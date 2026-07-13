@@ -206,6 +206,16 @@ public:
 		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "0.01"))
 	float QpDamping = 1e-3f;
 
+	/**
+	 * 0 = integrate the IK reference with the elapsed sim-time delta (default).
+	 * >0 = integrate with this fixed dt regardless of sim timestep, e.g. 0.005
+	 * to match the mink example's 200 Hz rate.dt exactly (for trace-parity
+	 * testing against the Python golden run).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK|Solver",
+		meta = (ClampMin = "0.0", UIMax = "0.02"))
+	float IntegrateDtOverride = 0.0f;
+
 	/** Early-out thresholds on the first Frame task's error (m / rad). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK|Solver", meta = (ClampMin = "0.0"))
 	float PosThreshold = 1e-4f;

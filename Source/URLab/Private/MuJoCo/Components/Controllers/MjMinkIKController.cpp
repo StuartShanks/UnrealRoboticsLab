@@ -447,9 +447,19 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	{
 		return; // idle invocation — sim didn't advance; hold ctrl as-is
 	}
-	const double Dt = (LastSimTime < 0.0)
-						? m->opt.timestep
-						: FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
+	double Dt;
+	if (IntegrateDtOverride > 0.0f)
+	{
+		Dt = (double)IntegrateDtOverride;
+	}
+	else if (LastSimTime < 0.0)
+	{
+		Dt = m->opt.timestep;
+	}
+	else
+	{
+		Dt = FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
+	}
 	LastSimTime = Now;
 	for (int32 It = 0; It < MaxIters; ++It)
 	{
@@ -577,6 +587,7 @@ void UMjMinkIKController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) co
 	OutSchema->SetStringField(TEXT("kind"), GetKindName());
 	OutSchema->SetStringField(TEXT("max_iters"), TEXT("int"));
 	OutSchema->SetStringField(TEXT("qp_damping"), TEXT("number"));
+	OutSchema->SetStringField(TEXT("integrate_dt_override"), TEXT("number"));
 	OutSchema->SetStringField(TEXT("pos_threshold"), TEXT("number"));
 	OutSchema->SetStringField(TEXT("ori_threshold"), TEXT("number"));
 	OutSchema->SetStringField(TEXT("sync_from_live_state"), TEXT("bool"));
@@ -588,6 +599,7 @@ void UMjMinkIKController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) c
 	OutParams = MakeShared<FJsonObject>();
 	OutParams->SetNumberField(TEXT("max_iters"), MaxIters);
 	OutParams->SetNumberField(TEXT("qp_damping"), QpDamping);
+	OutParams->SetNumberField(TEXT("integrate_dt_override"), IntegrateDtOverride);
 	OutParams->SetNumberField(TEXT("pos_threshold"), PosThreshold);
 	OutParams->SetNumberField(TEXT("ori_threshold"), OriThreshold);
 	OutParams->SetBoolField(TEXT("sync_from_live_state"), bSyncFromLiveState);
@@ -613,6 +625,10 @@ void UMjMinkIKController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
 	if (InParams->TryGetNumberField(TEXT("qp_damping"), V))
 	{
 		QpDamping = (float)FMath::Max(0.0, V);
+	}
+	if (InParams->TryGetNumberField(TEXT("integrate_dt_override"), V))
+	{
+		IntegrateDtOverride = (float)FMath::Max(0.0, V);
 	}
 	if (InParams->TryGetNumberField(TEXT("pos_threshold"), V))
 	{

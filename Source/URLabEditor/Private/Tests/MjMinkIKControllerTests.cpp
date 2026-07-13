@@ -30,6 +30,8 @@
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Misc/FileHelper.h"
+#include "Serialization/JsonSerializer.h"
 #include "mujoco/mujoco.h"
 
 // ============================================================================
@@ -99,6 +101,40 @@ TComp* FindComponentByMjId(const TArray<TComp*>& Comps, int32 MjId)
 		}
 	}
 	return nullptr;
+}
+
+/** Copies a JSON number array's first N elements into Out. Returns false if too short. */
+bool JsonArrayToDoubles(const TArray<TSharedPtr<FJsonValue>>* Arr, int32 N, double* Out)
+{
+	if (!Arr || Arr->Num() < N)
+	{
+		return false;
+	}
+	for (int32 i = 0; i < N; ++i)
+	{
+		Out[i] = (*Arr)[i]->AsNumber();
+	}
+	return true;
+}
+
+/**
+ * Minimal local load of the golden trace JSON — URLabEditor has no dependency on
+ * URLabMink (see URLabEditor.Build.cs), so MinkLoadFixture isn't reachable here.
+ * We only need per-step target_pos/target_quat/ctrl, not the full MinkTestUtils
+ * machinery (Eigen conversions, non-finite string decoding — none of which the
+ * golden trace's target/ctrl fields ever contain).
+ */
+bool LoadTidybotTraceLocal(TSharedPtr<FJsonObject>& OutRoot)
+{
+	const FString Path = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/fixtures/tidybot_trace.json"));
+	FString Contents;
+	if (!FFileHelper::LoadFileToString(Contents, *Path))
+	{
+		return false;
+	}
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Contents);
+	return FJsonSerializer::Deserialize(Reader, OutRoot) && OutRoot.IsValid();
 }
 } // namespace MjMinkIKControllerTestsLocal
 
@@ -477,6 +513,296 @@ bool FMjMinkIKTidybotClosedLoop::RunTest(const FString&)
 		const int32 YQposAdr = M->jnt_qposadr[TenJoints[1]->GetMjID()];
 		TestTrue(TEXT("base moved > 0.2 m"),
 			FMath::Sqrt(FMath::Square(D->qpos[XQposAdr]) + FMath::Square(D->qpos[YQposAdr])) > 0.2);
+	}
+
+	S.Cleanup();
+	return !bDiverged;
+}
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.CtrlParity
+//   Drives the REAL controller (same stack as ClosedLoopStable) on the imported
+//   model with the golden trace's recorded targets, integrating with Kevin's
+//   rate.dt (0.005) via IntegrateDtOverride, and compares its d->ctrl writes
+//   against the trace's recorded ctrl arrays step-by-step. This is the one
+//   remaining gap ClosedLoopStable documents (it integrates with sim dt, not
+//   0.005) — with the override, the only source of divergence left is float
+//   vs double and any residual code-path differences vs the Python reference,
+//   both of which SolverParity already bounds at 1e-3 on q_out.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotCtrlParity,
+	"URLab.MinkIK.TidyBot.CtrlParity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile -------------------------------------------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Load the golden trace ---------------------------------------------
+	TSharedPtr<FJsonObject> Trace;
+	if (!LoadTidybotTraceLocal(Trace))
+	{
+		AddError(TEXT("fixtures/tidybot_trace.json missing or unreadable — run gen_tidybot_trace.py"));
+		S.Cleanup();
+		return false;
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Steps = nullptr;
+	Trace->TryGetArrayField(TEXT("steps"), Steps);
+	if (!Steps || Steps->Num() == 0)
+	{
+		AddError(TEXT("empty trace"));
+		S.Cleanup();
+		return false;
+	}
+	const int32 NStepsToRun = FMath::Min(NSteps, Steps->Num());
+
+	// --- 3. Find components (suffix-resolve across the import prefix) --------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	int32 CtrlIds[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const TCHAR* Nm = JointNames[i];
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+		// The trace's ctrl order == JointNames order; the actuators driving these
+		// joints are named the same as the joints (position actuators), so a
+		// name-suffix lookup gives us the ctrl index independently of the
+		// controller's private DriveCtrlIds — same resolution mechanism the
+		// controller itself uses internally (actuator_trntype==mjTRN_JOINT).
+		CtrlIds[i] = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, Nm);
+		if (CtrlIds[i] < 0)
+		{
+			AddError(FString::Printf(TEXT("actuator '%s' not resolved"), Nm));
+			bAllJointsFound = false;
+		}
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- 4. Create + configure the controller (not yet bound) ----------------
+	// Same example stack as ClosedLoopStable, with ONE difference: integrating
+	// with Kevin's fixed rate.dt instead of the elapsed sim-time delta.
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKCtrlParity"));
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr; // targets streamed via ApplyConfig
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 100.0f;
+	Damping.Joints = BaseJoints;
+	Damping.bEnabled = false;
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->IntegrateDtOverride = 0.005f; // Kevin's rate.dt — the only deliberate difference
+	Ctrl->RegisterComponent();
+
+	// --- 5. Reset to home keyframe, mj_forward, THEN bind (posture target = ---
+	//        home, matching Kevin's order: reset -> forward -> configure tasks).
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 6. Stream recorded targets -> solve -> compare ctrl -> step ---------
+	double MaxAbsDiff = 0.0;
+	int32 MaxAbsDiffStep = -1;
+	bool bDiverged = false;
+	FVector LastTargetPos = FVector::ZeroVector;
+	for (int32 K = 0; K < NStepsToRun; ++K)
+	{
+		const TSharedPtr<FJsonObject> StepObj = (*Steps)[K]->AsObject();
+
+		double TPos[3];
+		double TQuat[4];
+		double ExpectedCtrl[10];
+		const TArray<TSharedPtr<FJsonValue>>* TPosArr = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* TQuatArr = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* CtrlArr = nullptr;
+		StepObj->TryGetArrayField(TEXT("target_pos"), TPosArr);
+		StepObj->TryGetArrayField(TEXT("target_quat"), TQuatArr);
+		StepObj->TryGetArrayField(TEXT("ctrl"), CtrlArr);
+		if (!JsonArrayToDoubles(TPosArr, 3, TPos) || !JsonArrayToDoubles(TQuatArr, 4, TQuat)
+			|| !JsonArrayToDoubles(CtrlArr, 10, ExpectedCtrl))
+		{
+			AddError(FString::Printf(TEXT("step %d: malformed trace entry"), K));
+			bDiverged = true;
+			break;
+		}
+		LastTargetPos = FVector(TPos[0], TPos[1], TPos[2]);
+
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr, QuatArr;
+		for (int32 i = 0; i < 3; ++i)
+		{
+			PosArr.Add(MakeShared<FJsonValueNumber>(TPos[i]));
+		}
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(TQuat[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+
+		Ctrl->ComputeAndApply(M, D, 0);
+
+		for (int32 i = 0; i < 10; ++i)
+		{
+			const double Actual = D->ctrl[CtrlIds[i]];
+			if (!FMath::IsFinite(Actual))
+			{
+				AddError(FString::Printf(TEXT("step %d: non-finite ctrl[%d] ('%s')"), K, i, JointNames[i]));
+				bDiverged = true;
+				break;
+			}
+			const double Diff = FMath::Abs(Actual - ExpectedCtrl[i]);
+			if (Diff > MaxAbsDiff)
+			{
+				MaxAbsDiff = Diff;
+				MaxAbsDiffStep = K;
+			}
+		}
+		if (bDiverged)
+		{
+			break;
+		}
+
+		mj_step(M, D);
+
+		for (int32 v = 0; v < M->nv; ++v)
+		{
+			if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+			{
+				AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+				bDiverged = true;
+				break;
+			}
+		}
+		if (bDiverged)
+		{
+			break;
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("ctrl parity over %d step(s): max |diff|=%.9e at step %d"),
+		NStepsToRun, MaxAbsDiff, MaxAbsDiffStep));
+
+	// Tolerance rationale: SolverParity proves the solver itself matches Python
+	// to 1e-3 on q_out (single-step, given the SAME q_in). This test instead
+	// runs the REAL controller open-loop over 2500 steps, so both sides
+	// integrate their own reference from their own prior ctrl — errors can
+	// compound across steps even though each side individually converges each
+	// step. 2e-3 gives headroom above SolverParity's 1e-3 without masking a
+	// real divergence (an actual bug would show as drift well past 1e-2, not
+	// noise at the 2-3e-3 level).
+	constexpr double CtrlTol = 2e-3;
+	TestTrue(FString::Printf(TEXT("max ctrl |diff| %.6f <= %.4f (peak at step %d)"),
+				 MaxAbsDiff, CtrlTol, MaxAbsDiffStep),
+		MaxAbsDiff <= CtrlTol);
+
+	// --- 7. Sanity: the run actually tracked (final EE vs final target) ------
+	if (!bDiverged)
+	{
+		const FVector FinalEe(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1],
+			D->site_xpos[3 * SiteMjId + 2]);
+		const double FinalTrackErr = (FinalEe - LastTargetPos).Length();
+		TestTrue(FString::Printf(TEXT("final EE tracking err %.4f <= 0.10 m"), FinalTrackErr),
+			FinalTrackErr <= 0.10);
 	}
 
 	S.Cleanup();
