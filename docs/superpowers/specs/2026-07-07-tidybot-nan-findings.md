@@ -350,6 +350,26 @@ Editor** (same-world, refs intact), a mode the bridge does not expose (it hard-
 codes `PlayInEditor`). The EOD's live runs — where the Frame task *was* active and
 NaN'd — were therefore Simulate, not bridge PIE.
 
+**FIXED (2026-07-14) — name capture + name-fallback resolution at Bind.** Fresh
+evidence today confirmed the duplication happens even under Simulate-In-Editor for
+saved levels (`PIE: Created PIE world by copying editor world`; world `Test_2`
+duplicated → controller logged `Bound: 2 task(s), 1 limit(s), 0 driven actuator(s)`
+and drove nothing). The controller's component-ref `UPROPERTY`s
+(`FMinkTaskSpec::Frame/TargetMocapBody/Joints`, `FMinkLimitSpec::Joints`,
+`UMjMinkIKController::DriveJoints`) don't survive the copy. Fix: each now has a
+plain-`FString` name sibling (`FrameName`, `TargetMocapBodyName`, `JointNames`,
+`DriveJointNames`) that *does* survive; `add_controller` captures the raw MjNames
+from its JSON, and `RebuildFromSpecs` resolves by name (exact `mj_name2id`, else
+suffix match) whenever a ref is null/unresolved — covering frame (site→body→geom),
+mocap body, task/limit joint subsets, and driven actuators. It also self-heals:
+a Details-panel-authored controller whose refs resolve once writes the compiled
+names back, so it too survives the next duplication. Regression:
+`URLab.MinkIK.TidyBot.BindSurvivesRefLoss` builds the ClosedLoopStable stack with
+**only** the name fields set (every `TObjectPtr` left null — the exact duplicated
+state) and asserts the closed loop still tracks to tolerance and drives the base
+> 0.2 m, proving all three tasks, one limit, and ten driven actuators rebuild from
+names alone.
+
 ### Reconciliation with the residual-risk list
 
 - **Raw control-mode bypass (EOD #2): NOT hit.** The client's `ControllerKind`

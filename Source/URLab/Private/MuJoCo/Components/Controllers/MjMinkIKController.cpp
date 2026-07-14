@@ -62,24 +62,101 @@ EMinkFrameType MinkFrameTypeOf(const UMjComponent* C, int32& OutMjObjType)
 	return EMinkFrameType::Body;
 }
 
-/** nv-sized cost vector: Scalar on the given joints' DOFs (all DOFs if none given). */
-FMinkVec SubsetCost(const mjModel* m, const TArray<TObjectPtr<UMjJoint>>& Joints, double Scalar)
+/**
+ * Resolve a compiled MuJoCo object id from a name — the duplication-safe fallback
+ * used when a component ref was dropped by a PIE/Simulate world copy. Exact
+ * `mj_name2id` first, else a suffix match (compiled name EndsWith "_"+Name /
+ * "/"+Name / Name) to tolerate the import prefix — same idiom as the test file's
+ * FindIdBySuffix. Returns -1 if nothing matches (or Name is empty).
+ */
+int32 ResolveIdByName(const mjModel* m, mjtObj ObjType, int32 Count, const FString& Name)
 {
-	if (Joints.Num() == 0)
+	if (Name.IsEmpty())
+	{
+		return -1;
+	}
+	const int32 Exact = mj_name2id(const_cast<mjModel*>(m), ObjType, TCHAR_TO_UTF8(*Name));
+	if (Exact >= 0)
+	{
+		return Exact;
+	}
+	const FString UnderSuffix = FString(TEXT("_")) + Name;
+	const FString SlashSuffix = FString(TEXT("/")) + Name;
+	for (int32 i = 0; i < Count; ++i)
+	{
+		const char* Nm = mj_id2name(const_cast<mjModel*>(m), ObjType, i);
+		if (!Nm)
+		{
+			continue;
+		}
+		const FString Compiled = FString(UTF8_TO_TCHAR(Nm));
+		if (Compiled.EndsWith(UnderSuffix) || Compiled.EndsWith(SlashSuffix) || Compiled.EndsWith(Name))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * Resolve a joint set into compiled joint mj-ids. Component refs win when valid;
+ * captured names (the duplication-safe fallback) fill any gap — after a
+ * PIE/Simulate world copy the refs are all null, so the whole set comes from
+ * Names. Self-heals: if refs resolved but no names were captured yet, records the
+ * compiled joint names into Names so the next duplication survives too.
+ */
+void ResolveJointIds(const mjModel* m, const TArray<TObjectPtr<UMjJoint>>& Refs, TArray<FString>& Names,
+	TArray<int32>& OutIds)
+{
+	OutIds.Reset();
+	for (const UMjJoint* J : Refs)
+	{
+		if (J && J->GetMjID() >= 0 && J->GetMjID() < m->njnt)
+		{
+			OutIds.AddUnique(J->GetMjID());
+		}
+	}
+	// Self-heal: capture compiled names from the resolved refs so a future
+	// duplicated world (which drops the refs) can rebuild this set from Names.
+	if (Names.Num() == 0 && OutIds.Num() > 0)
+	{
+		for (int32 Jid : OutIds)
+		{
+			if (const char* Nm = mj_id2name(const_cast<mjModel*>(m), mjOBJ_JOINT, Jid))
+			{
+				Names.Add(FString(UTF8_TO_TCHAR(Nm)));
+			}
+		}
+	}
+	// Name fallback: fill any joint not already covered by a valid ref.
+	for (const FString& Name : Names)
+	{
+		const int32 Id = ResolveIdByName(m, mjOBJ_JOINT, m->njnt, Name);
+		if (Id >= 0)
+		{
+			OutIds.AddUnique(Id);
+		}
+	}
+}
+
+/** nv-sized cost vector: Scalar on the given joints' DOFs (all DOFs if none given). */
+FMinkVec SubsetCost(const mjModel* m, const TArray<int32>& JointIds, double Scalar)
+{
+	if (JointIds.Num() == 0)
 	{
 		return FMinkVec::Constant(m->nv, Scalar);
 	}
 	FMinkVec Cost = FMinkVec::Zero(m->nv);
-	for (const UMjJoint* J : Joints)
+	for (int32 Jid : JointIds)
 	{
-		if (!J || J->GetMjID() < 0 || J->GetMjID() >= m->njnt)
+		if (Jid < 0 || Jid >= m->njnt)
 		{
 			continue;
 		}
-		const int32 DofAdr = m->jnt_dofadr[J->GetMjID()];
+		const int32 DofAdr = m->jnt_dofadr[Jid];
 		// Hinge/slide = 1 DOF; ball/free spread over 3/6 — cover the joint's full span.
 		int32 DofNum = 1;
-		switch (m->jnt_type[J->GetMjID()])
+		switch (m->jnt_type[Jid])
 		{
 			case mjJNT_FREE:
 				DofNum = 6;
@@ -186,7 +263,10 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 	// --- build tasks from specs -------------------------------------------------
 	for (int32 i = 0; i < Tasks.Num(); ++i)
 	{
-		const FMinkTaskSpec& S = Tasks[i];
+		// Non-const: Bind self-heals the name fallbacks (writes captured compiled
+		// names back into the spec) so Details-authored controllers become
+		// duplication-proof after their first successful bind.
+		FMinkTaskSpec& S = Tasks[i];
 		FMinkIKState::FBuiltTask Built;
 		Built.SpecIndex = i;
 
@@ -194,31 +274,98 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 		{
 			case EMinkTaskKind::Frame:
 			{
-				if (!S.Frame || S.Frame->GetMjID() < 0)
+				FString FrameCompiledName;
+				EMinkFrameType FrameType = EMinkFrameType::Site;
+
+				// Preferred: a valid component ref resolves the frame directly.
+				if (S.Frame && S.Frame->GetMjID() >= 0)
+				{
+					int32 ObjType = mjOBJ_BODY;
+					FrameType = MinkFrameTypeOf(S.Frame, ObjType);
+					if (const char* Nm = mj_id2name(m, ObjType, S.Frame->GetMjID()))
+					{
+						FrameCompiledName = FString(UTF8_TO_TCHAR(Nm));
+						// Self-heal: capture the compiled name so this task survives
+						// a future PIE/Simulate world copy that drops the ref.
+						if (S.FrameName.IsEmpty())
+						{
+							S.FrameName = FrameCompiledName;
+						}
+					}
+				}
+
+				// Fallback: ref null/unresolved (e.g. duplicated world) — resolve the
+				// captured name against the compiled model: site, then body, then geom.
+				if (FrameCompiledName.IsEmpty() && !S.FrameName.IsEmpty())
+				{
+					mjtObj MatchedObj = mjOBJ_SITE;
+					int32 Id = ResolveIdByName(m, mjOBJ_SITE, m->nsite, S.FrameName);
+					if (Id >= 0)
+					{
+						FrameType = EMinkFrameType::Site;
+						MatchedObj = mjOBJ_SITE;
+					}
+					else if ((Id = ResolveIdByName(m, mjOBJ_BODY, m->nbody, S.FrameName)) >= 0)
+					{
+						FrameType = EMinkFrameType::Body;
+						MatchedObj = mjOBJ_BODY;
+					}
+					else if ((Id = ResolveIdByName(m, mjOBJ_GEOM, m->ngeom, S.FrameName)) >= 0)
+					{
+						FrameType = EMinkFrameType::Geom;
+						MatchedObj = mjOBJ_GEOM;
+					}
+					if (Id >= 0)
+					{
+						if (const char* Nm = mj_id2name(m, MatchedObj, Id))
+						{
+							FrameCompiledName = FString(UTF8_TO_TCHAR(Nm));
+							UE_LOG(LogURLabRuntime, Log,
+								TEXT("[MinkIK] Tasks[%d]: frame resolved by name '%s' -> %s '%s' (ref dropped)."),
+								i, *S.FrameName,
+								MatchedObj == mjOBJ_SITE   ? TEXT("site")
+								: MatchedObj == mjOBJ_GEOM ? TEXT("geom")
+														   : TEXT("body"),
+								*FrameCompiledName);
+						}
+					}
+				}
+
+				if (FrameCompiledName.IsEmpty())
 				{
 					UE_LOG(LogURLabRuntime, Warning,
-						TEXT("[MinkIK] Tasks[%d]: Frame task has no resolved frame component — skipped."), i);
+						TEXT("[MinkIK] Tasks[%d]: Frame task has no resolved frame component or name '%s' — skipped."),
+						i, *S.FrameName);
 					continue;
 				}
-				int32 ObjType = mjOBJ_BODY;
-				const EMinkFrameType FrameType = MinkFrameTypeOf(S.Frame, ObjType);
-				const char* Nm = mj_id2name(m, ObjType, S.Frame->GetMjID());
-				if (!Nm)
-				{
-					UE_LOG(LogURLabRuntime, Warning,
-						TEXT("[MinkIK] Tasks[%d]: frame id %d has no compiled name — skipped."), i, S.Frame->GetMjID());
-					continue;
-				}
-				auto FrameTask = MakeUnique<FMinkFrameTask>(FString(UTF8_TO_TCHAR(Nm)), FrameType,
+				auto FrameTask = MakeUnique<FMinkFrameTask>(FrameCompiledName, FrameType,
 					FMinkVec::Constant(1, (double)S.PositionCost),
 					FMinkVec::Constant(1, (double)S.OrientationCost),
 					(double)S.Gain, (double)S.LmDamping);
 				// Hold the current pose until a target arrives — never yank on start.
 				FrameTask->SetTargetFromConfiguration(Config);
+
+				// Mocap target body: prefer the ref, else the captured name.
+				int32 MocapBodyId = -1;
 				if (S.TargetMocapBody && S.TargetMocapBody->GetMjID() >= 0
 					&& S.TargetMocapBody->GetMjID() < m->nbody)
 				{
-					Built.MocapIndex = m->body_mocapid[S.TargetMocapBody->GetMjID()];
+					MocapBodyId = S.TargetMocapBody->GetMjID();
+					if (S.TargetMocapBodyName.IsEmpty())
+					{
+						if (const char* Nm = mj_id2name(m, mjOBJ_BODY, MocapBodyId))
+						{
+							S.TargetMocapBodyName = FString(UTF8_TO_TCHAR(Nm));
+						}
+					}
+				}
+				else if (!S.TargetMocapBodyName.IsEmpty())
+				{
+					MocapBodyId = ResolveIdByName(m, mjOBJ_BODY, m->nbody, S.TargetMocapBodyName);
+				}
+				if (MocapBodyId >= 0)
+				{
+					Built.MocapIndex = m->body_mocapid[MocapBodyId];
 					if (Built.MocapIndex < 0)
 					{
 						UE_LOG(LogURLabRuntime, Warning,
@@ -231,7 +378,9 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 			}
 			case EMinkTaskKind::Posture:
 			{
-				auto Posture = MakeUnique<FMinkPostureTask>(m, SubsetCost(m, S.Joints, (double)S.Cost),
+				TArray<int32> JointIds;
+				ResolveJointIds(m, S.Joints, S.JointNames, JointIds);
+				auto Posture = MakeUnique<FMinkPostureTask>(m, SubsetCost(m, JointIds, (double)S.Cost),
 					(double)S.Gain, (double)S.LmDamping);
 				Posture->SetTargetFromConfiguration(Config);
 				Built.Task = MoveTemp(Posture);
@@ -239,7 +388,9 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 			}
 			case EMinkTaskKind::Damping:
 			{
-				Built.Task = MakeUnique<FMinkDampingTask>(m, SubsetCost(m, S.Joints, (double)S.Cost));
+				TArray<int32> JointIds;
+				ResolveJointIds(m, S.Joints, S.JointNames, JointIds);
+				Built.Task = MakeUnique<FMinkDampingTask>(m, SubsetCost(m, JointIds, (double)S.Cost));
 				break;
 			}
 		}
@@ -251,7 +402,7 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 	}
 
 	// --- limits ------------------------------------------------------------------
-	for (const FMinkLimitSpec& L : Limits)
+	for (FMinkLimitSpec& L : Limits)
 	{
 		if (L.Kind == EMinkLimitKind::Configuration)
 		{
@@ -270,23 +421,30 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 				if (Nm)
 					Caps.Emplace(FString(UTF8_TO_TCHAR(Nm)), FMinkVec::Constant(W, (double)L.MaxVelocity));
 			};
-			if (L.Joints.Num() == 0)
+			// Refs win; captured names are the duplication-safe fallback.
+			TArray<int32> LimitJointIds;
+			ResolveJointIds(m, L.Joints, L.JointNames, LimitJointIds);
+			if (LimitJointIds.Num() == 0)
 			{
 				for (int32 j = 0; j < m->njnt; ++j)
 					AddCap(j);
 			}
 			else
 			{
-				for (const UMjJoint* J : L.Joints)
-					if (J && J->GetMjID() >= 0)
-						AddCap(J->GetMjID());
+				for (int32 Jid : LimitJointIds)
+					AddCap(Jid);
 			}
 			Mink->BuiltLimits.Add(MakeUnique<FMinkVelocityLimit>(m, Caps));
 		}
 	}
 
 	// --- resolve driven actuators --------------------------------------------------
-	if (DriveJoints.Num() == 0)
+	// Refs win; captured names are the duplication-safe fallback (after a
+	// PIE/Simulate world copy the DriveJoints refs are all null). Empty both =>
+	// drive every bound actuator, as before.
+	TArray<int32> DriveJointIds;
+	ResolveJointIds(m, DriveJoints, DriveJointNames, DriveJointIds);
+	if (DriveJointIds.Num() == 0)
 	{
 		for (const FActuatorBinding& B : Bindings)
 		{
@@ -299,13 +457,8 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 	}
 	else
 	{
-		for (const UMjJoint* J : DriveJoints)
+		for (int32 JointId : DriveJointIds)
 		{
-			if (!J || J->GetMjID() < 0)
-			{
-				continue;
-			}
-			const int32 JointId = J->GetMjID();
 			bool bFound = false;
 			for (int32 a = 0; a < m->nu; ++a)
 			{
@@ -319,9 +472,10 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 			}
 			if (!bFound)
 			{
+				const char* Nm = mj_id2name(m, mjOBJ_JOINT, JointId);
 				UE_LOG(LogURLabRuntime, Warning,
 					TEXT("[MinkIK] DriveJoints: no joint actuator found for '%s' — it will not be commanded."),
-					*J->GetName());
+					Nm ? UTF8_TO_TCHAR(Nm) : TEXT("<unnamed>"));
 			}
 		}
 	}

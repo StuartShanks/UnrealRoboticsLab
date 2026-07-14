@@ -520,6 +520,213 @@ bool FMjMinkIKTidybotClosedLoop::RunTest(const FString&)
 }
 
 // ============================================================================
+// URLab.MinkIK.TidyBot.BindSurvivesRefLoss
+//   Regression for the PIE/Simulate world-duplication ref-loss bug. A UE world
+//   copy nulls the controller's TObjectPtr UPROPERTYs (Frame / DriveJoints /
+//   task+limit Joints) on the duplicated actor, so before the fix RebuildFromSpecs
+//   skipped the frame task and bound 0 driven actuators. Here we model that exact
+//   duplicated state: configure the SAME example stack as ClosedLoopStable but set
+//   ONLY the name fields (FrameName / *JointNames / DriveJointNames) and leave every
+//   component ref null. If the name-fallback resolution works, Bind rebuilds the
+//   full stack from names alone and the closed loop tracks + drives the base — end
+//   to end, without touching the controller's private state.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotBindSurvivesRefLoss,
+	"URLab.MinkIK.TidyBot.BindSurvivesRefLoss",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotBindSurvivesRefLoss::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile -------------------------------------------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 2. Configure the controller with NAMES ONLY — every component ref
+	//        left null, exactly as a duplicated (PIE/Simulate) world leaves it.
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKRefLoss"));
+
+	// Raw MjNames (same short names add_controller captures from JSON) — the
+	// controller resolves them against the compiled model by exact/suffix match.
+	const TArray<FString> ArmNames = {TEXT("joint_1"), TEXT("joint_2"), TEXT("joint_3"),
+		TEXT("joint_4"), TEXT("joint_5"), TEXT("joint_6"), TEXT("joint_7")};
+	const TArray<FString> BaseNames = {TEXT("joint_x"), TEXT("joint_y"), TEXT("joint_th")};
+	TArray<FString> AllNames;
+	for (const TCHAR* Nm : JointNames)
+	{
+		AllNames.Add(FString(Nm));
+	}
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = nullptr;                // ref dropped by duplication
+	Frame.FrameName = TEXT("pinch_site"); // name fallback survives it
+	Frame.TargetMocapBody = nullptr;
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints.Reset();        // refs dropped
+	Posture.JointNames = ArmNames; // resolved by name
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 100.0f;
+	Damping.Joints.Reset();
+	Damping.JointNames = BaseNames;
+	Damping.bEnabled = false;
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints.Reset(); // refs dropped
+	Ctrl->DriveJointNames = AllNames;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 3. Reset to home, capture P0/Q0, bind -------------------------------
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	const FVector P0(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2]);
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// Base joint qpos addresses (for the base-drove assert) — resolved directly
+	// from the compiled model, independent of any component ref.
+	const int32 JxId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, TEXT("joint_x"));
+	const int32 JyId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, TEXT("joint_y"));
+	if (!TestTrue(TEXT("base joints found"), JxId >= 0 && JyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	const int32 XQposAdr = M->jnt_qposadr[JxId];
+	const int32 YQposAdr = M->jnt_qposadr[JyId];
+
+	// --- 4. Closed loop: same target script; assert tracking + base drive ----
+	// If the frame task were skipped (bug) the EE would hold home; if the drive
+	// actuators were unresolved (bug) nothing would move at all. Both are proven
+	// false by tracking to tolerance AND the base translating on the far phase.
+	const TSet<int32> Checkpoints = {299, 999, 2499};
+	bool bDiverged = false;
+	for (int32 K = 0; K < NSteps; ++K)
+	{
+		const FVector TPos = TidybotTargetPos(K, P0);
+
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(TPos.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+
+		Ctrl->ComputeAndApply(M, D, 0);
+		mj_step(M, D);
+
+		for (int32 v = 0; v < M->nv; ++v)
+		{
+			if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+			{
+				AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+				bDiverged = true;
+				break;
+			}
+		}
+		if (bDiverged)
+		{
+			break;
+		}
+
+		if (Checkpoints.Contains(K))
+		{
+			const double Tol = (K == 299) ? 0.02 : (K == 999 ? 0.30 : 0.10);
+			const FVector Ee(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1],
+				D->site_xpos[3 * SiteMjId + 2]);
+			const double TrackErr = (Ee - TPos).Length();
+			TestTrue(FString::Printf(TEXT("checkpoint %d: track err %.4f <= %.2f m (frame+arm drive via name)"),
+						 K, TrackErr, Tol),
+				TrackErr <= Tol);
+		}
+	}
+
+	if (!bDiverged)
+	{
+		// Base translation is the end-to-end proof the base drive joints (3 of the
+		// 10) resolved by name too — the far-circle phase commands the base.
+		const double BaseXY = FMath::Sqrt(FMath::Square(D->qpos[XQposAdr]) + FMath::Square(D->qpos[YQposAdr]));
+		TestTrue(FString::Printf(TEXT("base drove > 0.2 m via name fallback (|xy|=%.3f)"), BaseXY), BaseXY > 0.2);
+	}
+
+	S.Cleanup();
+	return !bDiverged;
+}
+
+// ============================================================================
 // URLab.MinkIK.TidyBot.CtrlParity
 //   Drives the REAL controller (same stack as ClosedLoopStable) on the imported
 //   model with the golden trace's recorded targets, integrating with Kevin's

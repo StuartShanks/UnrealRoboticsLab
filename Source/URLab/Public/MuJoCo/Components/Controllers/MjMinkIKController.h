@@ -83,12 +83,32 @@ struct FMinkTaskSpec
 	TObjectPtr<UMjComponent> Frame;
 
 	/**
+	 * Frame only: MjName of the driven frame (site/body/geom) — the
+	 * duplication-safe fallback for Frame. A PIE/Simulate world copy nulls the
+	 * TObjectPtr above; this plain string survives and is resolved by name at
+	 * Bind. The component ref wins when valid; Bind self-captures the compiled
+	 * name here after the first successful resolve.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task",
+		meta = (EditCondition = "Kind==EMinkTaskKind::Frame"))
+	FString FrameName;
+
+	/**
 	 * Frame only: mocap body whose live pose is the target (e.g. a
 	 * "pinch_site_target" body). None => target comes from SetIKTarget().
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task",
 		meta = (EditCondition = "Kind==EMinkTaskKind::Frame", UseComponentPicker))
 	TObjectPtr<UMjBody> TargetMocapBody;
+
+	/**
+	 * Frame only: MjName of the mocap target body — duplication-safe fallback
+	 * for TargetMocapBody (survives a PIE/Simulate world copy). Ref wins when
+	 * valid; Bind self-captures the compiled name here after a good resolve.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task",
+		meta = (EditCondition = "Kind==EMinkTaskKind::Frame"))
+	FString TargetMocapBodyName;
 
 	/** Frame only: position error weight. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task|Gains",
@@ -123,6 +143,15 @@ struct FMinkTaskSpec
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task",
 		meta = (EditCondition = "Kind!=EMinkTaskKind::Frame", UseComponentPicker))
 	TArray<TObjectPtr<UMjJoint>> Joints;
+
+	/**
+	 * Posture/Damping: MjNames of the joints above — duplication-safe fallback
+	 * for Joints (survives a PIE/Simulate world copy). Refs win when valid; Bind
+	 * self-captures the compiled joint names here after a good resolve.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Task",
+		meta = (EditCondition = "Kind!=EMinkTaskKind::Frame"))
+	TArray<FString> JointNames;
 };
 
 /** One limit in the IK stack. Empty Limits array => mink's default joint-range limit. */
@@ -152,6 +181,16 @@ struct FMinkLimitSpec
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
 		meta = (EditCondition = "Kind==EMinkLimitKind::Velocity"))
 	TArray<TObjectPtr<UMjJoint>> Joints;
+
+	/**
+	 * Velocity only: MjNames of the capped joints above — duplication-safe
+	 * fallback for Joints (survives a PIE/Simulate world copy). Refs win when
+	 * valid; Bind self-captures the compiled joint names here after a good
+	 * resolve.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::Velocity"))
+	TArray<FString> JointNames;
 };
 
 /**
@@ -195,6 +234,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK",
 		meta = (UseComponentPicker))
 	TArray<TObjectPtr<UMjJoint>> DriveJoints;
+
+	/**
+	 * MjNames of DriveJoints — duplication-safe fallback (survives a PIE/Simulate
+	 * world copy that nulls the TObjectPtrs above). Refs win when valid; Bind
+	 * self-captures the compiled joint names here after a good resolve.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK")
+	TArray<FString> DriveJointNames;
 
 	/** Inner solve/integrate iterations per physics step. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK|Solver",

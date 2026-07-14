@@ -1673,8 +1673,7 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 		for (TActorIterator<AMjArticulation> It(World); It; ++It)
 		{
 			AMjArticulation* A = *It;
-			if (A && (A->ActorId.Equals(Key) || A->GetName().Equals(Key)
-					|| A->GetActorLabel().Equals(Key)))
+			if (A && (A->ActorId.Equals(Key) || A->GetName().Equals(Key) || A->GetActorLabel().Equals(Key)))
 			{
 				Art = A;
 				break;
@@ -1714,15 +1713,22 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 		Ctrl->RegisterComponent();
 	}
 
-	// helper: resolve a joints name-array field into component refs
+	// helper: resolve a joints name-array field into component refs, and ALSO
+	// capture the raw MjName strings into OutNames — the duplication-safe fallback
+	// the controller resolves by name when a PIE/Simulate world copy nulls the refs.
 	auto ResolveJoints = [&](const TArray<TSharedPtr<FJsonValue>>* Names,
-						 TArray<TObjectPtr<UMjJoint>>& Out, const TCHAR* Ctx) {
+							 TArray<TObjectPtr<UMjJoint>>& Out, const TCHAR* Ctx,
+							 TArray<FString>* OutNames = nullptr) {
 		Out.Reset();
+		if (OutNames)
+			OutNames->Reset();
 		if (!Names)
 			return;
 		for (const TSharedPtr<FJsonValue>& V : *Names)
 		{
 			const FString N = V->AsString();
+			if (OutNames)
+				OutNames->Add(N);
 			if (UMjJoint* J = FindMjComponentByName<UMjJoint>(Art, N))
 				Out.Add(J);
 			else
@@ -1750,6 +1756,9 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 				Spec.Kind = EMinkTaskKind::Frame;
 				FString FrameName;
 				T->TryGetStringField(TEXT("frame"), FrameName);
+				// Capture the raw MjName: survives PIE/Simulate world duplication and
+				// lets the controller re-resolve the frame by name when the ref is lost.
+				Spec.FrameName = FrameName;
 				UMjComponent* Frame = FindMjComponentByName<UMjSite>(Art, FrameName);
 				if (!Frame)
 					Frame = FindMjComponentByName<UMjBody>(Art, FrameName);
@@ -1763,14 +1772,17 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 				FString MocapName;
 				if (T->TryGetStringField(TEXT("mocap_body"), MocapName) && !MocapName.IsEmpty())
 				{
+					Spec.TargetMocapBodyName = MocapName; // duplication-safe fallback
 					if (UMjBody* Mb = FindMjComponentByName<UMjBody>(Art, MocapName))
 						Spec.TargetMocapBody = Mb;
 					else
 						Warn(FString::Printf(TEXT("mocap_body '%s' not found"), *MocapName));
 				}
 				double V;
-				if (T->TryGetNumberField(TEXT("position_cost"), V)) Spec.PositionCost = V;
-				if (T->TryGetNumberField(TEXT("orientation_cost"), V)) Spec.OrientationCost = V;
+				if (T->TryGetNumberField(TEXT("position_cost"), V))
+					Spec.PositionCost = V;
+				if (T->TryGetNumberField(TEXT("orientation_cost"), V))
+					Spec.OrientationCost = V;
 			}
 			else if (Kind.Equals(TEXT("posture"), ESearchCase::IgnoreCase))
 			{
@@ -1787,15 +1799,20 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 			}
 
 			double V;
-			if (T->TryGetNumberField(TEXT("cost"), V)) Spec.Cost = V;
-			if (T->TryGetNumberField(TEXT("gain"), V)) Spec.Gain = V;
-			if (T->TryGetNumberField(TEXT("lm_damping"), V)) Spec.LmDamping = V;
+			if (T->TryGetNumberField(TEXT("cost"), V))
+				Spec.Cost = V;
+			if (T->TryGetNumberField(TEXT("gain"), V))
+				Spec.Gain = V;
+			if (T->TryGetNumberField(TEXT("lm_damping"), V))
+				Spec.LmDamping = V;
 			bool B;
-			if (T->TryGetBoolField(TEXT("enabled"), B)) Spec.bEnabled = B;
+			if (T->TryGetBoolField(TEXT("enabled"), B))
+				Spec.bEnabled = B;
 
 			const TArray<TSharedPtr<FJsonValue>>* JN = nullptr;
 			T->TryGetArrayField(TEXT("joints"), JN);
-			ResolveJoints(JN, Spec.Joints, *FString::Printf(TEXT("tasks[%d]"), Ctrl->Tasks.Num()));
+			ResolveJoints(JN, Spec.Joints, *FString::Printf(TEXT("tasks[%d]"), Ctrl->Tasks.Num()),
+				&Spec.JointNames);
 
 			Ctrl->Tasks.Add(MoveTemp(Spec));
 		}
@@ -1818,16 +1835,19 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 			{
 				LSpec.Kind = EMinkLimitKind::Velocity;
 				double V;
-				if ((*LO)->TryGetNumberField(TEXT("max_velocity"), V)) LSpec.MaxVelocity = V;
+				if ((*LO)->TryGetNumberField(TEXT("max_velocity"), V))
+					LSpec.MaxVelocity = V;
 				const TArray<TSharedPtr<FJsonValue>>* LJ = nullptr;
 				(*LO)->TryGetArrayField(TEXT("joints"), LJ);
-				ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"));
+				ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"), &LSpec.JointNames);
 			}
 			else // configuration (default)
 			{
 				double V;
-				if ((*LO)->TryGetNumberField(TEXT("gain"), V)) LSpec.Gain = V;
-				if ((*LO)->TryGetNumberField(TEXT("min_distance"), V)) LSpec.MinDistance = V;
+				if ((*LO)->TryGetNumberField(TEXT("gain"), V))
+					LSpec.Gain = V;
+				if ((*LO)->TryGetNumberField(TEXT("min_distance"), V))
+					LSpec.MinDistance = V;
 			}
 			Ctrl->Limits.Add(LSpec);
 		}
@@ -1836,16 +1856,22 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	// --- drive joints + solver params -------------------------------------------
 	const TArray<TSharedPtr<FJsonValue>>* DJ = nullptr;
 	if (Req->TryGetArrayField(TEXT("drive_joints"), DJ))
-		ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"));
+		ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"), &Ctrl->DriveJointNames);
 
 	double V;
-	if (Req->TryGetNumberField(TEXT("max_iters"), V)) Ctrl->MaxIters = FMath::Max(1, (int32)V);
-	if (Req->TryGetNumberField(TEXT("qp_damping"), V)) Ctrl->QpDamping = V;
-	if (Req->TryGetNumberField(TEXT("integrate_dt_override"), V)) Ctrl->IntegrateDtOverride = FMath::Max(0.0, V);
-	if (Req->TryGetNumberField(TEXT("pos_threshold"), V)) Ctrl->PosThreshold = V;
-	if (Req->TryGetNumberField(TEXT("ori_threshold"), V)) Ctrl->OriThreshold = V;
+	if (Req->TryGetNumberField(TEXT("max_iters"), V))
+		Ctrl->MaxIters = FMath::Max(1, (int32)V);
+	if (Req->TryGetNumberField(TEXT("qp_damping"), V))
+		Ctrl->QpDamping = V;
+	if (Req->TryGetNumberField(TEXT("integrate_dt_override"), V))
+		Ctrl->IntegrateDtOverride = FMath::Max(0.0, V);
+	if (Req->TryGetNumberField(TEXT("pos_threshold"), V))
+		Ctrl->PosThreshold = V;
+	if (Req->TryGetNumberField(TEXT("ori_threshold"), V))
+		Ctrl->OriThreshold = V;
 	bool B;
-	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B)) Ctrl->bSyncFromLiveState = B;
+	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B))
+		Ctrl->bSyncFromLiveState = B;
 
 	// Tell the running solver to rebuild its baked task stack from the specs we
 	// just wrote — costs/damping/joint-subsets are baked at build time, so a live
@@ -2010,8 +2036,7 @@ void RegisterAll()
 		/*Required=*/{TEXT("target")});
 	RegEditor(TEXT("add_controller"), TEXT("ik"),
 		GameThreadHandler(&HandleAddController),
-		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"),
-			TEXT("tasks:int"), TEXT("limits:int"), TEXT("drive_joints:int"), TEXT("warnings:array")},
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"), TEXT("tasks:int"), TEXT("limits:int"), TEXT("drive_joints:int"), TEXT("warnings:array")},
 		/*Required=*/{});
 	RegEditor(TEXT("remove_quick_convert"), TEXT("outliner"),
 		GameThreadHandler(&HandleRemoveQuickConvert),
