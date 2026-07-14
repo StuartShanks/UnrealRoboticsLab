@@ -1875,6 +1875,10 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleReset(const TSharedPtr<FJsonO
 		}
 		mj_forward(m, d);
 	}
+	// Open-loop controllers (e.g. MinkIK) must re-base their reference on the
+	// reset state — sim time alone can't signal this (reset can land on the
+	// exact time the controller last integrated at).
+	UMjArticulationController::NotifySimReset();
 
 	StepCounter.store(0, std::memory_order_relaxed);
 
@@ -2924,6 +2928,8 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetQpos(const TSharedPtr<FJso
 		}
 		mj_forward(m, d);
 	}
+	// One-shot discontinuous qpos write — open-loop controllers must re-base.
+	UMjArticulationController::NotifySimReset();
 
 	TArray<TSharedPtr<FJsonValue>> Out;
 	if (bFreeBaseShortcut)

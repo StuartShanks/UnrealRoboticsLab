@@ -971,6 +971,7 @@ bool AMjArticulation::ResetToKeyframe(const FString& KeyframeName)
 	}
 
 	mj_forward(m_model, m_data);
+	UMjArticulationController::NotifySimReset();
 
 	UE_LOG(LogURLab, Log, TEXT("[MjArticulation] Reset to keyframe '%s' (id=%d, joints only, freejoint preserved) on '%s'"),
 		*KeyframeName, KeyId, *GetName());

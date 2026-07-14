@@ -250,6 +250,10 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 	RebuildFromSpecs(m, d);
 	BuiltGeneration = SpecGeneration.GetValue();
 	ErrorLogBudget = 8;
+	// Fresh session: force the first-integration re-base and take the current
+	// reset epoch as the baseline (a reset AFTER this point must re-base).
+	LastSimTime = -1.0;
+	LastSeenResetEpoch = GetSimResetEpoch();
 
 	UE_LOG(LogURLabRuntime, Log,
 		TEXT("[MinkIK] Bound: %d task(s), %d limit(s), %d driven actuator(s), nv=%d."),
@@ -624,14 +628,22 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	// Integrate exactly once per real physics step: the engine also invokes us
 	// on idle physics-thread iterations, which must not advance the reference.
 	const double Now = d->time;
-	if (LastSimTime >= 0.0 && Now < LastSimTime)
+	// Reset detection: every reset/restore site bumps the global sim-reset
+	// epoch. Sim time is NOT a reliable signal — a reset can land exactly on
+	// the time we last integrated at (equal-time blind spot: bind at t=0, one
+	// solve, reset back to t=0 looks "idle", then t advances "normally" and
+	// the stale reference yanks the robot through kp·(ctrl−qpos). The
+	// backwards-time check stays only as a fallback for state writers that
+	// don't call NotifySimReset().
+	const uint64 EpochNow = GetSimResetEpoch();
+	if (EpochNow != LastSeenResetEpoch || (LastSimTime >= 0.0 && Now < LastSimTime))
 	{
-		// Sim time went backwards => the sim was reset (e.g. auto-reset after a
-		// NaN, or a user reset). Re-base the open-loop reference on the live
-		// state so stale ctrl can't slam the respawned robot into divergence.
-		LastSimTime = Now;
-		Config.Update(d->qpos);
-		return;
+		LastSeenResetEpoch = EpochNow;
+		// Re-enter the first-integration path below: a full re-base of the
+		// open-loop reference AND every passive target from the live state
+		// (the old backwards-time guard re-based only the reference, leaving
+		// posture/frame targets pointing at the pre-reset pose).
+		LastSimTime = -1.0;
 	}
 	if (LastSimTime >= 0.0 && Now == LastSimTime)
 	{
@@ -652,16 +664,14 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		Dt = FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
 	}
 
-	// First integration after Bind: the sim may have been reset (e.g. to the
-	// `home` keyframe) BETWEEN Bind() and the first real step — Bind seeded the
-	// open-loop reference at whatever pose the sim was in then (live workflow:
-	// the SPAWN pose). The backwards-time guard above can never catch that reset
-	// (LastSimTime is still -1), so the first solve would run from a spawn-pose
-	// reference while the robot sits at home, and the first ctrl frame would
-	// command spawn — a violent yank through kp·(ctrl−qpos). Re-base the
-	// reference and every passive target on the live state now, at the moment
-	// stepping actually begins (Kevin's configuration.update(data.qpos)-after-
-	// reset semantics, deferred to first use).
+	// First integration after Bind OR after a detected sim reset: the open-loop
+	// reference was seeded at some earlier pose (Bind: the SPAWN pose; reset:
+	// the pre-reset trajectory) that no longer matches the live state. Solving
+	// from that stale reference would make the first ctrl frame command the old
+	// pose — a violent yank through kp·(ctrl−qpos). Re-base the reference and
+	// every passive target on the live state now, at the moment stepping
+	// actually (re)begins (Kevin's configuration.update(data.qpos)-after-reset
+	// semantics, deferred to first use).
 	if (bFirstIntegration)
 	{
 		Config.Update(d->qpos);
@@ -687,7 +697,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			}
 		}
 		UE_LOG(LogURLabRuntime, Log,
-			TEXT("[MinkIK] first integration: re-based reference + passive targets from live state"));
+			TEXT("[MinkIK] first integration (bind or sim reset): re-based reference + passive targets from live state"));
 	}
 	LastSimTime = Now;
 	for (int32 It = 0; It < MaxIters; ++It)

@@ -395,4 +395,9 @@ private:
 	 *  idle physics-thread iterations too, and integrating the open-loop
 	 *  reference on those races it ahead of the sim. */
 	double LastSimTime = -1.0;
+
+	/** GetSimResetEpoch() value at the last integration (seeded at Bind). A
+	 *  change means the sim was reset/restored since we last solved, so the
+	 *  open-loop reference is stale and must be re-based on the live state. */
+	uint64 LastSeenResetEpoch = 0;
 };

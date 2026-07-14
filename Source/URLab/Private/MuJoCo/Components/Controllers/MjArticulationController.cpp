@@ -24,6 +24,24 @@
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "Utils/URLabLogging.h"
 
+#include <atomic>
+
+namespace
+{
+	// See the header comment on NotifySimReset() for why this is global.
+	std::atomic<uint64> GSimResetEpoch{0};
+}
+
+void UMjArticulationController::NotifySimReset()
+{
+	GSimResetEpoch.fetch_add(1, std::memory_order_release);
+}
+
+uint64 UMjArticulationController::GetSimResetEpoch()
+{
+	return GSimResetEpoch.load(std::memory_order_acquire);
+}
+
 UMjArticulationController::UMjArticulationController()
 {
 	PrimaryComponentTick.bCanEverTick = false;

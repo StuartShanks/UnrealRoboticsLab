@@ -972,6 +972,289 @@ bool FMjMinkIKTidybotBindThenResetNoYank::RunTest(const FString&)
 }
 
 // ============================================================================
+// URLab.MinkIK.TidyBot.ResetAfterRunNoYank
+//   Regression for the EQUAL-TIME reset blind spot: BindThenResetNoYank covers
+//   a reset BEFORE the first integration; this covers a reset AFTER it. Live
+//   repro (2026-07-14): Simulate pressed -> Bind + one solve at t=0 (clock then
+//   sits at 0 in direct mode) -> bridge `reset` to home lands at t=0 again.
+//   "Time went backwards" (Now < LastSimTime) never fires for 0 -> 0, the
+//   equal-time check reads as an idle tick, and the next real step integrates
+//   from the STALE pre-reset reference — first ctrl frame commands near-spawn
+//   and kp=1e6 yanks the robot (demo logs: "EE moved 0.5974 m", again).
+//   The fix is the global sim-reset epoch (UMjArticulationController::
+//   NotifySimReset, bumped by every reset/restore site); this test pins the
+//   controller's consumption of that signal: solve once at t=0, reset to home
+//   at t=0, notify, and assert the very next ctrl frame commands ~HOME.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotResetAfterRunNoYank,
+	"URLab.MinkIK.TidyBot.ResetAfterRunNoYank",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotResetAfterRunNoYank::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Find components (same resolution as ClosedLoopStable) ------------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	int32 CtrlIds[10];
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const TCHAR* Nm = JointNames[i];
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+		CtrlIds[i] = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, Nm);
+		if (CtrlIds[i] < 0)
+		{
+			AddError(FString::Printf(TEXT("actuator '%s' not resolved"), Nm));
+			bAllJointsFound = false;
+		}
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- 3. Same example stack as ClosedLoopStable ----------------------------
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKResetAfterRun"));
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr;
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 100.0f;
+	Damping.Joints = BaseJoints;
+	Damping.bEnabled = false;
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 4. Bind at the SPAWN pose and solve ONCE at t=0 ----------------------
+	// Live repro: Simulate's first physics tick runs one solve at t=0.000, then
+	// the clock sits there (direct step mode, no pumps) until the client resets.
+	mj_forward(M, D);
+	double SpawnQpos[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		SpawnQpos[i] = D->qpos[QposAdrs[i]];
+	}
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	{
+		// Any reachable target away from spawn; the live run had the default
+		// mocap target. What matters is that the solve advances the internal
+		// reference away from the pose the robot will be reset to.
+		const FVector PSpawn(D->site_xpos[3 * SiteMjId + 0] + 0.1,
+			D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2] + 0.1);
+		double QSpawn[4];
+		mju_mat2Quat(QSpawn, D->site_xmat + 9 * SiteMjId);
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(PSpawn.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(PSpawn.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(PSpawn.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(QSpawn[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+	}
+	if (!TestTrue(TEXT("precondition: sim clock at t=0 before the pre-reset solve"), D->time == 0.0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	Ctrl->ComputeAndApply(M, D, 0); // first integration: LastSimTime latches 0.0
+
+	// --- 5. Reset to home AT THE SAME TIME VALUE (t=0), as the bridge does ----
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	// The bridge `reset` RPC (and every engine reset/restore site) bumps the
+	// global sim-reset epoch after rewriting state; do the same here. This is
+	// the ONLY reset signal that can work: time is 0 -> 0, not backwards.
+	UMjArticulationController::NotifySimReset();
+
+	double HomeQpos[10];
+	double MaxSpawnHomeDelta = 0.0;
+	for (int32 i = 0; i < 10; ++i)
+	{
+		HomeQpos[i] = D->qpos[QposAdrs[i]];
+		MaxSpawnHomeDelta = FMath::Max(MaxSpawnHomeDelta, FMath::Abs(HomeQpos[i] - SpawnQpos[i]));
+	}
+	// Precondition: spawn and home must actually differ, or this test pins nothing.
+	if (!TestTrue(FString::Printf(TEXT("spawn differs from home (max delta %.3f > 0.2)"), MaxSpawnHomeDelta),
+			MaxSpawnHomeDelta > 0.2))
+	{
+		S.Cleanup();
+		return false;
+	}
+	if (!TestTrue(TEXT("precondition: reset landed on the SAME time value (t=0) — the blind spot"),
+			D->time == 0.0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 6. Re-target the HOME EE pose (as the demo script does) and step -----
+	const FVector P0(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2]);
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+	{
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+	}
+
+	bool bDiverged = false;
+	for (int32 K = 0; K < 200; ++K)
+	{
+		Ctrl->ComputeAndApply(M, D, 0);
+
+		if (K == 0)
+		{
+			// THE assert: the first post-reset ctrl frame must command ~HOME.
+			// Without the epoch signal this tick reads as idle (t equal), ctrl
+			// keeps the pre-reset near-spawn command, and the next step yanks.
+			for (int32 i = 0; i < 10; ++i)
+			{
+				const double Ctl = D->ctrl[CtrlIds[i]];
+				TestTrue(FString::Printf(
+							 TEXT("first post-reset ctrl frame ~home for '%s': |%.4f - %.4f| = %.4f < 0.05 (spawn=%.4f)"),
+							 JointNames[i], Ctl, HomeQpos[i], FMath::Abs(Ctl - HomeQpos[i]), SpawnQpos[i]),
+					FMath::Abs(Ctl - HomeQpos[i]) < 0.05);
+			}
+		}
+
+		mj_step(M, D);
+
+		for (int32 v = 0; v < M->nv; ++v)
+		{
+			if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+			{
+				AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+				bDiverged = true;
+				break;
+			}
+		}
+		if (bDiverged)
+		{
+			break;
+		}
+	}
+
+	S.Cleanup();
+	return !bDiverged;
+}
+
+// ============================================================================
 // URLab.MinkIK.TidyBot.CtrlParity
 //   Drives the REAL controller (same stack as ClosedLoopStable) on the imported
 //   model with the golden trace's recorded targets, integrating with Kevin's

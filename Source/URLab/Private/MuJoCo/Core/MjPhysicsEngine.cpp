@@ -22,6 +22,7 @@
 
 #include "MuJoCo/Core/MjPhysicsEngine.h"
 #include "MuJoCo/Core/MjArticulation.h"
+#include "MuJoCo/Components/Controllers/MjArticulationController.h"
 #include "MuJoCo/Components/QuickConvert/MjQuickConvertComponent.h"
 #include "MuJoCo/Components/QuickConvert/AMjHeightfieldActor.h"
 #include "MuJoCo/Core/Spec/MjSpecWrapper.h"
@@ -352,6 +353,7 @@ void UMjPhysicsEngine::Compile()
 	mj_step(m_model, m_data);
 	mj_resetData(m_model, m_data);
 	mj_forward(m_model, m_data);
+	UMjArticulationController::NotifySimReset();
 }
 
 int32 UMjPhysicsEngine::MaxWorkerThreads()
@@ -430,6 +432,7 @@ void UMjPhysicsEngine::RunMujocoAsync()
 					mj_resetData(m_model, m_data);
 					mj_forward(m_model, m_data);
 					bPendingReset = false;
+					UMjArticulationController::NotifySimReset();
 
 					// Zero all actuator control values so stale commands
 					// don't persist after reset.
@@ -460,6 +463,7 @@ void UMjPhysicsEngine::RunMujocoAsync()
 					{
 						mj_setState(m_model, m_data, PendingStateVector.GetData(), PendingStateMask);
 						mj_forward(m_model, m_data);
+						UMjArticulationController::NotifySimReset();
 					}
 				}
 

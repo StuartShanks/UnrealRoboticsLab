@@ -126,6 +126,26 @@ public:
 	const TArray<FActuatorBinding>& GetBindings() const { return Bindings; }
 
 	// =========================================================================
+	// Sim-reset epoch — a global, monotonically increasing counter bumped by
+	// every code path that discontinuously rewrites mjData state (bridge
+	// `reset` RPC, the engine's pending reset/restore, per-articulation
+	// keyframe resets). Controllers that integrate an open-loop reference
+	// sample it each physics step and re-base when it changes. Sim time alone
+	// cannot signal a reset: a reset can land on the exact time value the
+	// controller last integrated at, so "time went backwards" has a blind
+	// spot. Global rather than per-engine so reset sites need no handle to
+	// bound controllers; a spurious re-base triggered from an unrelated world
+	// costs one sync-from-live-state step and is harmless.
+	// =========================================================================
+
+	/** Mark that sim state was discontinuously rewritten (reset/restore).
+	 *  Call from any thread, after the state write is complete. */
+	static void NotifySimReset();
+
+	/** Current sim-reset epoch (acquire; pairs with NotifySimReset). */
+	static uint64 GetSimResetEpoch();
+
+	// =========================================================================
 	// Config surface — used by both UURLabZmqRpcTransport's configure_controller RPC
 	// and the legacy `{prefix}/set_gains` topic on UURLabZmqSubscribeTransport.
 	// Subclasses override to plug their schema and apply path into the unified
