@@ -699,6 +699,25 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 	}
 
 	// --- 6. Stream recorded targets -> solve -> compare ctrl -> step ---------
+	// Optional evidence dump: set URLAB_CTRLPARITY_CSV=/abs/path.csv to record
+	// both ctrl vectors (python trace vs live controller) per step, plus the
+	// per-step max |diff| — user-inspectable ground truth for the parity claim.
+	const FString CsvPath = FPlatformMisc::GetEnvironmentVariable(TEXT("URLAB_CTRLPARITY_CSV"));
+	FString Csv;
+	if (!CsvPath.IsEmpty())
+	{
+		Csv = TEXT("step");
+		for (int32 i = 0; i < 10; ++i)
+		{
+			Csv += FString::Printf(TEXT(",py_%s"), JointNames[i]);
+		}
+		for (int32 i = 0; i < 10; ++i)
+		{
+			Csv += FString::Printf(TEXT(",ue_%s"), JointNames[i]);
+		}
+		Csv += TEXT(",step_max_abs_diff\n");
+	}
+
 	double MaxAbsDiff = 0.0;
 	int32 MaxAbsDiffStep = -1;
 	bool bDiverged = false;
@@ -741,9 +760,12 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 
 		Ctrl->ComputeAndApply(M, D, 0);
 
+		double ActualCtrl[10];
+		double StepMaxDiff = 0.0;
 		for (int32 i = 0; i < 10; ++i)
 		{
 			const double Actual = D->ctrl[CtrlIds[i]];
+			ActualCtrl[i] = Actual;
 			if (!FMath::IsFinite(Actual))
 			{
 				AddError(FString::Printf(TEXT("step %d: non-finite ctrl[%d] ('%s')"), K, i, JointNames[i]));
@@ -751,6 +773,7 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 				break;
 			}
 			const double Diff = FMath::Abs(Actual - ExpectedCtrl[i]);
+			StepMaxDiff = FMath::Max(StepMaxDiff, Diff);
 			if (Diff > MaxAbsDiff)
 			{
 				MaxAbsDiff = Diff;
@@ -760,6 +783,19 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 		if (bDiverged)
 		{
 			break;
+		}
+		if (!CsvPath.IsEmpty())
+		{
+			Csv += FString::Printf(TEXT("%d"), K);
+			for (int32 i = 0; i < 10; ++i)
+			{
+				Csv += FString::Printf(TEXT(",%.12g"), ExpectedCtrl[i]);
+			}
+			for (int32 i = 0; i < 10; ++i)
+			{
+				Csv += FString::Printf(TEXT(",%.12g"), ActualCtrl[i]);
+			}
+			Csv += FString::Printf(TEXT(",%.6e\n"), StepMaxDiff);
 		}
 
 		mj_step(M, D);
@@ -781,6 +817,18 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 
 	AddInfo(FString::Printf(TEXT("ctrl parity over %d step(s): max |diff|=%.9e at step %d"),
 		NStepsToRun, MaxAbsDiff, MaxAbsDiffStep));
+
+	if (!CsvPath.IsEmpty())
+	{
+		if (FFileHelper::SaveStringToFile(Csv, *CsvPath))
+		{
+			AddInfo(FString::Printf(TEXT("ctrl dump written: %s"), *CsvPath));
+		}
+		else
+		{
+			AddWarning(FString::Printf(TEXT("ctrl dump FAILED to write: %s"), *CsvPath));
+		}
+	}
 
 	// Tolerance rationale: SolverParity proves the solver itself matches Python
 	// to 1e-3 on q_out (single-step, given the SAME q_in). This test instead
