@@ -160,9 +160,25 @@ class Tracker:
         return np.array([d.qpos[self.qx], d.qpos[self.qy]])
 
 
-def build_controller_payload(draw_target: bool = False) -> dict:
+def build_controller_payload(draw_target: bool = False,
+                             lazy_base_cost: Optional[float] = None) -> dict:
     """The exact example stack, in add_controller JSON form (component refs by
-    MjName). Matches the green headless test's FMinkTaskSpec setup."""
+    MjName). Matches the green headless test's FMinkTaskSpec setup.
+
+    lazy_base_cost: when set, the base Damping task is ALWAYS ON at this cost
+    (instead of off/100). mink solves one weighted QP, so a moderate base cost
+    (~2-10) makes the solver arm-first: the base only drives when the target is
+    genuinely out of arm reach, and stops wherever the arm can take over —
+    the right default for cluttered environments. Live-measured at cost 5:
+    base 0.02 m (vs 0.19 m free) on an arm-only reach, 4x better tracking on
+    a held-altitude circle, base still recruited for a 0.8 m transit."""
+    damping = (
+        {"kind": "damping", "cost": float(lazy_base_cost),
+         "joints": BASE_JOINTS, "enabled": True}
+        if lazy_base_cost is not None else
+        # Base immobilisation task — off by default; the fix_base phase enables it.
+        {"kind": "damping", "cost": 100.0, "joints": BASE_JOINTS, "enabled": False}
+    )
     return {
         "tasks": [
             {
@@ -179,8 +195,7 @@ def build_controller_payload(draw_target: bool = False) -> dict:
             # gripper DOFs, and CtrlParity matches his exact-cost golden trace
             # to 6.4e-8 over 2500 steps — do NOT "fix" this into a divergence.
             {"kind": "posture", "cost": 1e-3, "joints": ARM_JOINTS, "enabled": True},
-            # Base immobilisation task — off by default; the fix_base phase enables it.
-            {"kind": "damping", "cost": 100.0, "joints": BASE_JOINTS, "enabled": False},
+            damping,
         ],
         "limits": [{"kind": "configuration"}],  # gain defaults to 0.95
         "drive_joints": DRIVE_JOINTS,
@@ -236,7 +251,22 @@ def main() -> int:
     ap.add_argument("--no-screenshots", action="store_true")
     ap.add_argument("--draw-target", action="store_true",
                     help="debug-draw the live IK target in the editor viewport")
+    ap.add_argument("--lazy-base", nargs="?", type=float, const=5.0, default=None,
+                    metavar="COST",
+                    help="keep the base Damping task always on at COST (default 5.0): "
+                         "arm-first IK — the base drives only when the target is out "
+                         "of arm reach. Relaxes the base-dependent tracking tolerances.")
     args = ap.parse_args()
+
+    if args.lazy_base is not None:
+        # Lazy-base mode trades transit tracking for a planted base: the
+        # base-dependent checkpoints (far transition, circle, come-home) lag
+        # by design, so widen their tolerances. Near-reach (arm-only) keeps
+        # the strict 1:1 tolerance.
+        for k in (1000, 1600, 2200, 2500):
+            TRACK_TOL[k] *= 2.0
+        log(f"LAZY-BASE mode: base Damping always on at cost {args.lazy_base} "
+            f"(arm-first IK); far-phase tolerances doubled")
 
     if not MODEL_XML.exists():
         log(f"FATAL: model not found: {MODEL_XML}")
@@ -284,7 +314,9 @@ def main() -> int:
         # --- 2. Attach + configure the mink controller (editor op) -----------
         log("add_controller (mink IK, example stack)")
         add_reply = client._rpc(
-            "add_controller", build_controller_payload(draw_target=args.draw_target),
+            "add_controller",
+            build_controller_payload(draw_target=args.draw_target,
+                                     lazy_base_cost=args.lazy_base),
             expected_op="add_controller_ok"
         )
         warnings = add_reply.get("warnings", [])
