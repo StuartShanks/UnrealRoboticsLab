@@ -202,7 +202,8 @@ struct UMjMinkIKController::FMinkIKState
 	struct FBuiltTask
 	{
 		TUniquePtr<FMinkBaseTask> Task;
-		FMinkFrameTask* AsFrame = nullptr; // non-owning view iff Kind==Frame
+		FMinkFrameTask* AsFrame = nullptr;     // non-owning view iff Kind==Frame
+		FMinkPostureTask* AsPosture = nullptr; // non-owning view iff Kind==Posture
 		int32 SpecIndex = INDEX_NONE;
 		int32 MocapIndex = -1; // m->body_mocapid slot, or -1
 	};
@@ -383,6 +384,7 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 				auto Posture = MakeUnique<FMinkPostureTask>(m, SubsetCost(m, JointIds, (double)S.Cost),
 					(double)S.Gain, (double)S.LmDamping);
 				Posture->SetTargetFromConfiguration(Config);
+				Built.AsPosture = Posture.Get();
 				Built.Task = MoveTemp(Posture);
 				break;
 			}
@@ -601,18 +603,57 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	{
 		return; // idle invocation — sim didn't advance; hold ctrl as-is
 	}
+	const bool bFirstIntegration = (LastSimTime < 0.0);
 	double Dt;
 	if (IntegrateDtOverride > 0.0f)
 	{
 		Dt = (double)IntegrateDtOverride;
 	}
-	else if (LastSimTime < 0.0)
+	else if (bFirstIntegration)
 	{
 		Dt = m->opt.timestep;
 	}
 	else
 	{
 		Dt = FMath::Min(Now - LastSimTime, 10.0 * m->opt.timestep);
+	}
+
+	// First integration after Bind: the sim may have been reset (e.g. to the
+	// `home` keyframe) BETWEEN Bind() and the first real step — Bind seeded the
+	// open-loop reference at whatever pose the sim was in then (live workflow:
+	// the SPAWN pose). The backwards-time guard above can never catch that reset
+	// (LastSimTime is still -1), so the first solve would run from a spawn-pose
+	// reference while the robot sits at home, and the first ctrl frame would
+	// command spawn — a violent yank through kp·(ctrl−qpos). Re-base the
+	// reference and every passive target on the live state now, at the moment
+	// stepping actually begins (Kevin's configuration.update(data.qpos)-after-
+	// reset semantics, deferred to first use).
+	if (bFirstIntegration)
+	{
+		Config.Update(d->qpos);
+		for (FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
+		{
+			if (B.AsPosture)
+			{
+				// Kevin sets the posture target after the home reset; ours was
+				// captured at Bind (spawn) — refresh it from the re-based reference.
+				B.AsPosture->SetTargetFromConfiguration(Config);
+			}
+			else if (B.AsFrame)
+			{
+				// Only frames with NO target source this step: a latched manual
+				// target is intentional and preserved; a mocap-driven frame is
+				// refreshed every step anyway. Without this, the held build-time
+				// target (spawn EE pose) would deliberately drive back to spawn.
+				const FManualTarget* T = Manual.Find(B.SpecIndex);
+				if ((!T || !T->bSet) && B.MocapIndex < 0)
+				{
+					B.AsFrame->SetTargetFromConfiguration(Config);
+				}
+			}
+		}
+		UE_LOG(LogURLabRuntime, Log,
+			TEXT("[MinkIK] first integration: re-based reference + passive targets from live state"));
 	}
 	LastSimTime = Now;
 	for (int32 It = 0; It < MaxIters; ++It)
