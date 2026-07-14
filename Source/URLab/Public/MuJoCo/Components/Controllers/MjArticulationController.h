@@ -148,23 +148,53 @@ public:
 	// =========================================================================
 	// Config surface — used by both UURLabZmqRpcTransport's configure_controller RPC
 	// and the legacy `{prefix}/set_gains` topic on UURLabZmqSubscribeTransport.
-	// Subclasses override to plug their schema and apply path into the unified
-	// JSON-driven controller-config flow.
+	// Subclasses override the *Internal hooks to plug their schema and apply
+	// path into the unified JSON-driven controller-config flow.
+	//
+	// THREAD MODEL: config writers (RPC/game thread) and ComputeAndApply
+	// (async physics thread) run concurrently. The public entry points below
+	// serialize all config access on ConfigMutex; subclass ComputeAndApply
+	// implementations MUST hold ConfigMutex while reading any state their
+	// ApplyConfigInternal writes (snapshot to locals, then release — never
+	// hold it across the actual solve/control computation). Lock ordering:
+	// ConfigMutex is the OUTER lock — never acquire it while holding a
+	// subclass-internal mutex.
 	// =========================================================================
 
 	/** Short kind name reported in the handshake (e.g. "pd", "passthrough"). */
 	virtual FString GetKindName() const { return TEXT("base"); }
 
-	/** Fill @p OutSchema with the JSON schema for this controller's params. */
+	/** Fill @p OutSchema with the JSON schema for this controller's params.
+	 *  Schema is static per class — no config state, so no lock needed. */
 	virtual void GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) const {}
 
-	/** Fill @p OutParams with the controller's current parameter values. */
-	virtual void GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const {}
+	/** Fill @p OutParams with the controller's current parameter values.
+	 *  Thread-safe: locks ConfigMutex and delegates to GetCurrentConfigInternal. */
+	void GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const;
 
-	/** Apply a partial JSON config to this controller. Missing fields keep their current value. */
-	virtual void ApplyConfig(const TSharedPtr<FJsonObject>& InParams) {}
+	/** Apply a partial JSON config to this controller. Missing fields keep their
+	 *  current value. Thread-safe: locks ConfigMutex and delegates to
+	 *  ApplyConfigInternal. Also logs instance/owner/world at Verbose so config
+	 *  routing is auditable across PIE/Simulate world duplication. */
+	void ApplyConfig(const TSharedPtr<FJsonObject>& InParams);
+
+	/** For external config writers (e.g. the add_controller editor op) that
+	 *  mutate spec arrays directly on a possibly-live controller and so must
+	 *  serialize against ComputeAndApply themselves. Prefer ApplyConfig for
+	 *  anything expressible as params. Do NOT hold across ApplyConfig calls. */
+	FCriticalSection& GetConfigLock() const { return ConfigMutex; }
 
 protected:
+	/** Subclass hook: fill @p OutParams with current values. Called with
+	 *  ConfigMutex held. */
+	virtual void GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const {}
+
+	/** Subclass hook: apply a partial JSON config. Called with ConfigMutex held. */
+	virtual void ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams) {}
+
+	/** Serializes the config surface against ComputeAndApply. See the thread
+	 *  model note above. */
+	mutable FCriticalSection ConfigMutex;
 	/** Actuator→DOF bindings, populated by Bind(). */
 	UPROPERTY()
 	TArray<FActuatorBinding> Bindings;

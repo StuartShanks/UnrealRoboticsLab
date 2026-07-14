@@ -1255,6 +1255,236 @@ bool FMjMinkIKTidybotResetAfterRunNoYank::RunTest(const FString&)
 }
 
 // ============================================================================
+// URLab.MinkIK.TidyBot.FixBaseHolds
+//   Kevin's fix_base semantics end-to-end through the config surface: the
+//   damping task over the base joints starts DISABLED (spec default), and
+//   enabling it live via ApplyConfig({"task_enabled": [true,true,true]}) must
+//   actually reach the physics-thread solve (the live 2026-07 bug: enables
+//   were stored — config echo true — but the solver kept active=2 and the
+//   base drove 78 cm where <2 cm was expected). Two phases against a far
+//   x-target only the base can chase:
+//     A) damping disabled  -> base MUST drive (precondition: target needs base)
+//     B) damping enabled   -> base must hold (cost 100 vs frame cost 1)
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotFixBaseHolds,
+	"URLab.MinkIK.TidyBot.FixBaseHolds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotFixBaseHolds::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Find components (same resolution as ClosedLoopStable) ------------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const TCHAR* Nm = JointNames[i];
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- 3. Same example stack as ClosedLoopStable (damping DISABLED) ---------
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKFixBase"));
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr;
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 100.0f;
+	Damping.Joints = BaseJoints;
+	Damping.bEnabled = false;
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 4. Start clean at home ------------------------------------------------
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	const FVector P0(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2]);
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+	const int32 QxAdr = QposAdrs[0];
+	const int32 QyAdr = QposAdrs[1];
+
+	// Far x-target: 0.6 m beyond home EE — outside comfortable arm-only reach,
+	// so the frame task recruits the base whenever the base is free to move.
+	auto SendTarget = [&](bool bFixBase) {
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.X + 0.6));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		TArray<TSharedPtr<FJsonValue>> Enabled;
+		Enabled.Add(MakeShared<FJsonValueBoolean>(true));
+		Enabled.Add(MakeShared<FJsonValueBoolean>(true));
+		Enabled.Add(MakeShared<FJsonValueBoolean>(bFixBase));
+		Cfg->SetArrayField(TEXT("task_enabled"), Enabled);
+		Ctrl->ApplyConfig(Cfg);
+	};
+
+	auto RunSteps = [&](int32 N) -> bool {
+		for (int32 K = 0; K < N; ++K)
+		{
+			Ctrl->ComputeAndApply(M, D, 0);
+			mj_step(M, D);
+			for (int32 v = 0; v < M->nv; ++v)
+			{
+				if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+				{
+					AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	// --- 5. Phase A: base free — MUST drive (precondition) --------------------
+	SendTarget(/*bFixBase*/ false);
+	if (!RunSteps(500))
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double FreeBaseTravel = FMath::Sqrt(
+		D->qpos[QxAdr] * D->qpos[QxAdr] + D->qpos[QyAdr] * D->qpos[QyAdr]);
+	if (!TestTrue(FString::Printf(
+			TEXT("precondition: free base drives toward the far target (|base xy| %.3f m > 0.15)"),
+			FreeBaseTravel),
+			FreeBaseTravel > 0.15))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 6. Phase B: reset, enable the damping task live, base must hold ------
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	UMjArticulationController::NotifySimReset();
+
+	SendTarget(/*bFixBase*/ true);
+	const bool bPhaseBOk = RunSteps(500);
+	const double FixedBaseTravel = FMath::Sqrt(
+		D->qpos[QxAdr] * D->qpos[QxAdr] + D->qpos[QyAdr] * D->qpos[QyAdr]);
+	TestTrue(FString::Printf(
+			 TEXT("fix_base holds: |base xy| %.4f m < 0.10 with damping enabled (free run drove %.3f m)"),
+			 FixedBaseTravel, FreeBaseTravel),
+		FixedBaseTravel < 0.10);
+
+	S.Cleanup();
+	return bPhaseBOk;
+}
+
+// ============================================================================
 // URLab.MinkIK.TidyBot.CtrlParity
 //   Drives the REAL controller (same stack as ClosedLoopStable) on the imported
 //   model with the golden trace's recorded targets, integrating with Kevin's

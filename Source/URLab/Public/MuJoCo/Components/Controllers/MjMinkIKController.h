@@ -324,8 +324,12 @@ public:
 	// --- bridge config surface (configure_controller) ---
 	virtual FString GetKindName() const override { return TEXT("mink_ik"); }
 	virtual void GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) const override;
-	virtual void GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const override;
-	virtual void ApplyConfig(const TSharedPtr<FJsonObject>& InParams) override;
+
+protected:
+	// Called with the base class's ConfigMutex held; ComputeAndApply snapshots
+	// everything these write under the same mutex before solving.
+	virtual void GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const override;
+	virtual void ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams) override;
 
 private:
 	/** Manual (SetIKTarget) target for a Frame spec, MuJoCo world coords. */

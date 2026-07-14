@@ -543,7 +543,30 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	}
 	FMinkConfiguration& Config = *Mink->Config;
 
-	if (bSyncFromLiveState)
+	// Snapshot the ApplyConfig-written surface under ConfigMutex (base-class
+	// thread model): copy scalars + per-spec enables to locals and release, so
+	// the solve never overlaps a config write and never holds the lock.
+	int32 CfgMaxIters;
+	float CfgQpDamping, CfgIntegrateDtOverride, CfgPosThreshold, CfgOriThreshold;
+	bool bCfgSyncFromLiveState, bCfgDrawTarget;
+	TArray<bool, TInlineAllocator<8>> CfgSpecEnabled;
+	{
+		FScopeLock ConfigLock(&ConfigMutex);
+		CfgMaxIters = MaxIters;
+		CfgQpDamping = QpDamping;
+		CfgIntegrateDtOverride = IntegrateDtOverride;
+		CfgPosThreshold = PosThreshold;
+		CfgOriThreshold = OriThreshold;
+		bCfgSyncFromLiveState = bSyncFromLiveState;
+		bCfgDrawTarget = bDrawTarget;
+		CfgSpecEnabled.SetNum(Tasks.Num());
+		for (int32 i = 0; i < Tasks.Num(); ++i)
+		{
+			CfgSpecEnabled[i] = Tasks[i].bEnabled;
+		}
+	}
+
+	if (bCfgSyncFromLiveState)
 	{
 		Config.Update(d->qpos);
 	}
@@ -564,7 +587,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	TArray<FMinkTargetSnapshot> NewDebugTargets;
 	for (FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
 	{
-		const bool bTaskEnabled = !Tasks.IsValidIndex(B.SpecIndex) || Tasks[B.SpecIndex].bEnabled;
+		const bool bTaskEnabled = !CfgSpecEnabled.IsValidIndex(B.SpecIndex) || CfgSpecEnabled[B.SpecIndex];
 		if (!bTaskEnabled)
 		{
 			continue;
@@ -591,7 +614,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			// Whatever the source above (mocap / manual / held bind pose), the
 			// resolved target now lives in TransformTargetToWorld — snapshot it
 			// for the debug draw regardless of why it did or didn't change.
-			if (bDrawTarget && B.AsFrame->TransformTargetToWorld.IsSet())
+			if (bCfgDrawTarget && B.AsFrame->TransformTargetToWorld.IsSet())
 			{
 				const FMinkSE3& Tgt = B.AsFrame->TransformTargetToWorld.GetValue();
 				FMinkTargetSnapshot Snap;
@@ -607,7 +630,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		}
 		Active.Add(B.Task.Get());
 	}
-	if (bDrawTarget)
+	if (bCfgDrawTarget)
 	{
 		FScopeLock Lock(&DebugTargetMutex);
 		DebugTargets = MoveTemp(NewDebugTargets);
@@ -651,9 +674,9 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	}
 	const bool bFirstIntegration = (LastSimTime < 0.0);
 	double Dt;
-	if (IntegrateDtOverride > 0.0f)
+	if (CfgIntegrateDtOverride > 0.0f)
 	{
-		Dt = (double)IntegrateDtOverride;
+		Dt = (double)CfgIntegrateDtOverride;
 	}
 	else if (bFirstIntegration)
 	{
@@ -700,9 +723,9 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			TEXT("[MinkIK] first integration (bind or sim reset): re-based reference + passive targets from live state"));
 	}
 	LastSimTime = Now;
-	for (int32 It = 0; It < MaxIters; ++It)
+	for (int32 It = 0; It < CfgMaxIters; ++It)
 	{
-		const FMinkIKResult R = MinkSolveIK(Config, Active, Dt, (double)QpDamping,
+		const FMinkIKResult R = MinkSolveIK(Config, Active, Dt, (double)CfgQpDamping,
 			/*bSafetyBreak*/ false, LimitsArg);
 		if (!R.IsSuccess())
 		{
@@ -739,8 +762,8 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		{
 			FMinkVec Err;
 			if (FirstFrame->ComputeError(Config, Err) && Err.size() >= 6
-				&& Err.head(3).norm() <= (double)PosThreshold
-				&& Err.tail(3).norm() <= (double)OriThreshold)
+				&& Err.head(3).norm() <= (double)CfgPosThreshold
+				&& Err.tail(3).norm() <= (double)CfgOriThreshold)
 			{
 				break;
 			}
@@ -787,7 +810,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 		}
 		UE_LOG(LogURLabRuntime, Log,
 			TEXT("[MinkIK] trace #%d t=%.4f sync=%d frameErr(pos=%.4f ori=%.4f)%s"),
-			DiagCounter, d->time, bSyncFromLiveState ? 1 : 0, FramePos, FrameOri, *Line);
+			DiagCounter, d->time, bCfgSyncFromLiveState ? 1 : 0, FramePos, FrameOri, *Line);
 	}
 
 	if (bDiag)
@@ -821,7 +844,12 @@ void UMjMinkIKController::TickComponent(float DeltaTime, ELevelTick TickType,
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
 #if ENABLE_DRAW_DEBUG
-	if (!bDrawTarget)
+	bool bDraw;
+	{
+		FScopeLock ConfigLock(&ConfigMutex);
+		bDraw = bDrawTarget;
+	}
+	if (!bDraw)
 	{
 		return;
 	}
@@ -868,7 +896,7 @@ void UMjMinkIKController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) co
 	OutSchema->SetStringField(TEXT("task_enabled"), TEXT("array<bool>"));
 }
 
-void UMjMinkIKController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const
+void UMjMinkIKController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const
 {
 	OutParams = MakeShared<FJsonObject>();
 	OutParams->SetNumberField(TEXT("max_iters"), MaxIters);
@@ -886,7 +914,7 @@ void UMjMinkIKController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) c
 	OutParams->SetArrayField(TEXT("task_enabled"), Enabled);
 }
 
-void UMjMinkIKController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
+void UMjMinkIKController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams)
 {
 	if (!InParams.IsValid())
 	{

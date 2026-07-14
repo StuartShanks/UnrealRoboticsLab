@@ -79,8 +79,12 @@ public:
 
 	virtual FString GetKindName() const override { return TEXT("pd"); }
 	virtual void GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) const override;
-	virtual void GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const override;
-	virtual void ApplyConfig(const TSharedPtr<FJsonObject>& InParams) override;
+
+protected:
+	virtual void GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const override;
+	virtual void ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams) override;
+
+public:
 
 	/** Set all gains at once. Arrays must match binding count. */
 	UFUNCTION(BlueprintCallable, Category = "MuJoCo|PD Controller")

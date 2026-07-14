@@ -1736,6 +1736,13 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 		}
 	};
 
+	// With bWasExisting the controller may already be bound and solving on the
+	// physics thread, and ComputeAndApply snapshots the spec arrays under the
+	// config lock — hold it while structurally mutating Tasks/Limits/DriveJoints
+	// (a concurrent TArray reallocation is use-after-free, not just staleness).
+	{
+	FScopeLock SpecLock(&Ctrl->GetConfigLock());
+
 	// --- tasks ----------------------------------------------------------------
 	const TArray<TSharedPtr<FJsonValue>>* TasksArr = nullptr;
 	if (Req->TryGetArrayField(TEXT("tasks"), TasksArr) && TasksArr)
@@ -1858,22 +1865,14 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	if (Req->TryGetArrayField(TEXT("drive_joints"), DJ))
 		ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"), &Ctrl->DriveJointNames);
 
-	double V;
-	if (Req->TryGetNumberField(TEXT("max_iters"), V))
-		Ctrl->MaxIters = FMath::Max(1, (int32)V);
-	if (Req->TryGetNumberField(TEXT("qp_damping"), V))
-		Ctrl->QpDamping = V;
-	if (Req->TryGetNumberField(TEXT("integrate_dt_override"), V))
-		Ctrl->IntegrateDtOverride = FMath::Max(0.0, V);
-	if (Req->TryGetNumberField(TEXT("pos_threshold"), V))
-		Ctrl->PosThreshold = V;
-	if (Req->TryGetNumberField(TEXT("ori_threshold"), V))
-		Ctrl->OriThreshold = V;
-	bool B;
-	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B))
-		Ctrl->bSyncFromLiveState = B;
-	if (Req->TryGetBoolField(TEXT("draw_target"), B))
-		Ctrl->bDrawTarget = B;
+	} // SpecLock — released before ApplyConfig takes the same lock itself
+
+	// Solver params (max_iters, qp_damping, integrate_dt_override, pos/ori
+	// thresholds, sync_from_live_state, draw_target) share configure_controller's
+	// parse — route through the locked ApplyConfig entry point: with
+	// bWasExisting the controller may already be bound and solving on the
+	// physics thread, so these writes must serialize on ConfigMutex.
+	Ctrl->ApplyConfig(Req);
 
 	// Tell the running solver to rebuild its baked task stack from the specs we
 	// just wrote — costs/damping/joint-subsets are baked at build time, so a live

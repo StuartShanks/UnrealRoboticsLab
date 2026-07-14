@@ -63,6 +63,11 @@ void UMjPDController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 	if (!bIsBound)
 		return;
 
+	// Config writers (RPC/game thread) mutate Kp/Kv/TorqueLimits — including
+	// SetNum reallocations — so the whole (cheap) control loop runs under
+	// ConfigMutex; indexing a concurrently-reallocated TArray is use-after-free.
+	FScopeLock ConfigLock(&ConfigMutex);
+
 	for (int32 i = 0; i < Bindings.Num(); ++i)
 	{
 		const FActuatorBinding& B = Bindings[i];
@@ -157,7 +162,7 @@ void UMjPDController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) const
 	OutSchema->SetObjectField(TEXT("default_torque_limit"), MakeScalar(0.f));
 }
 
-void UMjPDController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const
+void UMjPDController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const
 {
 	if (!OutParams.IsValid())
 		OutParams = MakeShared<FJsonObject>();
@@ -182,7 +187,7 @@ void UMjPDController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const
 	OutParams->SetNumberField(TEXT("default_torque_limit"), DefaultTorqueLimit);
 }
 
-void UMjPDController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
+void UMjPDController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams)
 {
 	if (!InParams.IsValid())
 		return;

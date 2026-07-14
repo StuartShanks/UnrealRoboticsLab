@@ -23,6 +23,8 @@
 #include "MuJoCo/Components/Controllers/MjArticulationController.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "Utils/URLabLogging.h"
+#include "GameFramework/Actor.h"
+#include "Engine/World.h"
 
 #include <atomic>
 
@@ -40,6 +42,28 @@ void UMjArticulationController::NotifySimReset()
 uint64 UMjArticulationController::GetSimResetEpoch()
 {
 	return GSimResetEpoch.load(std::memory_order_acquire);
+}
+
+void UMjArticulationController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) const
+{
+	FScopeLock Lock(&ConfigMutex);
+	GetCurrentConfigInternal(OutParams);
+}
+
+void UMjArticulationController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
+{
+	// Routing audit: in PIE/Simulate the world is duplicated, so two component
+	// instances exist — this line (vs the same fields on the Bind log) shows
+	// which instance a config write actually landed on.
+	const AActor* Owner = GetOwner();
+	const UWorld* World = GetWorld();
+	UE_LOG(LogURLab, Verbose, TEXT("[CtrlConfig] ApplyConfig -> '%s' (this=%p owner='%s' world='%s')"),
+		*GetName(), this,
+		Owner ? *Owner->GetName() : TEXT("null"),
+		World ? *World->GetName() : TEXT("null"));
+
+	FScopeLock Lock(&ConfigMutex);
+	ApplyConfigInternal(InParams);
 }
 
 UMjArticulationController::UMjArticulationController()
@@ -88,5 +112,10 @@ void UMjArticulationController::Bind(mjModel* m, mjData* d, const TMap<int32, UM
 	}
 
 	bIsBound = Bindings.Num() > 0;
-	UE_LOG(LogURLab, Log, TEXT("[ArticulationController] Bound %d actuators to DOFs"), Bindings.Num());
+	const AActor* Owner = GetOwner();
+	const UWorld* World = GetWorld();
+	UE_LOG(LogURLab, Log, TEXT("[ArticulationController] Bound %d actuators to DOFs ('%s' this=%p owner='%s' world='%s')"),
+		Bindings.Num(), *GetName(), this,
+		Owner ? *Owner->GetName() : TEXT("null"),
+		World ? *World->GetName() : TEXT("null"));
 }
