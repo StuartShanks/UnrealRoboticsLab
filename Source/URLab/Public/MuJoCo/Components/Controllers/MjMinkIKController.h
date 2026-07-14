@@ -278,6 +278,21 @@ public:
 	bool bSyncFromLiveState = false;
 
 	/**
+	 * Draw a debug marker (sphere + coordinate axes) at each enabled Frame
+	 * task's current target pose, whatever the source — a mocap body, a
+	 * streamed manual target (SetIKTarget / bridge target_pos), or the held
+	 * bind pose. Useful during a live demo: a streamed target bypasses the
+	 * mocap body's visible box, so without this the robot appears to chase
+	 * nothing. Editor/dev builds only (compiles to a no-op in Shipping).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK|Debug")
+	bool bDrawTarget = false;
+
+	/** Debug marker radius, in centimeters (UE units). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mink IK|Debug", meta = (ClampMin = "0.1"))
+	float DrawTargetSize = 5.0f;
+
+	/**
 	 * Command the target of the Frame task at Tasks[TaskIndex] in Unreal world
 	 * space. Thread-safe. Ignored while that spec has a TargetMocapBody. Wire
 	 * VR controller poses in here.
@@ -298,6 +313,13 @@ public:
 	// --- UMjArticulationController ---
 	virtual void Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap) override;
 	virtual void ComputeAndApply(mjModel* m, mjData* d, uint8 Source) override;
+
+	// --- UActorComponent ---
+	/** Game-thread only: draws the bDrawTarget debug markers from the physics-
+	 *  thread snapshot written by ComputeAndApply. Cheap no-op when bDrawTarget
+	 *  is false (the snapshot write itself is also gated on bDrawTarget). */
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType,
+		FActorComponentTickFunction* ThisTickFunction) override;
 
 	// --- bridge config surface (configure_controller) ---
 	virtual FString GetKindName() const override { return TEXT("mink_ik"); }
@@ -339,6 +361,23 @@ private:
 	/** Manual targets keyed by spec index; guarded by TargetMutex. */
 	TMap<int32, FManualTarget> ManualTargets;
 	FCriticalSection TargetMutex;
+
+	/** Physics-thread snapshot of one enabled Frame task's current target
+	 *  pose, MuJoCo world coords (whatever the source: mocap, manual, or held
+	 *  bind pose) — written by ComputeAndApply, read by TickComponent on the
+	 *  game thread. Never draw from ComputeAndApply itself; it runs off the
+	 *  game thread and DrawDebug* is not safe to call from there. */
+	struct FMinkTargetSnapshot
+	{
+		double Pos[3] = {0.0, 0.0, 0.0};
+		double Quat[4] = {1.0, 0.0, 0.0, 0.0};
+	};
+
+	/** Debug-draw snapshot; own lock (deliberately separate from TargetMutex —
+	 *  different producer/consumer, no reason to contend). Only written when
+	 *  bDrawTarget is set, so it costs nothing when the feature is off. */
+	TArray<FMinkTargetSnapshot> DebugTargets;
+	FCriticalSection DebugTargetMutex;
 
 	/** Diagnostic call counter (first calls + every Nth are logged). */
 	int32 DiagCounter = 0;

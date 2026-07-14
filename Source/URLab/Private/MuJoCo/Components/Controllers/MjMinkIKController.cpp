@@ -40,6 +40,7 @@
 #include "MuJoCo/Components/Joints/MjJoint.h"
 #include "MuJoCo/Utils/MjUtils.h"
 #include "Utils/URLabLogging.h"
+#include "DrawDebugHelpers.h"
 
 #include <mujoco/mujoco.h>
 
@@ -213,7 +214,16 @@ struct UMjMinkIKController::FMinkIKState
 	TArray<TUniquePtr<FMinkLimit>> BuiltLimits;
 };
 
-UMjMinkIKController::UMjMinkIKController() = default;
+UMjMinkIKController::UMjMinkIKController()
+{
+	// Ticking is off in the UMjArticulationController base (all real work runs
+	// off ComputeAndApply on the physics thread); this subclass needs a game-
+	// thread tick solely to draw the bDrawTarget debug markers, since
+	// DrawDebug* is not safe to call from the physics thread. TickComponent
+	// early-outs immediately when bDrawTarget is false, so this is free when
+	// the feature is off.
+	PrimaryComponentTick.bCanEverTick = true;
+}
 UMjMinkIKController::~UMjMinkIKController() = default;
 
 void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActuator*>& ActuatorIdMap)
@@ -545,6 +555,9 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	TArray<const FMinkBaseTask*> Active;
 	Active.Reserve(Mink->BuiltTasks.Num());
 	const FMinkFrameTask* FirstFrame = nullptr;
+	// Debug-draw snapshot for TickComponent (game thread); only populated when
+	// bDrawTarget is set so this whole path costs nothing in production.
+	TArray<FMinkTargetSnapshot> NewDebugTargets;
 	for (FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
 	{
 		const bool bTaskEnabled = !Tasks.IsValidIndex(B.SpecIndex) || Tasks[B.SpecIndex].bEnabled;
@@ -571,8 +584,29 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			{
 				FirstFrame = B.AsFrame;
 			}
+			// Whatever the source above (mocap / manual / held bind pose), the
+			// resolved target now lives in TransformTargetToWorld — snapshot it
+			// for the debug draw regardless of why it did or didn't change.
+			if (bDrawTarget && B.AsFrame->TransformTargetToWorld.IsSet())
+			{
+				const FMinkSE3& Tgt = B.AsFrame->TransformTargetToWorld.GetValue();
+				FMinkTargetSnapshot Snap;
+				Snap.Pos[0] = Tgt.WxyzXyz[4];
+				Snap.Pos[1] = Tgt.WxyzXyz[5];
+				Snap.Pos[2] = Tgt.WxyzXyz[6];
+				Snap.Quat[0] = Tgt.WxyzXyz[0];
+				Snap.Quat[1] = Tgt.WxyzXyz[1];
+				Snap.Quat[2] = Tgt.WxyzXyz[2];
+				Snap.Quat[3] = Tgt.WxyzXyz[3];
+				NewDebugTargets.Add(Snap);
+			}
 		}
 		Active.Add(B.Task.Get());
+	}
+	if (bDrawTarget)
+	{
+		FScopeLock Lock(&DebugTargetMutex);
+		DebugTargets = MoveTemp(NewDebugTargets);
 	}
 	if (Active.Num() == 0)
 	{
@@ -771,6 +805,40 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 	}
 }
 
+void UMjMinkIKController::TickComponent(float DeltaTime, ELevelTick TickType,
+	FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+#if ENABLE_DRAW_DEBUG
+	if (!bDrawTarget)
+	{
+		return;
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	TArray<FMinkTargetSnapshot> Targets;
+	{
+		FScopeLock Lock(&DebugTargetMutex);
+		Targets = DebugTargets;
+	}
+	for (const FMinkTargetSnapshot& T : Targets)
+	{
+		const FVector WorldPos = MjUtils::MjToUEPosition(T.Pos);
+		const FQuat WorldRot = MjUtils::MjToUERotation(T.Quat);
+		// Thin, non-persistent — redrawn every tick, so a single frame's
+		// lifetime (the codebase's established idiom for per-tick debug
+		// shapes; see MjPerturbation.cpp / MjNavComponent.cpp) is enough.
+		DrawDebugSphere(World, WorldPos, DrawTargetSize, 12, FColor::Red, false, -1.0f, 0, 1.0f);
+		DrawDebugCoordinateSystem(World, WorldPos, WorldRot.Rotator(), DrawTargetSize * 2.0f, false, -1.0f, 0, 1.5f);
+	}
+#endif // ENABLE_DRAW_DEBUG
+}
+
 // ---------------------------------------------------------------------------------
 // Bridge config surface — flat solver params + per-task enable flags. Structural
 // changes (task kinds, component refs, costs baked into cost vectors) rebuild on
@@ -786,6 +854,7 @@ void UMjMinkIKController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) co
 	OutSchema->SetStringField(TEXT("pos_threshold"), TEXT("number"));
 	OutSchema->SetStringField(TEXT("ori_threshold"), TEXT("number"));
 	OutSchema->SetStringField(TEXT("sync_from_live_state"), TEXT("bool"));
+	OutSchema->SetStringField(TEXT("draw_target"), TEXT("bool"));
 	OutSchema->SetStringField(TEXT("task_enabled"), TEXT("array<bool>"));
 }
 
@@ -798,6 +867,7 @@ void UMjMinkIKController::GetCurrentConfig(TSharedPtr<FJsonObject>& OutParams) c
 	OutParams->SetNumberField(TEXT("pos_threshold"), PosThreshold);
 	OutParams->SetNumberField(TEXT("ori_threshold"), OriThreshold);
 	OutParams->SetBoolField(TEXT("sync_from_live_state"), bSyncFromLiveState);
+	OutParams->SetBoolField(TEXT("draw_target"), bDrawTarget);
 	TArray<TSharedPtr<FJsonValue>> Enabled;
 	for (const FMinkTaskSpec& S : Tasks)
 	{
@@ -837,6 +907,10 @@ void UMjMinkIKController::ApplyConfig(const TSharedPtr<FJsonObject>& InParams)
 	if (InParams->TryGetBoolField(TEXT("sync_from_live_state"), B))
 	{
 		bSyncFromLiveState = B;
+	}
+	if (InParams->TryGetBoolField(TEXT("draw_target"), B))
+	{
+		bDrawTarget = B;
 	}
 	const TArray<TSharedPtr<FJsonValue>>* Enabled = nullptr;
 	if (InParams->TryGetArrayField(TEXT("task_enabled"), Enabled) && Enabled)

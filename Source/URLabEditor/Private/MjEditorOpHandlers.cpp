@@ -1872,6 +1872,8 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	bool B;
 	if (Req->TryGetBoolField(TEXT("sync_from_live_state"), B))
 		Ctrl->bSyncFromLiveState = B;
+	if (Req->TryGetBoolField(TEXT("draw_target"), B))
+		Ctrl->bDrawTarget = B;
 
 	// Tell the running solver to rebuild its baked task stack from the specs we
 	// just wrote — costs/damping/joint-subsets are baked at build time, so a live
