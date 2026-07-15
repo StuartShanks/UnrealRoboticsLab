@@ -32,6 +32,7 @@ TSharedPtr<FJsonObject> NavReq(const TCHAR* Op, const FString& Art)
 {
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("op"), Op);
+	R->SetStringField(TEXT("session_id"), TEXT("test-session"));
 	R->SetStringField(TEXT("articulation"), Art);
 	return R;
 }
@@ -52,6 +53,7 @@ bool FMjNavOpsNoComponent::RunTest(const FString&)
 		return false;
 	}
 	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
 	TSharedPtr<FJsonObject> Req = NavReq(TEXT("set_nav_goal"), S.Robot->GetName());
 	Req->SetNumberField(TEXT("x"), 1.0);
 	Req->SetNumberField(TEXT("y"), 0.0);
@@ -82,6 +84,7 @@ bool FMjNavOpsNoNavmesh::RunTest(const FString&)
 		return false;
 	}
 	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
 	TSharedPtr<FJsonObject> Req = NavReq(TEXT("set_nav_goal"), S.Robot->GetName());
 	Req->SetNumberField(TEXT("x"), 1.0);
 	Req->SetNumberField(TEXT("y"), 0.5);
@@ -115,6 +118,7 @@ bool FMjNavOpsStatus::RunTest(const FString&)
 		return false;
 	}
 	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
 	TSharedPtr<FJsonObject> Reply = Disp->Dispatch(NavReq(TEXT("get_nav_status"), S.Robot->GetName()));
 	FString State;
 	TestTrue(TEXT("state field"), Reply->TryGetStringField(TEXT("state"), State));
