@@ -140,6 +140,20 @@ URLABEDITOR_API bool SpawnActorSync(
 	bool& OutWasExisting,
 	FString& OutError);
 
+/** Spawn (or update, per ActorId) a static blocking AStaticMeshActor cube.
+ *  Location in MuJoCo world metres; Size = full extents in metres; YawDeg
+ *  CCW-positive about MuJoCo Z. UE-side only (no MuJoCo geom) — callers add
+ *  add_quick_convert(static=true) when MuJoCo needs it too. */
+URLABEDITOR_API bool SpawnBoxSync(
+	const FString& ActorId,
+	const FVector& LocationMeters,
+	const FVector& SizeMeters,
+	double YawDeg,
+	FString& OutActorName,
+	FString& OutActorPath,
+	bool& OutWasExisting,
+	FString& OutError);
+
 /** Destroy a spawned actor by actor id (preferred) or actor name. */
 URLABEDITOR_API bool DestroyActorSync(
 	const FString& ActorIdOrActorName,

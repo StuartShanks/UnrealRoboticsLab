@@ -42,6 +42,7 @@
 #include "Dom/JsonValue.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/Light.h"
+#include "Materials/Material.h"
 
 namespace URLabLevelOps
 {
@@ -464,6 +465,104 @@ bool SpawnActorSync(
 
 	OutActorName = Actor->GetName();
 	OutActorPath = Actor->GetPathName();
+	return true;
+}
+
+bool SpawnBoxSync(
+	const FString& ActorId,
+	const FVector& LocationMeters,
+	const FVector& SizeMeters,
+	double YawDeg,
+	FString& OutActorName,
+	FString& OutActorPath,
+	bool& OutWasExisting,
+	FString& OutError)
+{
+	OutActorName.Empty();
+	OutActorPath.Empty();
+	OutWasExisting = false;
+	OutError.Empty();
+
+	if (!GEditor)
+	{
+		OutError = TEXT("GEditor null");
+		return false;
+	}
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		OutError = TEXT("editor world unavailable");
+		return false;
+	}
+	if (ActorId.IsEmpty())
+	{
+		OutError = TEXT("actor_id required");
+		return false;
+	}
+	if (SizeMeters.GetMin() <= 0.0)
+	{
+		OutError = TEXT("size components must be > 0");
+		return false;
+	}
+
+	double MjPos[3] = {LocationMeters.X, LocationMeters.Y, LocationMeters.Z};
+	const FVector UELoc = MjUtils::MjToUEPosition(MjPos);
+	// MJ yaw is CCW about Z (RH); UE yaw is CW (LH Y-flip) -> negate.
+	const FRotator UERot(0.0, -YawDeg, 0.0);
+	// Engine cube asset is 100 cm -> component scale == size in metres.
+	const FVector UEScale(SizeMeters.X, SizeMeters.Y, SizeMeters.Z);
+
+	if (AActor* Existing = FindByActorIdOnly(World, ActorId))
+	{
+		AStaticMeshActor* Box = Cast<AStaticMeshActor>(Existing);
+		if (!Box)
+		{
+			OutError = FString::Printf(
+				TEXT("actor_id '%s' already in world with class %s; not a spawn_box actor"),
+				*ActorId, *Existing->GetClass()->GetPathName());
+			return false;
+		}
+		Box->SetActorLocationAndRotation(UELoc, UERot);
+		Box->SetActorScale3D(UEScale);
+		OutActorName = Box->GetName();
+		OutActorPath = Box->GetPathName();
+		OutWasExisting = true;
+		return true;
+	}
+
+	UStaticMesh* Cube = LoadObject<UStaticMesh>(
+		nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!Cube)
+	{
+		OutError = TEXT("engine cube mesh not found (/Engine/BasicShapes/Cube)");
+		return false;
+	}
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AStaticMeshActor* Box =
+		World->SpawnActor<AStaticMeshActor>(UELoc, UERot, Params);
+	if (!Box)
+	{
+		OutError = TEXT("SpawnActor returned null for AStaticMeshActor");
+		return false;
+	}
+	UStaticMeshComponent* SMC = Box->GetStaticMeshComponent();
+	// Editor world: setting the mesh on a Static-mobility component is the
+	// same thing the editor's drag-drop placement does.
+	SMC->SetStaticMesh(Cube);
+	if (UMaterial* Mat = LoadObject<UMaterial>(nullptr,
+			TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial")))
+	{
+		SMC->SetMaterial(0, Mat);
+	}
+	SMC->SetMobility(EComponentMobility::Static);
+	Box->SetActorScale3D(UEScale);
+	Box->Tags.AddUnique(FName(*MakeActorIdTag(ActorId)));
+
+	OutActorName = Box->GetName();
+	OutActorPath = Box->GetPathName();
 	return true;
 }
 

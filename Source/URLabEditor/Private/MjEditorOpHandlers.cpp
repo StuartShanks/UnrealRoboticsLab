@@ -415,6 +415,40 @@ TSharedPtr<FJsonObject> HandleSpawnGrid(const TSharedPtr<FJsonObject>& Req)
 	return Reply;
 }
 
+TSharedPtr<FJsonObject> HandleSpawnBox(const TSharedPtr<FJsonObject>& Req)
+{
+	FString ActorId;
+	if (!Req->TryGetStringField(TEXT("actor_id"), ActorId) || ActorId.IsEmpty())
+		return MakeJsonError(TEXT("missing_field"),
+			TEXT("spawn_box requires non-empty 'actor_id'"));
+
+	FVector Loc, Size;
+	if (!ReadVec3(Req, TEXT("location"), Loc, FVector::ZeroVector))
+		return MakeJsonError(TEXT("missing_field"),
+			TEXT("spawn_box requires 'location' [3] (MuJoCo metres)"));
+	if (!ReadVec3(Req, TEXT("size"), Size, FVector::OneVector))
+		return MakeJsonError(TEXT("missing_field"),
+			TEXT("spawn_box requires 'size' [3] full extents (metres)"));
+	double YawDeg = 0.0;
+	Req->TryGetNumberField(TEXT("yaw_deg"), YawDeg);
+
+	FString ActorName, ActorPath, Err;
+	bool bWasExisting = false;
+	if (!URLabLevelOps::SpawnBoxSync(ActorId, Loc, Size, YawDeg,
+			ActorName, ActorPath, bWasExisting, Err))
+		return MakeJsonError(TEXT("spawn_failed"), Err);
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("spawn_box_ok"));
+	Reply->SetStringField(TEXT("actor_id"), ActorId);
+	Reply->SetStringField(TEXT("actor_name"), ActorName);
+	Reply->SetStringField(TEXT("actor_path"), ActorPath);
+	Reply->SetBoolField(TEXT("was_existing"), bWasExisting);
+	Reply->SetBoolField(TEXT("requires_pie_restart"),
+		GEditor ? GEditor->IsPlayingSessionInEditor() : false);
+	return Reply;
+}
+
 TSharedPtr<FJsonObject> HandleSpawnLight(const TSharedPtr<FJsonObject>& Req)
 {
 	FString Kind = TEXT("directional");
@@ -1984,6 +2018,10 @@ void RegisterAll()
 		GameThreadHandler(&HandleSpawnGrid),
 		/*Reply=*/{TEXT("op:string"), TEXT("count:int"), TEXT("blueprint_class_path:string"), TEXT("actors:array"), TEXT("requires_pie_restart:bool")},
 		/*Required=*/{TEXT("blueprint"), TEXT("base_actor_id"), TEXT("count_x"), TEXT("count_y")});
+	RegEditor(TEXT("spawn_box"), TEXT("scene"),
+		GameThreadHandler(&HandleSpawnBox),
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_id:string"), TEXT("actor_name:string"), TEXT("actor_path:string"), TEXT("was_existing:bool"), TEXT("requires_pie_restart:bool")},
+		/*Required=*/{TEXT("actor_id"), TEXT("location"), TEXT("size")});
 	RegEditor(TEXT("spawn_light"), TEXT("scene"),
 		GameThreadHandler(&HandleSpawnLight),
 		{TEXT("op:string"), TEXT("actor_id:string"), TEXT("actor_name:string"),
@@ -2119,6 +2157,7 @@ void UnregisterAll()
 	URLabOpRegistry::UnregisterHandler(TEXT("save_level"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_grid"));
+	URLabOpRegistry::UnregisterHandler(TEXT("spawn_box"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_light"));
 	URLabOpRegistry::UnregisterHandler(TEXT("destroy_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("set_actor_transform"));
