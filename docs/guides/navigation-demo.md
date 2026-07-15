@@ -116,6 +116,21 @@ assert s["state"] == "arrived"
 You can also call `SetNavGoal(WorldGoal)` (Blueprint) directly, or bind
 `OnNavGoalReached` / `OnNavGoalFailed`.
 
+### Scripted demo (one command)
+
+The whole setup above — floor, obstacles, navmesh bounds, robot, components,
+PIE — can be run as a single reproducible script (editor open, bridge up):
+
+```bash
+/home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python \
+    Scripts/demos/tidybot_nav_demo.py
+```
+
+It authors the scene with `spawn_box` / `spawn_nav_bounds`, attaches the
+components with `add_nav_stack`, drives a goal behind an obstacle wall, and
+asserts arrival + a real detour + off-mesh rejection. `--keep-open` leaves
+PIE running for inspection.
+
 ### Ops reference
 
 | Op (`client.runtime.…`) | Args | Reply |
@@ -148,26 +163,30 @@ grinding.
 
 ## Validation checklist (run once, in an editor session)
 
-This stack was implemented with per-task **compile verification**; the automation
-suite and the live E2E were **not executed** in the authoring session (the editor
-held the project lock). Run these once in a session that owns the editor:
+This stack was implemented with per-task **compile verification**. Items 1-2
+were completed in a session that owned the editor; items 3-5 are covered by
+the scripted demo (§Scripted demo) — run it in a session that owns the editor
+to exercise them end-to-end.
 
-1. **Automation suite** (close the editor first — the runner needs the project lock):
+1. ✅ **Automation suite** — green 2026-07-15:
    ```bash
    ./Scripts/build_and_test_linux.sh \
      --engine /home/stuart/UE_ROOT/UnrealEngine \
      --project "/home/stuart/Documents/Unreal Projects/Test/Test.uproject" \
      --filter "URLab.Nav"
    ```
-   Expect all nav tests green (`Result={Success}`): `URLab.Nav.Pursuit.*` (5),
-   `URLab.Nav.BaseDrive.*` (6), `URLab.Nav.Component.*` (5), `URLab.Nav.Ops.*` (3).
-2. **Sign check** — if `URLab.Nav.BaseDrive.DriveWorldY` or `…YawThenForward`
-   fails on an inverted axis, flip the test rig's `joint_y` slide axis from
-   `(0,-1,0)` to `(0,1,0)` (the MuJoCo `d->xpos` assertion is the source of truth
-   for the sign) and re-run. The servo code itself is convention-free.
+   All nav tests green (`Result={Success}`): `URLab.Nav.Pursuit.*` (5),
+   `URLab.Nav.BaseDrive.*` (6), `URLab.Nav.Component.*` (5), `URLab.Nav.Ops.*` (6).
+2. ✅ **Sign check** — `joint_y` sign confirmed correct; `URLab.Nav.BaseDrive.DriveWorldY`
+   / `…YawThenForward` passed as-is. (If this ever regresses: flip the test
+   rig's `joint_y` slide axis from `(0,-1,0)` to `(0,1,0)` — the MuJoCo
+   `d->xpos` assertion is the source of truth for the sign. The servo code
+   itself is convention-free.)
 3. **Manual WASD** drive (§Driving) — base moves, arm untouched.
-4. **E2E** (§Autonomous) — robot detours around an obstacle, decelerates, stops
-   within 15 cm; `get_nav_status` reaches `arrived`.
-5. **Failure paths** — `set_nav_goal` into an obstacle → `accepted: false`; wedge
-   the robot against a wall with a tight `StuckTimeout` → status `failed`, robot
-   at rest (no force grinding).
+4. **E2E** — run `Scripts/demos/tidybot_nav_demo.py` (§Scripted demo): robot
+   detours around an obstacle, decelerates, stops within `ACCEPT_DIST`;
+   `get_nav_status` reaches `arrived`.
+5. **Failure paths** — covered by the scripted demo's off-mesh phase
+   (`set_nav_goal` into the wall → `accepted: false`). Wedging the robot
+   against a wall with a tight `StuckTimeout` to observe `failed` + at-rest
+   behavior is not scripted; still a manual check.
