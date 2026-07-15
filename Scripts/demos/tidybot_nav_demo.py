@@ -9,7 +9,9 @@ bounds), imports + spawns the TidyBot, attaches the nav stack
      get_nav_status reaches 'arrived', final distance <= ACCEPT_DIST, and the
      sampled track detoured (max |y| >= DETOUR_MIN_Y — the straight line to the
      goal has y == 0).
-  2. OFF-MESH    — set_nav_goal inside the wall; accept when accepted == false.
+  2. OFF-MESH    — set_nav_goal beyond the floor/navmesh extent (genuinely
+     more than the 1 m projection tolerance from any navmesh point); accept
+     when accepted == false.
 
 Run with the bridge venv's python while the editor is open:
     /home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python \
@@ -45,8 +47,14 @@ OBSTACLES = [
 ]
 NAV_BOUNDS = dict(center=(0.0, 0.0, 0.5), extent=(12.0, 12.0, 2.0))
 
-GOAL = (4.0, 0.0)          # behind the wall
-OFFMESH_GOAL = (2.0, 0.0)  # inside the wall
+GOAL = (4.0, 0.0)           # behind the wall
+# Genuinely off-mesh, not merely "inside an obstacle": UMjNavComponent::
+# SetNavGoal projects with a 1 m horizontal ProjectPointToNavigation
+# tolerance, so a goal at the wall's center (x=2.0) snaps onto the nearby
+# navmesh and gets accepted. The floor is 20 m full-extent (+-10 m from
+# origin) and the nav bounds are +-12 m, so x=14.0 is beyond both the floor
+# and the navmesh -- more than 1 m from any navmesh point.
+OFFMESH_GOAL = (14.0, 0.0)  # beyond the floor/navmesh extent
 ACCEPT_DIST = 0.20         # m: acceptance_radius (0.15) + slack
 DETOUR_MIN_Y = 1.0         # m: sampled |y| must exceed this at least once
 TIMEOUT_S = 90.0
@@ -132,14 +140,32 @@ def main() -> None:
         log("entering PIE (sim.start)")
         client.sim.start(timeout_s=180.0)
         try:
-            client.runtime.set_mode("live")
+            mode = client.runtime.set_mode("live")
+            log(f"set_mode(live) -> {mode}")
         except URLabRPCError as exc:
-            log(f"set_mode(live) warning: {exc}")
+            log(f"set_mode(live) warning: {exc} (PIE defaults to live, continuing)")
         time.sleep(2.0)  # let physics settle on spawn
+
+        # set_nav_goal/get_nav_status resolve the articulation server-side by
+        # Art->GetName() (the UE actor NAME), NOT by the actor_id spawn_actor
+        # stashes as a tag -- spawn_actor never renames the actor. So we must
+        # look up the runtime name/prefix from client.articulations (keyed by
+        # UE name/prefix) rather than reusing ACTOR_ID here. ACTOR_ID stays
+        # correct for find_actors(in_pie=True) in robot_xy(), which filters
+        # client-side on actor_id -- a different, correctly-matching path.
+        log(f"PIE ready; articulations={list(client.articulations)}")
+        art = client.articulations.get("tidybot")
+        if art is None:
+            arts = list(client.articulations.values())
+            art = arts[0] if arts else None
+        if art is None:
+            fail(f"no articulation found after PIE start (articulations={list(client.articulations)})")
+        nav_articulation = art.prefix
+        log(f"nav articulation name={nav_articulation!r}")
 
         # ---- Phase 4: happy path ------------------------------------------------
         log(f"set_nav_goal {GOAL}")
-        r = client.runtime.set_nav_goal(articulation=ACTOR_ID, x=GOAL[0], y=GOAL[1])
+        r = client.runtime.set_nav_goal(articulation=nav_articulation, x=GOAL[0], y=GOAL[1])
         if not r.get("accepted"):
             fail(f"happy-path goal rejected: {r}")
 
@@ -147,7 +173,7 @@ def main() -> None:
         state = "navigating"
         deadline = time.time() + TIMEOUT_S
         while time.time() < deadline:
-            s = client.runtime.get_nav_status(articulation=ACTOR_ID)
+            s = client.runtime.get_nav_status(articulation=nav_articulation)
             state = s["state"]
             x, y = robot_xy(client)
             max_abs_y = max(max_abs_y, abs(y))
@@ -158,7 +184,7 @@ def main() -> None:
 
         if state != "arrived":
             fail(f"did not arrive (state={state})")
-        s = client.runtime.get_nav_status(articulation=ACTOR_ID)
+        s = client.runtime.get_nav_status(articulation=nav_articulation)
         if s["distance_to_goal"] > ACCEPT_DIST:
             fail(f"arrived but distance {s['distance_to_goal']:.2f} > {ACCEPT_DIST}")
         if max_abs_y < DETOUR_MIN_Y:
@@ -167,9 +193,9 @@ def main() -> None:
         log(f"ARRIVED, detour max |y| = {max_abs_y:.2f} m")
 
         # ---- Phase 5: off-mesh reject -------------------------------------------
-        log(f"off-mesh goal {OFFMESH_GOAL} (inside the wall)")
+        log(f"off-mesh goal {OFFMESH_GOAL} (beyond the floor/navmesh extent)")
         r = client.runtime.set_nav_goal(
-            articulation=ACTOR_ID, x=OFFMESH_GOAL[0], y=OFFMESH_GOAL[1])
+            articulation=nav_articulation, x=OFFMESH_GOAL[0], y=OFFMESH_GOAL[1])
         if r.get("accepted"):
             fail("off-mesh goal was accepted — expected rejection")
         log("off-mesh goal correctly rejected")
