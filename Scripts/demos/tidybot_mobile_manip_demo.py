@@ -85,8 +85,8 @@ def robot_xy(client, actor_id: str):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="tcp://localhost")
-    ap.add_argument("--port", type=int, default=5560,
-                    help="direct step-server port (mink-demo default)")
+    ap.add_argument("--port", type=int, default=5559,
+                    help="direct step-server port (bridge StepPort default 5559)")
     ap.add_argument("--keep-open", action="store_true")
     args = ap.parse_args()
 
