@@ -462,6 +462,10 @@ TSharedPtr<FJsonObject> HandleSpawnNavBounds(const TSharedPtr<FJsonObject>& Req)
 			TEXT("spawn_nav_bounds requires 'extent' [3] half-extents (metres)"));
 	double TimeoutS = 10.0;
 	Req->TryGetNumberField(TEXT("timeout_s"), TimeoutS);
+	// Obstacle clearance: default 55 cm (~tidybot footprint + margin);
+	// pass agent_radius <= 0 to keep the level/CDO value.
+	double AgentRadiusCm = 55.0;
+	Req->TryGetNumberField(TEXT("agent_radius"), AgentRadiusCm);
 
 	const double T0 = FPlatformTime::Seconds();
 
@@ -469,7 +473,7 @@ TSharedPtr<FJsonObject> HandleSpawnNavBounds(const TSharedPtr<FJsonObject>& Req)
 	bool bWasExisting = false, bSpawnOk = false;
 	RunOnGameThreadSync([&]() -> TSharedPtr<FJsonObject> {
 		bSpawnOk = URLabLevelOps::SpawnNavBoundsSync(
-			Center, Extent, ActorName, bWasExisting, Err);
+			Center, Extent, (float)AgentRadiusCm, ActorName, bWasExisting, Err);
 		return nullptr;
 	});
 	if (!bSpawnOk)

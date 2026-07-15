@@ -163,6 +163,7 @@ URLABEDITOR_API bool SpawnBoxSync(
 URLABEDITOR_API bool SpawnNavBoundsSync(
 	const FVector& CenterMeters,
 	const FVector& ExtentMeters,
+	float AgentRadiusCm,
 	FString& OutActorName,
 	bool& OutWasExisting,
 	FString& OutError);

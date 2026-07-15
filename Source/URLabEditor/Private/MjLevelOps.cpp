@@ -46,6 +46,7 @@
 
 #include "NavigationSystem.h"
 #include "NavMesh/NavMeshBoundsVolume.h"
+#include "NavMesh/RecastNavMesh.h"
 #include "Builders/CubeBuilder.h"
 #include "ActorFactories/ActorFactory.h"
 
@@ -583,6 +584,7 @@ bool SpawnBoxSync(
 bool SpawnNavBoundsSync(
 	const FVector& CenterMeters,
 	const FVector& ExtentMeters,
+	float AgentRadiusCm,
 	FString& OutActorName,
 	bool& OutWasExisting,
 	FString& OutError)
@@ -654,6 +656,21 @@ bool SpawnNavBoundsSync(
 			FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
 	{
 		NavSys->OnNavigationBoundsUpdated(Vol);
+
+		// Deterministic obstacle clearance: override the RecastNavMesh's agent
+		// radius (ignore = AgentRadiusCm <= 0) so the bake keeps the path this
+		// far from obstacles, independent of the level's saved value. Set it
+		// BEFORE the rebuild; RebuildAll re-reads AgentRadius when it
+		// reconstructs the generator.
+		if (AgentRadiusCm > 0.f)
+		{
+			if (ARecastNavMesh* Recast = Cast<ARecastNavMesh>(
+					NavSys->GetDefaultNavDataInstance(FNavigationSystem::Create)))
+			{
+				Recast->AgentRadius = AgentRadiusCm;
+				Recast->RebuildAll();
+			}
+		}
 		NavSys->Build();
 	}
 	else

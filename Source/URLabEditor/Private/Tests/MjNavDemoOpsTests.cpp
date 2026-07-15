@@ -126,7 +126,7 @@ bool FMjNavDemoNavBounds::RunTest(const FString&)
 
 	TestTrue(*FString::Printf(TEXT("nav bounds ok: %s"), *Err),
 		URLabLevelOps::SpawnNavBoundsSync(
-			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), Name, bExisting, Err));
+			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), /*AgentRadiusCm=*/0.f, Name, bExisting, Err));
 	TestFalse(TEXT("fresh volume"), bExisting);
 
 	// Wait for the async build (editor tests may not tick the world; poll).
@@ -155,7 +155,7 @@ bool FMjNavDemoNavBounds::RunTest(const FString&)
 	// Idempotent: second call reuses the tagged volume.
 	TestTrue(TEXT("re-call ok"),
 		URLabLevelOps::SpawnNavBoundsSync(
-			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), Name, bExisting, Err));
+			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), /*AgentRadiusCm=*/0.f, Name, bExisting, Err));
 	TestTrue(TEXT("volume reused"), bExisting);
 
 	// Cleanup: floor + volume.

@@ -35,7 +35,10 @@ MODEL_XML = (
     Path(__file__).resolve().parents[1]
     / "mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"
 )
-ACTOR_ID = "tidybot_0"
+# A unique actor_id (NOT "tidybot_0") so we never collide with an IK tidybot the
+# user may already have in their project — the demo isolates into its own fresh
+# level anyway (see create_level below), but a distinct id keeps it unambiguous.
+ACTOR_ID = "nav_tidybot"
 
 # Scene layout (MuJoCo world metres). Wall at x=2 spans y in [-1.5, 1.5];
 # robot starts at origin; goal is straight through the wall.
@@ -110,6 +113,14 @@ def main() -> None:
 
     try:
         # ---- Phase 1: scene ----------------------------------------------------
+        # Isolate into a FRESH level. Critical: if another robot (e.g. an IK
+        # tidybot) shares the level, both compile into ONE MuJoCo model with
+        # duplicate joint_x/_y/_th names, and the base-drive resolves the wrong
+        # robot's joints -> it never drives. A dedicated level guarantees the nav
+        # robot is alone.
+        log("creating a fresh NavDemo level")
+        client.scene.create_level(name="NavDemo")
+
         log("authoring scene (floor, wall, nav bounds)")
         client.scene.spawn_box(**FLOOR)  # UE-only: MJCF plane is the physics floor
         for ob in OBSTACLES:
@@ -118,7 +129,9 @@ def main() -> None:
             # verified against RegEditor(TEXT("add_quick_convert"), TEXT("outliner"), ...)
             # in Source/URLabEditor/Private/MjEditorOpHandlers.cpp.
             client.outliner.add_quick_convert(target=ob["actor_id"], static=True)
-        r = client.scene.spawn_nav_bounds(**NAV_BOUNDS, timeout_s=30.0)
+        # agent_radius carves obstacle clearance into the navmesh so the path
+        # keeps its distance (55 cm ~ tidybot footprint + margin).
+        r = client.scene.spawn_nav_bounds(**NAV_BOUNDS, agent_radius=55.0, timeout_s=30.0)
         if not r.get("nav_data_present"):
             fail(f"navmesh did not bake: {r}")
         log(f"navmesh ready in {r.get('build_seconds', 0):.1f}s")
@@ -144,23 +157,29 @@ def main() -> None:
             log(f"set_mode(live) -> {mode}")
         except URLabRPCError as exc:
             log(f"set_mode(live) warning: {exc} (PIE defaults to live, continuing)")
+        # Live mode over the bridge is NEVER auto-unpaused (only Direct/Puppet
+        # are -- see the set_mode handler in RpcDispatcher.cpp). Without a manual
+        # Play/Simulate button press the MuJoCo engine stays paused and mj_step
+        # never runs -- the controllers write ctrl into a frozen sim. Un-pause it.
+        try:
+            client.runtime.set_paused(paused=False)
+        except URLabRPCError as exc:
+            log(f"set_paused warning: {exc}")
         time.sleep(2.0)  # let physics settle on spawn
 
         # set_nav_goal/get_nav_status resolve the articulation server-side by
         # Art->GetName() (the UE actor NAME), NOT by the actor_id spawn_actor
-        # stashes as a tag -- spawn_actor never renames the actor. So we must
-        # look up the runtime name/prefix from client.articulations (keyed by
-        # UE name/prefix) rather than reusing ACTOR_ID here. ACTOR_ID stays
-        # correct for find_actors(in_pie=True) in robot_xy(), which filters
-        # client-side on actor_id -- a different, correctly-matching path.
-        log(f"PIE ready; articulations={list(client.articulations)}")
-        art = client.articulations.get("tidybot")
-        if art is None:
-            arts = list(client.articulations.values())
-            art = arts[0] if arts else None
-        if art is None:
-            fail(f"no articulation found after PIE start (articulations={list(client.articulations)})")
-        nav_articulation = art.prefix
+        # stashes as a tag -- spawn_actor never renames the actor. Resolve the
+        # runtime name by matching our ACTOR_ID against find_actors(in_pie=True),
+        # which returns both actor_id and the (PIE-suffixed) name -- the same
+        # correctly-matching path robot_xy() uses.
+        nav_articulation = None
+        for row in client.outliner.find_actors(class_filter="AMjArticulation", in_pie=True):
+            if row.actor_id == ACTOR_ID:
+                nav_articulation = row.name
+                break
+        if nav_articulation is None:
+            fail(f"nav robot {ACTOR_ID!r} not found in the PIE world")
         log(f"nav articulation name={nav_articulation!r}")
 
         # ---- Phase 4: happy path ------------------------------------------------
