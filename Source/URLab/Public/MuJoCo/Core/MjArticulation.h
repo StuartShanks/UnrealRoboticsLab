@@ -524,8 +524,12 @@ public:
 	void AdoptRuntimeController(class UMjArticulationController* Ctrl);
 
 	/** The currently-bound controller (CachedController), or null when the
-	 *  default per-actuator ctrl path is active. Game-thread read — pairs
-	 *  with AdoptRuntimeController; not for the physics thread. */
+	 *  default per-actuator ctrl path is active. Safe to read on the game
+	 *  thread or a bridge worker thread (e.g. set_active_controller /
+	 *  configure_controller): AdoptRuntimeController's release fence plus the
+	 *  dispatcher's serialized RPC processing order the publish before any
+	 *  later read. NOT for the physics thread — ApplyControls has its own
+	 *  fenced read of CachedController. */
 	class UMjArticulationController* GetActiveController() const
 	{
 		return CachedController;

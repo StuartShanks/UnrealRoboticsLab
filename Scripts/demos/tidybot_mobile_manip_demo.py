@@ -191,22 +191,14 @@ def main() -> None:
             log(f"set_mode(direct) warning: {exc}")
         client.runtime.set_paused(False)
 
-        # NOTE (concern for the live run): configure_controller (which
-        # stream_target calls under the hood) resolves the target component
-        # via Art->FindComponentByClass<UMjArticulationController>() in
-        # HandleConfigureController (Source/URLab/Private/Bridge/
-        # RpcDispatcher.cpp) — a single first-match lookup over ALL attached
-        # UMjArticulationController subclasses. That is a DIFFERENT lookup
-        # from set_active_controller's Art->GetActiveController() /
-        # AdoptRuntimeController binding used just above. With both
-        # MjBaseDriveController (from add_nav_stack) and MjMinkIKController
-        # (from add_controller) attached simultaneously — new territory, no
-        # existing demo or test attaches both — it is untested which
-        # component FindComponentByClass resolves. If it resolves the base
-        # drive controller, every stream_target() call below will silently
-        # no-op (UMjArticulationController::ApplyConfigInternal defaults to
-        # an empty override, and MjBaseDriveController does not override it),
-        # and Phase B will simply never converge with no error surfaced.
+        # configure_controller (which stream_target calls under the hood)
+        # targets the ACTIVE (bound) controller — HandleConfigureController
+        # resolves Art->GetActiveController() first (RpcDispatcher.cpp),
+        # falling back to first-match only when nothing is bound. Because we
+        # switched the active controller to mink IK just above, the streamed
+        # targets below land on the mink controller even though the base-drive
+        # is also attached. (Before that fix, first-match could have hit the
+        # base-drive and silently dropped the IK target — see commit 67e5dfa.)
         tracker = Tracker(client)  # takes only `client`; resolves pinch_site/
                                    # joint_x/joint_y itself from client.model
         p0, q0 = tracker.ee_pose()
