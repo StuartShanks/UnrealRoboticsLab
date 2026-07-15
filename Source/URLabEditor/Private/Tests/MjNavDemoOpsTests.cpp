@@ -322,3 +322,67 @@ bool FMjNavDemoSetActiveController::RunTest(const FString&)
 	S.Cleanup();
 	return true;
 }
+
+// URLab.Nav.Ops.ConfigureControllerActive — configure_controller targets the
+// ACTIVE (bound) controller, not the first attached one, so it reaches the
+// mink IK when a base-drive is also attached (mobile manipulation).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavDemoConfigureControllerActive,
+	"URLab.Nav.Ops.ConfigureControllerActive",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavDemoConfigureControllerActive::RunTest(const FString&)
+{
+	FMjUESession S;
+	if (!S.Init())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	UMjBaseDriveController* Drive =
+		NewObject<UMjBaseDriveController>(S.Robot, TEXT("DriveCtrl"));
+	S.Robot->AddInstanceComponent(Drive);
+	Drive->RegisterComponent();
+	UMjPassthroughController* Pass =
+		NewObject<UMjPassthroughController>(S.Robot, TEXT("PassCtrl"));
+	S.Robot->AddInstanceComponent(Pass);
+	Pass->RegisterComponent();
+
+	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
+
+	auto Activate = [&](const TCHAR* Token) {
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetStringField(TEXT("op"), TEXT("set_active_controller"));
+		R->SetStringField(TEXT("session_id"), TEXT("test-session"));
+		R->SetStringField(TEXT("articulation"), S.Robot->GetName());
+		R->SetStringField(TEXT("controller"), Token);
+		return Disp->Dispatch(R);
+	};
+	auto Configure = [&]() {
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetStringField(TEXT("op"), TEXT("configure_controller"));
+		R->SetStringField(TEXT("session_id"), TEXT("test-session"));
+		R->SetStringField(TEXT("articulation"), S.Robot->GetName());
+		R->SetObjectField(TEXT("params"), MakeShared<FJsonObject>()); // empty
+		return Disp->Dispatch(R);
+	};
+
+	// Make the passthrough active; configure must resolve it (not the base drive).
+	Activate(TEXT("passthrough"));
+	TSharedPtr<FJsonObject> Reply = Configure();
+	FString Ctrl;
+	TestTrue(TEXT("controller field"), Reply->TryGetStringField(TEXT("controller"), Ctrl));
+	TestEqual(TEXT("configures the active passthrough"), Ctrl, TEXT("MjPassthroughController"));
+
+	// Switch active to the base drive; configure now follows it. Adopting the
+	// base drive Binds on the one-joint rig -> one expected harmless error.
+	AddExpectedError(TEXT("not found in compiled model"),
+		EAutomationExpectedErrorFlags::Contains, 1);
+	Activate(TEXT("base_drive"));
+	Reply = Configure();
+	Reply->TryGetStringField(TEXT("controller"), Ctrl);
+	TestEqual(TEXT("configures the active base drive"), Ctrl, TEXT("MjBaseDriveController"));
+
+	S.Cleanup();
+	return true;
+}

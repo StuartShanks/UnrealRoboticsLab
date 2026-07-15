@@ -198,7 +198,7 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 		/*Required=*/{TEXT("paused")});
 	Reg(TEXT("configure_controller"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleConfigureController(R); },
-		/*Reply=*/{TEXT("op:string"), TEXT("articulation:string"), TEXT("params:object")},
+		/*Reply=*/{TEXT("op:string"), TEXT("articulation:string"), TEXT("controller:string"), TEXT("params:object")},
 		/*Required=*/{TEXT("articulation"), TEXT("params")});
 	Reg(TEXT("set_sim_options"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetSimOptions(R); },
@@ -2136,7 +2136,13 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleConfigureController(const TSh
 	if (!Art)
 		return MakeError(TEXT("unknown_articulation"), ArtName);
 
-	UMjArticulationController* Ctrl = Art->FindComponentByClass<UMjArticulationController>();
+	// Target the currently-ACTIVE (bound) controller so this works when more
+	// than one controller is attached (mobile manipulation: base-drive + mink
+	// IK). Fall back to the first attached controller when none is bound yet
+	// (single-controller sessions, pre-bind) — preserves the prior behavior.
+	UMjArticulationController* Ctrl = Art->GetActiveController();
+	if (!Ctrl)
+		Ctrl = Art->FindComponentByClass<UMjArticulationController>();
 	if (!Ctrl)
 		return MakeError(TEXT("no_controller"), FString::Printf(TEXT("Articulation '%s' has no controller"), *ArtName));
 
@@ -2149,6 +2155,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleConfigureController(const TSh
 	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
 	Reply->SetStringField(TEXT("op"), TEXT("configure_controller_ok"));
 	Reply->SetStringField(TEXT("articulation"), ArtName);
+	Reply->SetStringField(TEXT("controller"), Ctrl->GetClass()->GetName());
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Ctrl->GetCurrentConfig(Out);
