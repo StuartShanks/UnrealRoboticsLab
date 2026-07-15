@@ -221,6 +221,10 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 		[this](auto& R) { return HandleGetNavStatus(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("state:string"), TEXT("distance_to_goal:float")},
 		/*Required=*/{TEXT("articulation")});
+	Reg(TEXT("set_active_controller"), EOpCategory::ManagerRequired, TEXT("runtime"),
+		[this](auto& R) { return HandleSetActiveController(R); },
+		/*Reply=*/{TEXT("op:string"), TEXT("active:string"), TEXT("was_active:bool")},
+		/*Required=*/{TEXT("articulation"), TEXT("controller")});
 	Reg(TEXT("set_qpos"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetQpos(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string"), TEXT("actor_id:string?"), TEXT("actor_name:string?"), TEXT("qpos:array"), TEXT("free_base_shortcut:bool")},
@@ -2798,6 +2802,133 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	Reply->SetStringField(TEXT("op"), TEXT("get_nav_status_ok"));
 	Reply->SetStringField(TEXT("state"), StateStr);
 	Reply->SetNumberField(TEXT("distance_to_goal"), DistanceToGoal);
+	return Reply;
+}
+
+// -----------------------------------------------------------------------------
+// set_active_controller — repoint the articulation's bound controller.
+//
+// Matches `controller` against the attached UMjArticulationController
+// subclasses' class names, normalised to lowercase with underscores removed
+// ("base_drive" -> MjBaseDriveController, "mink_ik" -> MjMinkIKController),
+// then AdoptRuntimeController() publishes the pick to the physics thread.
+// Sequencing (e.g. "only switch after nav arrives") is the caller's job.
+// -----------------------------------------------------------------------------
+TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetActiveController(
+	const TSharedPtr<FJsonObject>& Req)
+{
+	AAMjManager* Mgr = OwnerMgr.Get();
+	if (!Mgr)
+		return MakeError(TEXT("not_ready"), TEXT("Manager missing"));
+
+	FString ArtName, Token;
+	Req->TryGetStringField(TEXT("articulation"), ArtName);
+	Req->TryGetStringField(TEXT("controller"), Token);
+
+	AMjArticulation* Art = Mgr->GetArticulation(ArtName);
+	if (!Art)
+		return MakeError(TEXT("unknown_articulation"), ArtName);
+
+	// Normalise: lowercase, underscores stripped, so "base_drive" matches
+	// "MjBaseDriveController".
+	FString Needle = Token.ToLower().Replace(TEXT("_"), TEXT(""));
+	if (Needle.IsEmpty())
+		return MakeError(TEXT("missing_field"),
+			TEXT("set_active_controller requires non-empty 'controller'"));
+
+	// Component discovery + AdoptRuntimeController are game-thread-only.
+	struct FSwitchResult
+	{
+		FThreadSafeBool bWasActive{false};
+		FThreadSafeCounter Matches{0};
+		FString ActiveClass;      // written on the game thread before Trigger
+		FString AttachedClasses;  // for the unknown_controller message
+		FCriticalSection StrLock; // guards the two FStrings
+	};
+	TSharedPtr<FSwitchResult, ESPMode::ThreadSafe> Result =
+		MakeShared<FSwitchResult, ESPMode::ThreadSafe>();
+
+	auto DoSwitch = [Needle, Result](AMjArticulation* ArtPtr) {
+		TArray<UMjArticulationController*> Ctrls;
+		ArtPtr->GetComponents<UMjArticulationController>(Ctrls);
+		UMjArticulationController* Match = nullptr;
+		int32 N = 0;
+		FString All;
+		for (UMjArticulationController* C : Ctrls)
+		{
+			if (!C)
+				continue;
+			const FString Cls = C->GetClass()->GetName();
+			if (!All.IsEmpty())
+				All += TEXT(", ");
+			All += Cls;
+			if (Cls.ToLower().Replace(TEXT("_"), TEXT("")).Contains(Needle))
+			{
+				Match = C;
+				++N;
+			}
+		}
+		Result->Matches.Set(N);
+		{
+			FScopeLock Lock(&Result->StrLock);
+			Result->AttachedClasses = All;
+		}
+		if (N != 1 || !Match)
+			return;
+		if (ArtPtr->GetActiveController() == Match)
+		{
+			Result->bWasActive = true;
+		}
+		else
+		{
+			ArtPtr->AdoptRuntimeController(Match);
+		}
+		FScopeLock Lock(&Result->StrLock);
+		Result->ActiveClass = Match->GetClass()->GetName();
+	};
+
+	if (IsInGameThread())
+	{
+		DoSwitch(Art);
+	}
+	else
+	{
+		// Same stack-safety rules as HandleSetNavGoal: weak actor ptr,
+		// shared result, event by value — nothing borrowed from this frame.
+		TWeakObjectPtr<AMjArticulation> WeakArt(Art);
+		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+		AsyncTask(ENamedThreads::GameThread, [WeakArt, DoSwitch, Done]() {
+			if (AMjArticulation* ArtPtr = WeakArt.Get())
+				DoSwitch(ArtPtr);
+			Done->Trigger();
+		});
+		Done->Wait(2000);
+		FPlatformProcess::ReturnSynchEventToPool(Done);
+	}
+
+	const int32 N = Result->Matches.GetValue();
+	FString ActiveClass, Attached;
+	{
+		FScopeLock Lock(&Result->StrLock);
+		ActiveClass = Result->ActiveClass;
+		Attached = Result->AttachedClasses;
+	}
+	if (N == 0)
+		return MakeError(TEXT("unknown_controller"),
+			FString::Printf(TEXT("no attached controller matches '%s' (attached: %s)"),
+				*Token, Attached.IsEmpty() ? TEXT("none") : *Attached));
+	if (N > 1)
+		return MakeError(TEXT("ambiguous"),
+			FString::Printf(TEXT("'%s' matches %d controllers (attached: %s)"),
+				*Token, N, *Attached));
+	if (ActiveClass.IsEmpty())
+		return MakeError(TEXT("not_ready"),
+			TEXT("controller switch did not complete (game thread stalled?)"));
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("set_active_controller_ok"));
+	Reply->SetStringField(TEXT("active"), ActiveClass);
+	Reply->SetBoolField(TEXT("was_active"), Result->bWasActive);
 	return Reply;
 }
 

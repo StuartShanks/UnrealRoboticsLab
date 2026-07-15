@@ -33,7 +33,9 @@
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Input/MjTwistController.h"
 #include "MuJoCo/Components/Controllers/MjBaseDriveController.h"
+#include "MuJoCo/Components/Controllers/MjPassthroughController.h"
 #include "MuJoCo/Navigation/MjNavComponent.h"
+#include "Bridge/RpcDispatcher.h"
 
 namespace
 {
@@ -238,6 +240,84 @@ bool FMjNavDemoAddNavStack::RunTest(const FString&)
 									 S.Robot, P, Created, Existing, Warnings, Err));
 	TestEqual(TEXT("none created on re-call"), Created.Num(), 0);
 	TestEqual(TEXT("three existing"), Existing.Num(), 3);
+
+	S.Cleanup();
+	return true;
+}
+
+// URLab.Nav.Ops.SetActiveController — repoints the bound controller between
+// two attached UMjArticulationController components; idempotent; errors on
+// unknown/ambiguous tokens.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavDemoSetActiveController,
+	"URLab.Nav.Ops.SetActiveController",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavDemoSetActiveController::RunTest(const FString&)
+{
+	FMjUESession S;
+	if (!S.Init())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	// Attach two controllers. PostSetup already bound one (whichever
+	// FindComponentByClass found); the op must be able to select either.
+	UMjBaseDriveController* Drive =
+		NewObject<UMjBaseDriveController>(S.Robot, TEXT("DriveCtrl"));
+	S.Robot->AddInstanceComponent(Drive);
+	Drive->RegisterComponent();
+	UMjPassthroughController* Pass =
+		NewObject<UMjPassthroughController>(S.Robot, TEXT("PassCtrl"));
+	S.Robot->AddInstanceComponent(Pass);
+	Pass->RegisterComponent();
+
+	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
+	auto Req = [&](const TCHAR* Token) {
+		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetStringField(TEXT("op"), TEXT("set_active_controller"));
+		R->SetStringField(TEXT("session_id"), TEXT("test-session"));
+		R->SetStringField(TEXT("articulation"), S.Robot->GetName());
+		R->SetStringField(TEXT("controller"), Token);
+		return R;
+	};
+
+	// Select the passthrough.
+	TSharedPtr<FJsonObject> Reply = Disp->Dispatch(Req(TEXT("passthrough")));
+	FString Active;
+	TestTrue(TEXT("active field"), Reply->TryGetStringField(TEXT("active"), Active));
+	TestEqual(TEXT("passthrough active"), Active, TEXT("MjPassthroughController"));
+	TestTrue(TEXT("bound repointed"),
+		S.Robot->GetActiveController() == (UMjArticulationController*)Pass);
+
+	// Idempotent repeat.
+	Reply = Disp->Dispatch(Req(TEXT("passthrough")));
+	bool bWasActive = false;
+	TestTrue(TEXT("was_active field"), Reply->TryGetBoolField(TEXT("was_active"), bWasActive));
+	TestTrue(TEXT("was already active"), bWasActive);
+
+	// Switch to the base drive. Adopting it calls Bind(), which logs an
+	// Error because the one-joint test rig doesn't have "joint_x" — that's
+	// expected and harmless here: the op's contract is repointing, not
+	// successful base resolution (see MjTestHelpers.h FMjUESession docs).
+	AddExpectedError(TEXT("not found in compiled model"),
+		EAutomationExpectedErrorFlags::Contains, 1);
+	Reply = Disp->Dispatch(Req(TEXT("base_drive")));
+	Reply->TryGetStringField(TEXT("active"), Active);
+	TestEqual(TEXT("base drive active"), Active, TEXT("MjBaseDriveController"));
+	TestTrue(TEXT("bound repointed again"),
+		S.Robot->GetActiveController() == (UMjArticulationController*)Drive);
+
+	// Unknown token.
+	Reply = Disp->Dispatch(Req(TEXT("warp_drive")));
+	FString Code;
+	TestTrue(TEXT("error code"), Reply->TryGetStringField(TEXT("code"), Code));
+	TestEqual(TEXT("unknown_controller"), Code, TEXT("unknown_controller"));
+
+	// Ambiguous token ("controller" is a substring of both class names).
+	Reply = Disp->Dispatch(Req(TEXT("controller")));
+	Reply->TryGetStringField(TEXT("code"), Code);
+	TestEqual(TEXT("ambiguous"), Code, TEXT("ambiguous"));
 
 	S.Cleanup();
 	return true;

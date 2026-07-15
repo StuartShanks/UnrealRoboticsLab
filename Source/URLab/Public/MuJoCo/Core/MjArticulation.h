@@ -523,6 +523,14 @@ public:
 	 */
 	void AdoptRuntimeController(class UMjArticulationController* Ctrl);
 
+	/** The currently-bound controller (CachedController), or null when the
+	 *  default per-actuator ctrl path is active. Game-thread read — pairs
+	 *  with AdoptRuntimeController; not for the physics thread. */
+	class UMjArticulationController* GetActiveController() const
+	{
+		return CachedController;
+	}
+
 	/** @brief draws debug lines for collision geoms. */
 	void DrawDebugCollision();
 
