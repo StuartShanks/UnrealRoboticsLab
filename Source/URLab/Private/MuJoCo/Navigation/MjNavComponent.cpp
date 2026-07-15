@@ -21,10 +21,12 @@
 // CoACD (MIT), and libzmq (MPL 2.0). See ThirdPartyNotices.txt for details.
 
 #include "MuJoCo/Navigation/MjNavComponent.h"
+#include "Utils/URLabLogging.h" // LogURLab — nav warnings must be visible
 
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Components/Bodies/MjBody.h"
 #include "MuJoCo/Components/Bodies/MjWorldBody.h"
+#include "MuJoCo/Components/Joints/MjJoint.h"
 #include "MuJoCo/Input/MjTwistController.h"
 #include "NavigationSystem.h"
 #include "NavigationPath.h"
@@ -55,7 +57,38 @@ UMjBody* UMjNavComponent::ResolveBaseBody() const
 				return B;
 		return nullptr;
 	}
-	// Default: first body attached directly to the world body (the base link).
+	// Default: the body that OWNS the planar base joints. "First body attached
+	// to the world body" is unreliable — a scene may declare an IK mocap marker
+	// (e.g. the TidyBot's pinch_site_target) as the first world child, which is
+	// static, so nav would read a frozen pose and never close its feedback loop.
+	// Identify the base by its joints instead: find a joint named joint_x/_y/_th
+	// (suffix-tolerant for import prefixes) and return its owning UMjBody.
+	//
+	// NOTE: these three joint names are HARD-CODED — they are the fixed base
+	// convention shared with UMjBaseDriveController's default BaseJointNames.
+	// If the base joints are ever renamed, update both places (or set the
+	// component's BaseBodyName override above).
+	auto IsBaseJoint = [](const FString& N) {
+		for (const TCHAR* Suf : {TEXT("joint_x"), TEXT("joint_y"), TEXT("joint_th")})
+		{
+			const FString S(Suf);
+			if (N == S || N.EndsWith(FString(TEXT("_")) + S) || N.EndsWith(FString(TEXT("/")) + S))
+				return true;
+		}
+		return false;
+	};
+	for (UMjJoint* J : Art->GetJoints())
+	{
+		if (!J || !IsBaseJoint(J->GetMjName()))
+			continue;
+		for (USceneComponent* P = J->GetAttachParent(); P; P = P->GetAttachParent())
+			if (UMjBody* B = Cast<UMjBody>(P))
+				return B;
+	}
+	// Fallback: no body owns joint_x/_y/_th (e.g. a rig without the standard
+	// planar base joints) — use the first body attached to the world body (the
+	// pre-existing default). Only reached when the joint match above finds
+	// nothing, so it never re-introduces the mocap-marker pick for real tidybots.
 	for (UMjBody* B : Art->GetBodies())
 		if (B && Cast<UMjWorldBody>(B->GetAttachParent()))
 			return B;
@@ -79,26 +112,26 @@ bool UMjNavComponent::SetNavGoal(FVector WorldGoal)
 	UNavigationSystemV1* Nav = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
 	if (!Nav)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UMjNavComponent: no navigation system in world."));
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no navigation system in world."));
 		return false;
 	}
 	FVector Start;
 	float Yaw;
 	if (!GetBasePose(Start, Yaw))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UMjNavComponent: could not resolve base body pose."));
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: could not resolve base body pose."));
 		return false;
 	}
 	FNavLocation Projected;
 	if (!Nav->ProjectPointToNavigation(WorldGoal, Projected, FVector(100, 100, 500)))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UMjNavComponent: goal %s is off the navmesh."), *WorldGoal.ToString());
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: goal %s is off the navmesh."), *WorldGoal.ToString());
 		return false;
 	}
 	UNavigationPath* P = Nav->FindPathToLocationSynchronously(GetWorld(), Start, Projected.Location);
 	if (!P || !P->IsValid() || P->PathPoints.Num() < 1)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UMjNavComponent: no path to %s."), *WorldGoal.ToString());
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no path to %s."), *WorldGoal.ToString());
 		return false;
 	}
 	Path = P->PathPoints;

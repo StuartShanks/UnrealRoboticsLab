@@ -21,6 +21,7 @@
 // CoACD (MIT), and libzmq (MPL 2.0). See ThirdPartyNotices.txt for details.
 
 #include "MuJoCo/Components/Controllers/MjBaseDriveController.h"
+#include "Utils/URLabLogging.h" // LogURLab — Bind diagnostics must be visible
 
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Input/MjTwistController.h"
@@ -58,7 +59,7 @@ void UMjBaseDriveController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjAc
 	// component discovery is safe here; GetTwist() is thread-safe later.
 	TwistSource = GetOwner() ? GetOwner()->FindComponentByClass<UMjTwistController>() : nullptr;
 	if (!TwistSource)
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogURLab, Warning,
 			TEXT("UMjBaseDriveController '%s': no UMjTwistController sibling — base will hold position."),
 			*GetName());
 
@@ -67,7 +68,7 @@ void UMjBaseDriveController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjAc
 	BaseBindingIdx[0] = BaseBindingIdx[1] = BaseBindingIdx[2] = -1;
 	if (BaseJointNames.Num() != 3)
 	{
-		UE_LOG(LogTemp, Error,
+		UE_LOG(LogURLab, Error,
 			TEXT("UMjBaseDriveController '%s': BaseJointNames must have exactly 3 entries (X, Y, TH)."),
 			*GetName());
 		return;
@@ -77,7 +78,7 @@ void UMjBaseDriveController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjAc
 		const int32 Jid = ResolveJointByName(m, BaseJointNames[k]);
 		if (Jid < 0)
 		{
-			UE_LOG(LogTemp, Error,
+			UE_LOG(LogURLab, Error,
 				TEXT("UMjBaseDriveController '%s': base joint '%s' not found in compiled model."),
 				*GetName(), *BaseJointNames[k]);
 			return;
@@ -93,7 +94,7 @@ void UMjBaseDriveController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjAc
 		}
 		if (BaseBindingIdx[k] < 0)
 		{
-			UE_LOG(LogTemp, Error,
+			UE_LOG(LogURLab, Error,
 				TEXT("UMjBaseDriveController '%s': no actuator bound to base joint '%s'."),
 				*GetName(), *BaseJointNames[k]);
 			return;
