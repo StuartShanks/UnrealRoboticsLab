@@ -29,6 +29,11 @@
 #include "MjLevelOps.h"
 #include "NavigationSystem.h"
 #include "NavMesh/NavMeshBoundsVolume.h"
+#include "Tests/MjTestHelpers.h"
+#include "MuJoCo/Core/MjArticulation.h"
+#include "MuJoCo/Input/MjTwistController.h"
+#include "MuJoCo/Components/Controllers/MjBaseDriveController.h"
+#include "MuJoCo/Navigation/MjNavComponent.h"
 
 namespace
 {
@@ -162,5 +167,78 @@ bool FMjNavDemoNavBounds::RunTest(const FString&)
 			It->Destroy();
 			break;
 		}
+	return true;
+}
+
+// URLab.Nav.Ops.AddNavStack — attaches twist + base-drive + nav components with
+// params applied; idempotent; bad joint name warns instead of failing.
+//
+// NOTE: FMjUESession's rig has exactly ONE UMjJoint, whose UE object name is
+// "TestJoint" — this is also its compiled MuJoCo name (no prefix, no
+// collision, since it's the sole joint in the model). The brief's original
+// {"joint_x", "joint_y", "not_a_joint"} doesn't match this rig at all (0 of 3
+// would resolve, not 2 of 3). Adjusted here to {"TestJoint", "TestJoint",
+// "not_a_joint"} so exactly two entries genuinely resolve against the real
+// joint and exactly one is bogus — keeping the warning-count assertion a real
+// test of the advisory-warning path.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavDemoAddNavStack,
+	"URLab.Nav.Ops.AddNavStack",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavDemoAddNavStack::RunTest(const FString&)
+{
+	FMjUESession S;
+	if (!S.Init())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	URLabLevelOps::FNavStackParams P;
+	P.MaxSpeed = 1.25f;
+	P.AcceptanceRadiusM = 0.30f;
+	P.ActuatorMode = TEXT("velocity_direct");
+	P.BaseJoints = {TEXT("TestJoint"), TEXT("TestJoint"), TEXT("not_a_joint")};
+	P.bDebugDraw = true;
+
+	TArray<FString> Created, Existing, Warnings;
+	FString Err;
+	const bool bOk = URLabLevelOps::AddNavStackSync(
+		S.Robot, P, Created, Existing, Warnings, Err);
+	TestTrue(*FString::Printf(TEXT("AddNavStackSync ok: %s"), *Err), bOk);
+	TestEqual(TEXT("three created"), Created.Num(), 3);
+	TestEqual(TEXT("none existing"), Existing.Num(), 0);
+	TestEqual(TEXT("bad joint warned"), Warnings.Num(), 1);
+
+	UMjBaseDriveController* Drive =
+		S.Robot->FindComponentByClass<UMjBaseDriveController>();
+	UMjNavComponent* Nav = S.Robot->FindComponentByClass<UMjNavComponent>();
+	TestNotNull(TEXT("twist attached"),
+		S.Robot->FindComponentByClass<UMjTwistController>());
+	TestNotNull(TEXT("drive attached"), Drive);
+	TestNotNull(TEXT("nav attached"), Nav);
+	if (!Drive || !Nav)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TestTrue(TEXT("actuator mode applied"),
+		Drive->ActuatorMode == EMjBaseDriveActuatorMode::VelocityDirect);
+	TestEqual(TEXT("base joints applied"),
+		Drive->BaseJointNames[2], FString(TEXT("not_a_joint")));
+	TestEqual(TEXT("max speed applied"), Nav->MaxSpeed, 1.25f);
+	TestEqual(TEXT("acceptance m->cm"), Nav->AcceptanceRadius, 30.f);
+	TestTrue(TEXT("debug draw applied"), Nav->bDebugDraw);
+
+	// Idempotent re-call.
+	Created.Reset();
+	Existing.Reset();
+	Warnings.Reset();
+	TestTrue(TEXT("re-call ok"), URLabLevelOps::AddNavStackSync(
+									 S.Robot, P, Created, Existing, Warnings, Err));
+	TestEqual(TEXT("none created on re-call"), Created.Num(), 0);
+	TestEqual(TEXT("three existing"), Existing.Num(), 3);
+
+	S.Cleanup();
 	return true;
 }

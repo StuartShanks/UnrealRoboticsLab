@@ -8,6 +8,8 @@
 #include "CoreMinimal.h"
 #include "Dom/JsonValue.h"
 
+class AMjArticulation;
+
 /**
  * Editor-side helpers for the bridge's level / asset RPCs. Each function
  * is synchronous, returns true on success, and reports an error via
@@ -255,5 +257,32 @@ URLABEDITOR_API bool RemoveQuickConvertSync(
  *  ``..._C`` class path for spawn_actor) and ``short_name``. */
 URLABEDITOR_API bool ListBlueprintsSync(
 	TArray<TSharedPtr<FJsonValue>>& OutBlueprints,
+	FString& OutError);
+
+/** Optional tuning for add_nav_stack. Unset optionals keep component defaults.
+ *  Distances are MuJoCo metres (converted to component cm internally). */
+struct FNavStackParams
+{
+	TArray<FString> BaseJoints; // empty = component default (joint_x/y/th)
+	FString ActuatorMode;       // "", "position_integrate", "velocity_direct"
+	TOptional<float> MaxSpeed;
+	TOptional<float> MaxYawRate;
+	TOptional<float> LookaheadM;
+	TOptional<float> AcceptanceRadiusM;
+	TOptional<float> DecelRadiusM;
+	TOptional<float> StuckTimeout;
+	TOptional<bool> bDebugDraw;
+};
+
+/** Attach (or reuse) UMjTwistController + UMjBaseDriveController +
+ *  UMjNavComponent on the articulation and apply params. Unresolvable base
+ *  joint names are warnings, not failures (resolution is suffix-tolerant at
+ *  Bind; the warning is advisory). */
+URLABEDITOR_API bool AddNavStackSync(
+	AMjArticulation* Art,
+	const FNavStackParams& Params,
+	TArray<FString>& OutCreated,
+	TArray<FString>& OutExisting,
+	TArray<FString>& OutWarnings,
 	FString& OutError);
 } // namespace URLabLevelOps

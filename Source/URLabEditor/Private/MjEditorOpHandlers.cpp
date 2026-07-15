@@ -1985,6 +1985,90 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	Reply->SetArrayField(TEXT("warnings"), Warnings);
 	return Reply;
 }
+
+// ---- add_nav_stack — attach twist + base-drive + nav components ----
+
+TSharedPtr<FJsonObject> HandleAddNavStack(const TSharedPtr<FJsonObject>& Req)
+{
+	if (!GEditor)
+		return MakeJsonError(TEXT("not_in_editor"), TEXT("GEditor null"));
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+		return MakeJsonError(TEXT("no_world"), TEXT("editor world unavailable"));
+
+	// Same key-or-sole resolution as add_controller.
+	FString Key, Err;
+	bool bByName = false;
+	AMjArticulation* Art = nullptr;
+	if (ResolveActorKey(Req, Key, bByName, Err))
+	{
+		for (TActorIterator<AMjArticulation> It(World); It; ++It)
+		{
+			AMjArticulation* A = *It;
+			if (A && (A->ActorId.Equals(Key) || A->GetName().Equals(Key) || A->GetActorLabel().Equals(Key)))
+			{
+				Art = A;
+				break;
+			}
+		}
+		if (!Art)
+			return MakeJsonError(TEXT("unknown_articulation"), Key);
+	}
+	else
+	{
+		int32 N = 0;
+		for (TActorIterator<AMjArticulation> It(World); It; ++It)
+		{
+			Art = *It;
+			++N;
+		}
+		if (N == 0)
+			return MakeJsonError(TEXT("no_articulation"), TEXT("no AMjArticulation in level"));
+		if (N > 1)
+			return MakeJsonError(TEXT("ambiguous"), TEXT("multiple articulations; pass 'target'"));
+	}
+
+	URLabLevelOps::FNavStackParams P;
+	const TArray<TSharedPtr<FJsonValue>>* JointsArr = nullptr;
+	if (Req->TryGetArrayField(TEXT("base_joints"), JointsArr) && JointsArr)
+		for (const TSharedPtr<FJsonValue>& V : *JointsArr)
+			P.BaseJoints.Add(V->AsString());
+	Req->TryGetStringField(TEXT("actuator_mode"), P.ActuatorMode);
+	double D = 0.0;
+	if (Req->TryGetNumberField(TEXT("max_speed"), D))
+		P.MaxSpeed = (float)D;
+	if (Req->TryGetNumberField(TEXT("max_yaw_rate"), D))
+		P.MaxYawRate = (float)D;
+	if (Req->TryGetNumberField(TEXT("lookahead"), D))
+		P.LookaheadM = (float)D;
+	if (Req->TryGetNumberField(TEXT("acceptance_radius"), D))
+		P.AcceptanceRadiusM = (float)D;
+	if (Req->TryGetNumberField(TEXT("decel_radius"), D))
+		P.DecelRadiusM = (float)D;
+	if (Req->TryGetNumberField(TEXT("stuck_timeout"), D))
+		P.StuckTimeout = (float)D;
+	bool bDraw = false;
+	if (Req->TryGetBoolField(TEXT("debug_draw"), bDraw))
+		P.bDebugDraw = bDraw;
+
+	TArray<FString> Created, Existing, Warnings;
+	if (!URLabLevelOps::AddNavStackSync(Art, P, Created, Existing, Warnings, Err))
+		return MakeJsonError(TEXT("attach_failed"), Err);
+
+	auto ToJsonArr = [](const TArray<FString>& In) {
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FString& S : In)
+			Out.Add(MakeShared<FJsonValueString>(S));
+		return Out;
+	};
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("add_nav_stack_ok"));
+	Reply->SetStringField(TEXT("actor_name"), Art->GetName());
+	Reply->SetArrayField(TEXT("created"), ToJsonArr(Created));
+	Reply->SetArrayField(TEXT("existing"), ToJsonArr(Existing));
+	Reply->SetArrayField(TEXT("warnings"), ToJsonArr(Warnings));
+	return Reply;
+}
 } // namespace
 
 namespace URLabEditorOpHandlers
@@ -2136,6 +2220,10 @@ void RegisterAll()
 		GameThreadHandler(&HandleAddController),
 		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"), TEXT("tasks:int"), TEXT("limits:int"), TEXT("drive_joints:int"), TEXT("warnings:array")},
 		/*Required=*/{});
+	RegEditor(TEXT("add_nav_stack"), TEXT("scene"),
+		GameThreadHandler(&HandleAddNavStack),
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("created:array"), TEXT("existing:array"), TEXT("warnings:array")},
+		/*Required=*/{});
 	RegEditor(TEXT("remove_quick_convert"), TEXT("outliner"),
 		GameThreadHandler(&HandleRemoveQuickConvert),
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string")},
@@ -2243,6 +2331,7 @@ void UnregisterAll()
 	URLabOpRegistry::UnregisterHandler(TEXT("track_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("untrack"));
 	URLabOpRegistry::UnregisterHandler(TEXT("add_controller"));
+	URLabOpRegistry::UnregisterHandler(TEXT("add_nav_stack"));
 	StopTrackingCameraInternal();
 }
 } // namespace URLabEditorOpHandlers

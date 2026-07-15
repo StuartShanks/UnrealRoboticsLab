@@ -49,6 +49,10 @@
 #include "Builders/CubeBuilder.h"
 #include "ActorFactories/ActorFactory.h"
 
+#include "MuJoCo/Input/MjTwistController.h"
+#include "MuJoCo/Components/Controllers/MjBaseDriveController.h"
+#include "MuJoCo/Navigation/MjNavComponent.h"
+
 namespace URLabLevelOps
 {
 bool ImportXmlSync(
@@ -1551,6 +1555,127 @@ bool ActorHierarchySync(
 		return Node;
 	};
 	OutRoot = BuildNode(A);
+	return true;
+}
+
+namespace
+{
+// Advisory check mirroring the runtime's suffix-tolerant resolution
+// (MjBaseDriveController.cpp ResolveJointByName): exact, "_Name" or "/Name".
+bool NavStackJointNameKnown(AMjArticulation* Art, const FString& Name)
+{
+	TInlineComponentArray<UMjJoint*> Joints(Art);
+	const FString US = TEXT("_") + Name, SL = TEXT("/") + Name;
+	for (UMjJoint* J : Joints)
+	{
+		if (!J)
+			continue;
+		const FString S = J->GetMjName();
+		if (S == Name || S.EndsWith(US) || S.EndsWith(SL))
+			return true;
+	}
+	return false;
+}
+
+template <typename T>
+T* NavStackFindOrCreate(AMjArticulation* Art, const TCHAR* CompName,
+	TArray<FString>& OutCreated, TArray<FString>& OutExisting)
+{
+	if (T* Existing = Art->FindComponentByClass<T>())
+	{
+		OutExisting.Add(Existing->GetName());
+		return Existing;
+	}
+	T* C = NewObject<T>(Art, CompName);
+	if (!C)
+		return nullptr;
+	Art->AddInstanceComponent(C);
+	C->RegisterComponent();
+	OutCreated.Add(C->GetName());
+	return C;
+}
+} // namespace
+
+bool AddNavStackSync(
+	AMjArticulation* Art,
+	const FNavStackParams& Params,
+	TArray<FString>& OutCreated,
+	TArray<FString>& OutExisting,
+	TArray<FString>& OutWarnings,
+	FString& OutError)
+{
+	OutCreated.Reset();
+	OutExisting.Reset();
+	OutWarnings.Reset();
+	OutError.Empty();
+
+	if (!Art)
+	{
+		OutError = TEXT("null articulation");
+		return false;
+	}
+
+	UMjTwistController* Twist = NavStackFindOrCreate<UMjTwistController>(
+		Art, TEXT("TwistController"), OutCreated, OutExisting);
+	UMjBaseDriveController* Drive = NavStackFindOrCreate<UMjBaseDriveController>(
+		Art, TEXT("BaseDriveController"), OutCreated, OutExisting);
+	UMjNavComponent* Nav = NavStackFindOrCreate<UMjNavComponent>(
+		Art, TEXT("NavComponent"), OutCreated, OutExisting);
+	if (!Twist || !Drive || !Nav)
+	{
+		OutError = TEXT("NewObject returned null");
+		return false;
+	}
+
+	if (Params.BaseJoints.Num() > 0)
+	{
+		if (Params.BaseJoints.Num() != 3)
+		{
+			OutError = TEXT("base_joints must have exactly 3 entries (X, Y, TH)");
+			return false;
+		}
+		Drive->BaseJointNames = Params.BaseJoints;
+	}
+	for (const FString& N : Drive->BaseJointNames)
+	{
+		if (!NavStackJointNameKnown(Art, N))
+			OutWarnings.Add(FString::Printf(
+				TEXT("base joint '%s' not found on actor (advisory — Bind "
+					 "resolves against the compiled model)"),
+				*N));
+	}
+
+	if (!Params.ActuatorMode.IsEmpty())
+	{
+		if (Params.ActuatorMode == TEXT("position_integrate"))
+			Drive->ActuatorMode = EMjBaseDriveActuatorMode::PositionIntegrate;
+		else if (Params.ActuatorMode == TEXT("velocity_direct"))
+			Drive->ActuatorMode = EMjBaseDriveActuatorMode::VelocityDirect;
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("unknown actuator_mode '%s' (position_integrate | "
+					 "velocity_direct)"),
+				*Params.ActuatorMode);
+			return false;
+		}
+	}
+
+	if (Params.MaxSpeed.IsSet())
+		Nav->MaxSpeed = Params.MaxSpeed.GetValue();
+	if (Params.MaxYawRate.IsSet())
+		Nav->MaxYawRate = Params.MaxYawRate.GetValue();
+	if (Params.LookaheadM.IsSet())
+		Nav->LookaheadDist = Params.LookaheadM.GetValue() * 100.f;
+	if (Params.AcceptanceRadiusM.IsSet())
+		Nav->AcceptanceRadius = Params.AcceptanceRadiusM.GetValue() * 100.f;
+	if (Params.DecelRadiusM.IsSet())
+		Nav->DecelRadius = Params.DecelRadiusM.GetValue() * 100.f;
+	if (Params.StuckTimeout.IsSet())
+		Nav->StuckTimeout = Params.StuckTimeout.GetValue();
+	if (Params.bDebugDraw.IsSet())
+		Nav->bDebugDraw = Params.bDebugDraw.GetValue();
+
 	return true;
 }
 } // namespace URLabLevelOps
