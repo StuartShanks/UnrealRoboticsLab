@@ -567,6 +567,11 @@ bool SpawnBoxSync(
 		SMC->SetMaterial(0, Mat);
 	}
 	SMC->SetMobility(EComponentMobility::Static);
+	// Explicit, not inherited: the navmesh bake depends on both of these, so
+	// we set them ourselves rather than relying on UStaticMeshComponent's
+	// engine defaults (which could drift).
+	SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	SMC->SetCanEverAffectNavigation(true);
 	Box->SetActorScale3D(UEScale);
 	Box->Tags.AddUnique(FName(*MakeActorIdTag(ActorId)));
 

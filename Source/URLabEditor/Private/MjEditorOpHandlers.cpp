@@ -2220,6 +2220,8 @@ void RegisterAll()
 		GameThreadHandler(&HandleAddController),
 		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"), TEXT("tasks:int"), TEXT("limits:int"), TEXT("drive_joints:int"), TEXT("warnings:array")},
 		/*Required=*/{});
+	// Deliberately under `scene`, not `ik` — unlike the sibling add_controller
+	// below, this is not a client.ik.add_nav_stack call.
 	RegEditor(TEXT("add_nav_stack"), TEXT("scene"),
 		GameThreadHandler(&HandleAddNavStack),
 		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("created:array"), TEXT("existing:array"), TEXT("warnings:array")},

@@ -168,7 +168,10 @@ URLABEDITOR_API bool SpawnNavBoundsSync(
 	FString& OutError);
 
 /** True when no navmesh build is in progress. bOutNavDataPresent reports
- *  whether nav data (a RecastNavMesh) exists in the editor world. */
+ *  whether nav data (a RecastNavMesh) exists in the editor world.
+ *  Caveat: this is an existence check (a RecastNavMesh instance exists and
+ *  no build is running), not a guarantee of non-empty tiles — correct today
+ *  only because the editor Build() call is synchronous. */
 URLABEDITOR_API bool IsNavBuildDone(bool& bOutNavDataPresent);
 
 /** Destroy a spawned actor by actor id (preferred) or actor name. */
