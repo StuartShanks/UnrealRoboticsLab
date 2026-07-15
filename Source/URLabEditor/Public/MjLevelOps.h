@@ -154,6 +154,21 @@ URLABEDITOR_API bool SpawnBoxSync(
 	bool& OutWasExisting,
 	FString& OutError);
 
+/** Spawn (or update — a single volume tagged 'URLabNavBounds' is reused) a
+ *  NavMeshBoundsVolume spanning center ± extent (MuJoCo metres), notify the
+ *  navigation system and trigger a rebuild. Does not wait for the build —
+ *  poll IsNavBuildDone. */
+URLABEDITOR_API bool SpawnNavBoundsSync(
+	const FVector& CenterMeters,
+	const FVector& ExtentMeters,
+	FString& OutActorName,
+	bool& OutWasExisting,
+	FString& OutError);
+
+/** True when no navmesh build is in progress. bOutNavDataPresent reports
+ *  whether nav data (a RecastNavMesh) exists in the editor world. */
+URLABEDITOR_API bool IsNavBuildDone(bool& bOutNavDataPresent);
+
 /** Destroy a spawned actor by actor id (preferred) or actor name. */
 URLABEDITOR_API bool DestroyActorSync(
 	const FString& ActorIdOrActorName,

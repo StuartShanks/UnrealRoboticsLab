@@ -44,6 +44,11 @@
 #include "Engine/Light.h"
 #include "Materials/Material.h"
 
+#include "NavigationSystem.h"
+#include "NavMesh/NavMeshBoundsVolume.h"
+#include "Builders/CubeBuilder.h"
+#include "ActorFactories/ActorFactory.h"
+
 namespace URLabLevelOps
 {
 bool ImportXmlSync(
@@ -564,6 +569,107 @@ bool SpawnBoxSync(
 	OutActorName = Box->GetName();
 	OutActorPath = Box->GetPathName();
 	return true;
+}
+
+bool SpawnNavBoundsSync(
+	const FVector& CenterMeters,
+	const FVector& ExtentMeters,
+	FString& OutActorName,
+	bool& OutWasExisting,
+	FString& OutError)
+{
+	OutActorName.Empty();
+	OutWasExisting = false;
+	OutError.Empty();
+
+	if (!GEditor)
+	{
+		OutError = TEXT("GEditor null");
+		return false;
+	}
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		OutError = TEXT("editor world unavailable");
+		return false;
+	}
+	if (ExtentMeters.GetMin() <= 0.0)
+	{
+		OutError = TEXT("extent components must be > 0");
+		return false;
+	}
+
+	double MjPos[3] = {CenterMeters.X, CenterMeters.Y, CenterMeters.Z};
+	const FVector UECenter = MjUtils::MjToUEPosition(MjPos);
+
+	static const FName NavBoundsTag(TEXT("URLabNavBounds"));
+	ANavMeshBoundsVolume* Vol = nullptr;
+	for (TActorIterator<ANavMeshBoundsVolume> It(World); It; ++It)
+	{
+		if (It->Tags.Contains(NavBoundsTag))
+		{
+			Vol = *It;
+			OutWasExisting = true;
+			break;
+		}
+	}
+	if (!Vol)
+	{
+		FActorSpawnParameters Params;
+		Params.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		Vol = World->SpawnActor<ANavMeshBoundsVolume>(
+			UECenter, FRotator::ZeroRotator, Params);
+		if (!Vol)
+		{
+			OutError = TEXT("SpawnActor returned null for ANavMeshBoundsVolume");
+			return false;
+		}
+		Vol->Tags.AddUnique(NavBoundsTag);
+	}
+	else
+	{
+		Vol->SetActorLocation(UECenter);
+	}
+
+	// Size the brush exactly the way the editor's Place tool does.
+	UCubeBuilder* Builder = NewObject<UCubeBuilder>();
+	Builder->X = ExtentMeters.X * 200.0; // full size, cm
+	Builder->Y = ExtentMeters.Y * 200.0;
+	Builder->Z = ExtentMeters.Z * 200.0;
+	UActorFactory::CreateBrushForVolumeActor(Vol, Builder);
+
+	OutActorName = Vol->GetName();
+
+	if (UNavigationSystemV1* NavSys =
+			FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
+	{
+		NavSys->OnNavigationBoundsUpdated(Vol);
+		NavSys->Build();
+	}
+	else
+	{
+		OutError = TEXT("no navigation system in editor world");
+		return false;
+	}
+	return true;
+}
+
+bool IsNavBuildDone(bool& bOutNavDataPresent)
+{
+	bOutNavDataPresent = false;
+	if (!GEditor)
+		return true;
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+		return true;
+	UNavigationSystemV1* NavSys =
+		FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	if (!NavSys)
+		return true;
+	bOutNavDataPresent =
+		(NavSys->GetDefaultNavDataInstance(FNavigationSystem::DontCreate) != nullptr);
+	return !NavSys->IsNavigationBuildInProgress();
 }
 
 namespace

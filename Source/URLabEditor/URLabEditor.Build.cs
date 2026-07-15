@@ -57,6 +57,7 @@ public class URLabEditor : ModuleRules
 			"RenderCore",
 			"DesktopPlatform",
 			"Kismet",
+			"NavigationSystem",
 			"ToolMenus",
 			// Required to include URLab's public MjTwistController.h, which
 			// transitively includes InputActionValue.h. URLab depends on

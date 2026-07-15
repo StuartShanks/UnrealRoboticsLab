@@ -27,6 +27,8 @@
 #include "Engine/StaticMeshActor.h"
 #include "EngineUtils.h"
 #include "MjLevelOps.h"
+#include "NavigationSystem.h"
+#include "NavMesh/NavMeshBoundsVolume.h"
 
 namespace
 {
@@ -96,5 +98,69 @@ bool FMjNavDemoSpawnBox::RunTest(const FString&)
 	Box = NavDemoFindBoxByTag(World, TEXT("navdemo_box_test"));
 	if (Box)
 		Box->Destroy();
+	return true;
+}
+
+// URLab.Nav.Ops.NavBounds — a floor box + spawn_nav_bounds produce nav data;
+// a point on the floor projects onto the navmesh; re-call reuses the volume.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavDemoNavBounds,
+	"URLab.Nav.Ops.NavBounds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavDemoNavBounds::RunTest(const FString&)
+{
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	TestNotNull(TEXT("editor world"), World);
+
+	// Floor: 10x10x0.2 m, top at MJ z=0.
+	FString Name, Path, Err;
+	bool bExisting = false;
+	TestTrue(TEXT("floor spawns"),
+		URLabLevelOps::SpawnBoxSync(TEXT("navdemo_floor_test"),
+			FVector(0, 0, -0.1), FVector(10.0, 10.0, 0.2), 0.0,
+			Name, Path, bExisting, Err));
+
+	TestTrue(*FString::Printf(TEXT("nav bounds ok: %s"), *Err),
+		URLabLevelOps::SpawnNavBoundsSync(
+			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), Name, bExisting, Err));
+	TestFalse(TEXT("fresh volume"), bExisting);
+
+	// Wait for the async build (editor tests may not tick the world; poll).
+	bool bNavData = false;
+	const double Deadline = FPlatformTime::Seconds() + 30.0;
+	while (FPlatformTime::Seconds() < Deadline)
+	{
+		if (URLabLevelOps::IsNavBuildDone(bNavData) && bNavData)
+			break;
+		FPlatformProcess::Sleep(0.1);
+	}
+	TestTrue(TEXT("nav data present after build"), bNavData);
+
+	UNavigationSystemV1* NavSys =
+		FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	TestNotNull(TEXT("nav system exists"), NavSys);
+	if (NavSys)
+	{
+		FNavLocation Projected;
+		// UE cm: a point 1 m above the floor centre projects down onto it.
+		const bool bOnMesh = NavSys->ProjectPointToNavigation(
+			FVector(0, 0, 100.0), Projected, FVector(200, 200, 500));
+		TestTrue(TEXT("floor point is on the navmesh"), bOnMesh);
+	}
+
+	// Idempotent: second call reuses the tagged volume.
+	TestTrue(TEXT("re-call ok"),
+		URLabLevelOps::SpawnNavBoundsSync(
+			FVector(0, 0, 0.5), FVector(6.0, 6.0, 2.0), Name, bExisting, Err));
+	TestTrue(TEXT("volume reused"), bExisting);
+
+	// Cleanup: floor + volume.
+	if (AStaticMeshActor* Floor = NavDemoFindBoxByTag(World, TEXT("navdemo_floor_test")))
+		Floor->Destroy();
+	for (TActorIterator<ANavMeshBoundsVolume> It(World); It; ++It)
+		if (It->Tags.Contains(FName(TEXT("URLabNavBounds"))))
+		{
+			It->Destroy();
+			break;
+		}
 	return true;
 }

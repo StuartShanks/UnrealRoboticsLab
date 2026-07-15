@@ -449,6 +449,59 @@ TSharedPtr<FJsonObject> HandleSpawnBox(const TSharedPtr<FJsonObject>& Req)
 	return Reply;
 }
 
+// spawn_nav_bounds self-marshals (begin_pie pattern): spawn + build-trigger on
+// the game thread, then poll from the worker so the editor keeps ticking.
+TSharedPtr<FJsonObject> HandleSpawnNavBounds(const TSharedPtr<FJsonObject>& Req)
+{
+	FVector Center, Extent;
+	if (!ReadVec3(Req, TEXT("center"), Center, FVector::ZeroVector))
+		return MakeJsonError(TEXT("missing_field"),
+			TEXT("spawn_nav_bounds requires 'center' [3] (MuJoCo metres)"));
+	if (!ReadVec3(Req, TEXT("extent"), Extent, FVector::OneVector))
+		return MakeJsonError(TEXT("missing_field"),
+			TEXT("spawn_nav_bounds requires 'extent' [3] half-extents (metres)"));
+	double TimeoutS = 10.0;
+	Req->TryGetNumberField(TEXT("timeout_s"), TimeoutS);
+
+	const double T0 = FPlatformTime::Seconds();
+
+	FString ActorName, Err;
+	bool bWasExisting = false, bSpawnOk = false;
+	RunOnGameThreadSync([&]() -> TSharedPtr<FJsonObject> {
+		bSpawnOk = URLabLevelOps::SpawnNavBoundsSync(
+			Center, Extent, ActorName, bWasExisting, Err);
+		return nullptr;
+	});
+	if (!bSpawnOk)
+		return MakeJsonError(TEXT("spawn_failed"), Err);
+
+	bool bNavData = false, bDone = false;
+	const double Deadline = FPlatformTime::Seconds() + TimeoutS;
+	while (FPlatformTime::Seconds() < Deadline)
+	{
+		RunOnGameThreadSync([&]() -> TSharedPtr<FJsonObject> {
+			bDone = URLabLevelOps::IsNavBuildDone(bNavData);
+			return nullptr;
+		});
+		if (bDone && bNavData)
+			break;
+		FPlatformProcess::Sleep(0.2);
+	}
+	if (!(bDone && bNavData))
+		return MakeJsonError(TEXT("nav_build_timeout"),
+			FString::Printf(TEXT("navmesh not ready after %.1fs "
+								 "(nav_data_present=%d, build_done=%d)"),
+				TimeoutS, bNavData ? 1 : 0, bDone ? 1 : 0));
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("spawn_nav_bounds_ok"));
+	Reply->SetStringField(TEXT("actor_name"), ActorName);
+	Reply->SetBoolField(TEXT("was_existing"), bWasExisting);
+	Reply->SetBoolField(TEXT("nav_data_present"), bNavData);
+	Reply->SetNumberField(TEXT("build_seconds"), FPlatformTime::Seconds() - T0);
+	return Reply;
+}
+
 TSharedPtr<FJsonObject> HandleSpawnLight(const TSharedPtr<FJsonObject>& Req)
 {
 	FString Kind = TEXT("directional");
@@ -2022,6 +2075,12 @@ void RegisterAll()
 		GameThreadHandler(&HandleSpawnBox),
 		/*Reply=*/{TEXT("op:string"), TEXT("actor_id:string"), TEXT("actor_name:string"), TEXT("actor_path:string"), TEXT("was_existing:bool"), TEXT("requires_pie_restart:bool")},
 		/*Required=*/{TEXT("actor_id"), TEXT("location"), TEXT("size")});
+	// spawn_nav_bounds self-marshals (no GameThreadHandler wrapper): the
+	// spawn hops to the game thread, then the build-wait polls from the
+	// worker so the game thread keeps ticking the async navmesh build.
+	RegEditor(TEXT("spawn_nav_bounds"), TEXT("scene"), &HandleSpawnNavBounds,
+		/*Reply=*/{TEXT("op:string"), TEXT("actor_name:string"), TEXT("was_existing:bool"), TEXT("nav_data_present:bool"), TEXT("build_seconds:float")},
+		/*Required=*/{TEXT("center"), TEXT("extent")});
 	RegEditor(TEXT("spawn_light"), TEXT("scene"),
 		GameThreadHandler(&HandleSpawnLight),
 		{TEXT("op:string"), TEXT("actor_id:string"), TEXT("actor_name:string"),
@@ -2158,6 +2217,7 @@ void UnregisterAll()
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_grid"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_box"));
+	URLabOpRegistry::UnregisterHandler(TEXT("spawn_nav_bounds"));
 	URLabOpRegistry::UnregisterHandler(TEXT("spawn_light"));
 	URLabOpRegistry::UnregisterHandler(TEXT("destroy_actor"));
 	URLabOpRegistry::UnregisterHandler(TEXT("set_actor_transform"));
