@@ -241,6 +241,13 @@ def main() -> None:
                 client.sim.stop()
             except URLabRPCError:
                 pass
+        # close() reverts the server to live step mode before disconnecting —
+        # important because this client promoted itself to 'direct' for Phase B.
+        # Without it, --keep-open would leave the editor in direct/paused mode.
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
