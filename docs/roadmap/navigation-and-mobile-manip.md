@@ -110,8 +110,53 @@ upgrades, roughly in order:
    UE raycasts) → costmaps/SLAM from sensor data instead of ground truth. Only
    meaningful combined with #3.
 
-## Related, separate thread
+## Axis 3 — the task layer (agreed 2026-07-16, after axis-1 steps 0–3)
 
-Suction pickup (adhesion actuator + `set_suction` op + orientation-accurate
-reach) replaces finger grasping for pick tasks — orthogonal to both axes,
-composes with the swap architecture today and with TwistFollow later.
+The layer the step-3 debugging proved missing: the QP tracks and avoids, it
+does not plan — "when to reach", "drive first", "is the corridor free" are
+decisions ABOVE the controller. Architecture: **behavior tree over skills over
+controllers** (the standard mobile-manip shape). Skills are thin wrappers over
+existing bridge verbs (Drive = set_nav_goal + monitor; Reach = task gating +
+bounded-error ramp + plateau monitor); the tree sequences them with condition
+nodes. Upgrades slot INSIDE skills without changing the tree — the same
+interchangeability test as the twist bus:
+
+- Kinematic checks (condition nodes): reachability = bent-arm annulus
+  arithmetic (~0.3–0.85 m from the shoulder, mapped empirically); clearance =
+  a small `mj_geomDistance` corridor-sweep bridge op (same collision world as
+  the guard — dual-representation by construction).
+- Reach-skill upgrade path: clearance gate now → RRT-Connect in joint space
+  over MuJoCo collision checking (`URLabPlan` pure-math module, MoveIt-style
+  planner-proposes / QP-disposes / guard-insures) when clutter demands it.
+- Drive-skill upgrade path: MPPI twist producer (axis 2 #1).
+- Whole-body sampling MPC (MJPC-style) is the biggest hammer: upgrades
+  reference quality, does NOT replace the task layer. Not the first move.
+- Implementation: Python (py_trees or plain FSM) while behaviors are
+  experimental; graduate to UE StateTree (in-engine demos) or
+  BehaviorTree.CPP/py_trees_ros (if the ROS bridge happens). Skills are
+  bridge verbs, so the tree ports mechanically either way.
+
+## NEXT MILESTONE — suction pick v1 (scoped, awaiting brainstorm/spec)
+
+"Nav, grab, nav while holding" — the original ask — via suction, which
+collapses grasping into the validated Reach primitive (drive the EE target to
+the object; no grasp-pose synthesis, no finger choreography). Pieces:
+
+1. BT skeleton + `skills.py` (Drive / StowArm / Reach / Descend / Suction /
+   Lift) reproducing the guarded-reach demo as tree composition.
+2. The two kinematic checks above (one op, one function).
+3. `set_suction` runtime op + adhesion actuator (just another d->ctrl slot —
+   the pass-through idiom already carries it through any active controller);
+   contact/proximity check before engaging.
+4. MJCF surgery: 2f85 finger subtree → suction cup (one simple geom). Kills
+   the finger-envelope compromise (gripper becomes guardable at 2–3 cm — the
+   close-quarters clearance a tabletop pick needs); mink golden fixtures need
+   a once-over (EE frame moves).
+5. Design consequences already settled: pickable objects are EXCLUDED from
+   guard obstacle groups (the table stays guarded, the object doesn't — the
+   one-pair-per-limit-entry surface supports this); carried object rides the
+   frozen-arm hold (last-write-wins ctrl), weld-vs-adhesion decides drop
+   physics.
+
+Axis-1 steps 4–5 and axis 2 are NOT blockers for this milestone; their
+triggers (dynamic worlds, multi-agent) remain unmet.
