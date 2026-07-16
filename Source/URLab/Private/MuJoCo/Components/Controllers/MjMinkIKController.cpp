@@ -959,7 +959,17 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 		{
 			continue;
 		}
-		d->ctrl[ActId] = Comp->ResolveDesiredControl(Source);
+		const float PassVal = Comp->ResolveDesiredControl(Source);
+		d->ctrl[ActId] = PassVal;
+		// TEMP DIAG (suction pick): log the delivered value for the adhesion
+		// actuator so we can see the server-side ctrl the client mirror can't show.
+		static int32 PassThroughDiagCount = 0;
+		if (Comp->Type == EMjActuatorType::Adhesion && (PassThroughDiagCount++ % 200) == 0)
+		{
+			UE_LOG(LogURLabRuntime, Warning,
+				TEXT("[MinkIK PASSDIAG] adhesion '%s' comp=%p ActId=%d Source=%u -> d->ctrl=%.3f (Network=%.3f)"),
+				*Comp->GetMjName(), Comp, ActId, (uint32)Source, PassVal, Comp->ResolveDesiredControl(0));
+		}
 	}
 
 	// data.ctrl[actuator_ids] = configuration.q[dof_ids]

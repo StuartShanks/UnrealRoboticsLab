@@ -3035,6 +3035,9 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetSuction(const TSharedPtr<F
 				Match->SetNetworkControl(ValueF);
 				Result->Name = Match->GetMjName();
 				Result->bFound = true;
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[set_suction DIAG] set NetworkControl=%.3f on comp=%p '%s' (art=%p)"),
+					ValueF, Match, *Match->GetMjName(), ArtPtr);
 			}
 		}
 	};
