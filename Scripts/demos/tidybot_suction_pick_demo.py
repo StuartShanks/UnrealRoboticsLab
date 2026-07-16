@@ -99,8 +99,12 @@ class SuctionBlackboard(PickBlackboard):
 
 def suction_pick_controller_payload(obstacle_bodies: list) -> dict:
     """The twist-follow stack (tidybot_twist_follow_demo), EE frame switched
-    to the cup variant's `cup_site`, plus the two collision-avoidance guards:
-    the full arm chain at LINK_STANDOFF, and the cup at close quarters."""
+    to the cup variant's `cup_site`, plus the collision-avoidance guards:
+    the full arm chain at LINK_STANDOFF, the cup at close quarters, and the
+    2f85 mount plate (`base`) at close quarters too. `base` needs its own
+    guard because ResolveGeomGroup resolves a body name to that body's OWN
+    geoms only (no subtree recursion) — guarding `cup` does not protect its
+    parent `base`, which is a real collision mesh one link above the cup."""
     payload = twist_follow_controller_payload()
     payload["tasks"][0]["frame"] = "cup_site"
     payload["limits"] += [
@@ -117,6 +121,13 @@ def suction_pick_controller_payload(obstacle_bodies: list) -> dict:
             "geoms_b": obstacle_bodies,
             "min_distance": CUP_STANDOFF_M,
             "detection_distance": CUP_DETECTION_M,
+        },
+        {
+            "kind": "collision_avoidance",
+            "geoms_a": ["base"],          # the 2f85 mount plate — a real collision mesh
+            "geoms_b": obstacle_bodies,   # same obstacle set as the other guards (pick_box NOT included)
+            "min_distance": 0.04,
+            "detection_distance": 0.25,
         },
     ]
     return payload
