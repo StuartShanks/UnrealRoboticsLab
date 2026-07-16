@@ -13,7 +13,17 @@
 - Drive to an aligned, front-edge staging pose; reach top-down (cup points **down** — the `cup_site` quat orientation fix is confirmed); descend to **contact** (cup geom touching box geom, x/y aligned); `VerifyAttach` now reads the box's real **physics** z.
 - The adhesion **config** is correct: a pure-MuJoCo test grips the box with `margin=0.03 gap=0.03` on the cup geom + direct `ctrl=1.0`. Without margin/gap, adhesion produces zero force (the fix in `0374543`).
 
-## The open bug: the suction control value never reaches the actuator server-side
+## UPDATE (later same day) — suction DELIVERY root-caused + fixed; one narrower unknown remains
+
+The pointer diagnostic (commit `9b75c3f`) resolved the delivery question:
+- **Same instance, correct path.** `set_suction` sets `NetworkValue=1.0` on the *same* `UMjActuator` the mink reads (same `comp=%p`), `Source=0`, `d->ctrl=1.000` — on a clean sim.
+- **The real cause: a direct-mode `client.step()` ZEROS actuator NetworkValues server-side** (the step pushes the client's zero ctrl array). So every synced physics read (`synced_site_pose` / `_object_z`, which dip to direct + step) silently un-set an engaged suction. PASSDIAG proof: `Network=1.0` right after `set_suction`, then `0.0` after one synced read.
+- **Fixed demo-side** in commit `18a98e7`: a `_hold_suction()` helper re-asserts `set_suction(1.0)` after every stepping read in the grip/verify/carry phases. Verified live that `Network` now holds at `1.0` across the grip window (180 sustained samples).
+- **Proper engine fix (follow-up):** a direct-mode step should preserve actuator `NetworkValue`s it isn't explicitly overwriting (in `ZmqStep`/`ZmqSubscribeTransport`/the step handler). That removes the need for the demo-side re-asserts.
+
+**Narrower remaining unknown — does adhesion actually GRIP in the full pick?** After the re-assert fix, a clean run still failed VerifyAttach (`rose -0.012`, i.e. box moved slightly *down*) with suction confirmed held at 1.0. Adhesion is proven to grip in a *minimal* offline model (`margin=0.03 gap=0.03` + `ctrl=1.0`, `adhesion_offline3.py`), but a clean full-model / full-pick grip has NOT yet been observed. Confounders during testing: the light box keeps getting knocked/falling off the table across repeated failed runs (contaminates the next test), and the offline full-model harness wedges the box in the extended default-pose arm. **Next step:** one clean run — restart Simulate for a fresh table box, descend to solid contact, hold suction (fixed), lift, and read the box's PHYSICS z. If it still won't grip, suspects are (a) a contact-param / default-class difference in the full model vs the minimal offline model (check the cup geom's inherited condim/solref), (b) give the pick box its own `margin`/`gap`, (c) bump the adhesion `gain`. `grip_test2.py` (in the job tmp) is the isolated descend+grip+lift probe.
+
+## (original) The open bug: the suction control value never reaches the actuator server-side
 Server log while simulating (from the `9b75c3f` diagnostics):
 ```
 [MinkIK PASSDIAG] adhesion 'tidybot_suction_ue_C_0_suction' ActId=10 Source=0 -> d->ctrl=0.000 (Network=0.000)
