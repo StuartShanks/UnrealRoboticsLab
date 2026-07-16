@@ -2521,3 +2521,125 @@ bool FMjMinkIKTidybotCollisionAvoidanceFloor::RunTest(const FString&)
 	S.Cleanup();
 	return bOk;
 }
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.NonDrivePassThrough
+//   A bound controller replaces the articulation's default ctrl path entirely
+//   (the BaseDrive contract) — so the mink must pass non-drive actuator values
+//   (fingers, suction) through to d->ctrl. Encodes the latent gap where
+//   SetNetworkControl on the gripper was a silent no-op under a bound mink.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotNonDrivePassThrough,
+	"URLab.MinkIK.TidyBot.NonDrivePassThrough",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotNonDrivePassThrough::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Resolve the ten joints (base x/y/th + arm) -------------------------
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, JointNames[i]);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved"), JointNames[i]));
+			S.Cleanup();
+			return false;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// Resolve fingers_actuator (non-drive) + its component.
+	const int32 FingersActId = FindIdBySuffix(M, mjOBJ_ACTUATOR, M->nu, TEXT("fingers_actuator"));
+	if (!TestTrue(TEXT("fingers_actuator found"), FingersActId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// Minimal mink stack: posture only; DriveJoints = the ten joints (fingers excluded).
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKPassThrough"));
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+	Ctrl->Tasks = {Posture};
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = 1;
+	Ctrl->RegisterComponent();
+
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// Stage a network value on the fingers actuator, run one controller pass.
+	UMjActuator* Fingers = nullptr;
+	for (UMjActuator* A : Robot->GetActuators())
+		if (A && A->GetMjID() == FingersActId)
+		{
+			Fingers = A;
+			break;
+		}
+	if (!TestNotNull(TEXT("fingers actuator component"), Fingers))
+	{
+		S.Cleanup();
+		return false;
+	}
+	Fingers->SetNetworkControl(123.0f);
+	Ctrl->ComputeAndApply(M, D, 0);
+	TestEqual(TEXT("non-drive NetworkValue reaches d->ctrl under a bound mink"),
+		(double)D->ctrl[FingersActId], 123.0, 1e-6);
+	S.Cleanup();
+	return true;
+}

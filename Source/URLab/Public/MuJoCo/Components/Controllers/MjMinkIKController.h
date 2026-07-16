@@ -409,6 +409,16 @@ private:
 	TArray<int32> DriveCtrlIds;
 	TArray<int32> DriveQposAddrs;
 
+	/** Every actuator on the articulation, keyed by MuJoCo actuator id — captured
+	 *  verbatim from Bind()'s ActuatorIdMap, UNFILTERED by transmission type.
+	 *  The inherited Bindings array (MjArticulationController) only covers
+	 *  joint-transmission actuators (Bind() skips tendon/site/etc. transmissions
+	 *  with a warning), so tendon-driven actuators like a 2f85 gripper's
+	 *  "fingers_actuator" never appear there. ComputeAndApply's non-drive
+	 *  pass-through needs the full roster to honor the BaseDrive contract for
+	 *  every actuator, not just the joint-driven subset. */
+	TMap<int32, UMjActuator*> AllActuatorIdMap;
+
 	/** Sibling twist source for TwistFollow tasks; resolved in Bind, read on
 	 *  the physics thread via its thread-safe GetTwist() (BaseDrive pattern).
 	 *  Null when the actor has no twist controller — TwistFollow tasks then

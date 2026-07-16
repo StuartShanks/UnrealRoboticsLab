@@ -272,6 +272,11 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 {
 	Super::Bind(m, d, ActuatorIdMap);
 
+	// Captured verbatim (not the transmission-type-filtered Bindings) so the
+	// non-drive pass-through in ComputeAndApply can reach tendon/site-driven
+	// actuators too — see the member comment in the header.
+	AllActuatorIdMap = ActuatorIdMap;
+
 	Mink.Reset();
 	DriveCtrlIds.Reset();
 	DriveQposAddrs.Reset();
@@ -622,7 +627,7 @@ void UMjMinkIKController::SetIKTarget(int32 TaskIndex, FVector WorldPos, FQuat W
 	ManualTargets.Add(TaskIndex, T);
 }
 
-void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*/)
+void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 {
 	// Throttled diagnostics: first calls + every 2000th tell us this ran, what
 	// target it saw, and what it wrote — ground truth for remote debugging.
@@ -932,6 +937,25 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 				break;
 			}
 		}
+	}
+
+	// Pass-through for every non-drive actuator: a bound controller replaces
+	// the articulation's default ctrl path entirely (BaseDrive contract), so
+	// non-drive actuators (gripper, suction) must keep receiving their
+	// UI/network values through us — otherwise SetNetworkControl is a silent
+	// no-op while the mink is bound. Iterates AllActuatorIdMap (captured at
+	// Bind, unfiltered by transmission type) rather than the inherited
+	// Bindings array, which only covers joint-transmission actuators — a
+	// tendon-driven gripper (e.g. fingers_actuator) never appears in Bindings.
+	for (const TPair<int32, UMjActuator*>& Elem : AllActuatorIdMap)
+	{
+		const int32 ActId = Elem.Key;
+		UMjActuator* Comp = Elem.Value;
+		if (ActId < 0 || !Comp || DriveCtrlIds.Contains(ActId))
+		{
+			continue;
+		}
+		d->ctrl[ActId] = Comp->ResolveDesiredControl(Source);
 	}
 
 	// data.ctrl[actuator_ids] = configuration.q[dof_ids]
