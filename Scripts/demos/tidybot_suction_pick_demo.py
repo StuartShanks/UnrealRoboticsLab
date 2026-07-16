@@ -63,9 +63,20 @@ MODEL_XML = (
 ASSETS = Path(__file__).resolve().parent / "assets"
 ACTOR_ID = "sp_tidybot"  # unique — never tidybot_0 / nav_tidybot / mm_tidybot / tf_tidybot
 
-# The pick object: on the table top (top z=0.6, TABLE from tidybot_guarded_
-# reach_demo) + box half-height (0.05) + a 1 cm settle.
-PICK_LOCATION = (5.0, 0.0, 0.66)
+# The pick object: at the table's FRONT EDGE (table front face x=4.85; box
+# half-width 0.05 -> center 4.90 sits fully on the table with its front flush to
+# the edge) + box half-height (0.05) on the top (z=0.6) + a 1 cm settle. Front
+# edge, not mid-table, so a nav-parked base reaches it y-aligned and vertical —
+# a deep-table whole-body pick needs base *alignment* control (v1.1), not just
+# the base *closeness* free base-assist gave (it drifted off-center in y).
+PICK_LOCATION = (4.9, 0.0, 0.66)
+
+# Pick-approach staging: directly in front of the box, ALIGNED in y, as close as
+# the agent-radius-carved navmesh allows (table face 4.85 - 0.55 clearance =
+# ~4.30 walkable edge; 4.35 keeps a small margin). From here the fixed-base arm
+# reaches the front-edge box at ~0.59 m (inside its ~0.85 m envelope), straight
+# ahead and straight down.
+PICK_STAGING = (4.35, 0.0)
 
 # Guard tuning. The full arm chain gets the same standoff as the guarded-
 # reach sibling; the cup (no gripper envelope to hide behind) is guarded at
@@ -144,14 +155,20 @@ def build_tree(bb: SuctionBlackboard) -> py_trees.trees.BehaviourTree:
         memory=True,
         children=[
             ResolveAffordance("ResolveAffordance", bb, body_suffix="pick_box"),
-            Reachable("Reachable", bb, shoulder_xy=STAGING),
-            Drive("DriveToStaging", bb, STAGING),
+            Reachable("Reachable", bb, shoulder_xy=PICK_STAGING),
+            Drive("DriveToStaging", bb, PICK_STAGING),
             CorridorClear(
                 "CorridorClear", bb,
                 p_from=lambda: bb.affordance.waypoints[0],
                 p_to=lambda: bb.affordance.waypoints[2],
                 exclude_body_suffixes=CORRIDOR_EXCLUDE,
             ),
+            # No base-assist: the front-edge box is reachable from the aligned
+            # nav-staging pose with a fixed base, so the base stays locked and the
+            # descent is a clean, y-aligned, pure-vertical arm drop. (Free
+            # base-assist gave closeness but drifted the base off-center in y,
+            # descending beside the box; controlled base positioning for a
+            # deep-table pick is v1.1 — SetBaseAssist stays in urlab_skills for it.)
             ReachRamp("ReachRamp", bb, waypoints_key="pre_approach_waypoints", quat_key="q_cup"),
             DescendEngage("DescendEngage", bb),
             verify_attach,

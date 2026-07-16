@@ -140,6 +140,7 @@ class PickBlackboard:
     object_actor_id: str = ""
     ee_task: int = 0
     damping_task: int = 2
+    twist_task: int = 3            # twist-follow task spec index (base hold)
     affordance: object = None      # Affordance
     fail_reason: str = ""
     home_xy: tuple = (0.0, 0.0)
@@ -182,15 +183,22 @@ def synced_site_pose(client, site_suffix: str):
 
 
 def _object_z(client, object_actor_id: str) -> float:
-    """Read an object's world z via find_actors(in_pie=True), matched by
-    actor_id. find_actors returns the actor ROOT transform (not the MuJoCo
-    body) — per tidybot_mobile_manip_demo.py's robot_xy() caveat — but a
-    free-floating dynamic body pump-syncs its actor transform every tick, so
-    this tracks the live z of the pick object."""
-    for row in client.outliner.find_actors(in_pie=True):
-        if row.actor_id == object_actor_id:
-            return float(row.location[2])
-    raise RuntimeError(f"object {object_actor_id!r} not found via find_actors")
+    """Read the object's LIVE PHYSICS z (its MuJoCo body world pos via the synced
+    mirror). find_actors(in_pie=True) must NOT be used here: for a spawned free
+    body it returns the actor ROOT transform, which stays FROZEN at the spawn
+    location and does not track physics — confirmed live (actor z stuck at 0.66
+    while the physics body was on the floor at 0.05), so a lift is invisible to
+    it. The body is matched by actor_id suffix (import may prefix the name)."""
+    client.runtime.set_mode("direct")
+    client.step(n_steps=1)
+    m, d = client.model, client.data
+    bid = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_BODY, m.nbody, object_actor_id)
+    z = float(d.xpos[bid][2]) if bid >= 0 else None
+    client.runtime.set_mode("live")
+    client.runtime.set_paused(paused=False)
+    if bid < 0:
+        raise RuntimeError(f"object body {object_actor_id!r} not found in compiled model")
+    return z
 
 
 def _base_xy(client) -> np.ndarray:
@@ -420,6 +428,43 @@ class CorridorClear(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
+class SetBaseAssist(py_trees.behaviour.Behaviour):
+    """Relax (enabled=True) or restore (enabled=False) the base hold so the
+    whole-body QP can recruit the base to help the arm reach — the guarded
+    table-reach capability. ON drops the twist-follow and lazy-base damping
+    task costs so the EE frame task pulls the base forward the last few cm (the
+    base x table CollisionAvoidance limit stops it short of the surface); OFF
+    restores them for a stable carry. Uses the live task_costs surface (a sparse
+    map by spec index — orthogonal to task_enabled, so it does not disturb the
+    EE-task gating the reach skills manage). SUCCESS immediately."""
+
+    def __init__(self, name, bb, enabled: bool,
+                 assist_twist_cost: float = 0.02, assist_damping_cost: float = 0.05,
+                 hold_twist_cost: float = 1.0, hold_damping_cost: float = 5.0):
+        super().__init__(name)
+        self.bb = bb
+        self.enabled = enabled
+        self.assist_twist_cost = assist_twist_cost
+        self.assist_damping_cost = assist_damping_cost
+        self.hold_twist_cost = hold_twist_cost
+        self.hold_damping_cost = hold_damping_cost
+
+    def update(self):
+        bb = self.bb
+        tw = self.assist_twist_cost if self.enabled else self.hold_twist_cost
+        dp = self.assist_damping_cost if self.enabled else self.hold_damping_cost
+        try:
+            bb.client._rpc_configure_controller(
+                articulation=bb.name,
+                params={"task_costs": {str(bb.twist_task): {"cost": tw},
+                                       str(bb.damping_task): {"cost": dp}}},
+            )
+        except Exception as e:  # RPC failure -> fail the node, don't crash the tree
+            bb.fail_reason = f"SetBaseAssist[{self.name}]: {e}"
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.SUCCESS
+
+
 class ReachRamp(py_trees.behaviour.Behaviour):
     """Seed-then-enable EE-task ramp: seeds the manual target at the CURRENT
     cup_site pose while the EE task is still disabled (enabling against a
@@ -494,84 +539,108 @@ class ReachRamp(py_trees.behaviour.Behaviour):
 
 
 class DescendEngage(py_trees.behaviour.Behaviour):
-    """Final-leg ramp onto the affordance point (bb.affordance.waypoints[1:]
-    — engage then contact), engaging suction
-    (client.runtime.set_suction(articulation=bb.name, value=1.0)) the instant
-    cup_site is within 2 cm of the affordance point. Ramp structure from
-    tidybot_guarded_reach_demo.py; the engage gate reads cup_site via the
-    Tracker pattern (synced_site_pose) every tick."""
+    """Descend the cup onto the object and engage suction. Ramps from the
+    pre-approach pose down to a target pressed PRESS_M INTO the object's top
+    surface (adhesion needs contact, not proximity), tracking the object's LIVE
+    affordance-site pose each tick (a settled/nudged free body drifts, so a
+    static target misses). Engages suction (set_suction value=1.0) once cup_site
+    is within ENGAGE_DIST_M of the surface, then HOLDS the press until the cup is
+    within CONTACT_DIST_M (actual contact, so the arm has time to converge and
+    adhesion to grab) or SETTLE_TIMEOUT_S elapses. SUCCESS when contact is
+    reached or the settle times out with suction engaged (VerifyAttach is the
+    real gate); FAILURE only on a read error."""
 
-    ENGAGE_DIST_M = 0.02
+    ENGAGE_DIST_M = 0.04    # fire suction once this close to the surface
+    CONTACT_DIST_M = 0.015  # "in contact" -> stop pressing, done
+    PRESS_M = 0.005         # press the target this far below the surface (light)
+    SETTLE_TIMEOUT_S = 4.0  # hold-and-press ceiling before giving up to VerifyAttach
 
-    def __init__(self, name, bb, duration: float = 4.0):
+    def __init__(self, name, bb, ramp_duration: float = 4.0):
         super().__init__(name)
         self.bb = bb
-        self.duration = float(duration)
-        self._legs = []
-        self._leg_idx = 0
-        self._leg_start_pose = None
-        self._leg_t0 = None
-        self._per_leg = None
+        self.ramp_duration = float(ramp_duration)
         self._quat = None
+        self._start_pose = None
+        self._surf = None       # object surface point, SNAPSHOT once (see initialise)
+        self._pressed = None    # fixed descent target (surf - PRESS_M*normal)
+        self._t0 = None
         self._engaged = False
+        self._settling = False
+        self._settle_t0 = None
+        self._init_error = None
 
     def initialise(self):
         bb = self.bb
-        aff = bb.affordance
-        if aff is None:
-            bb.fail_reason = f"DescendEngage[{self.name}]: no affordance resolved"
-            self._legs = []
+        self._init_error = None
+        self._engaged = False
+        self._settling = False
+        self._settle_t0 = None
+        if bb.affordance is None:
+            self._init_error = "no affordance resolved"
             return
-        self._quat = np.asarray(aff.quat_cup_down, dtype=float)
-        self._legs = [np.asarray(w, dtype=float) for w in aff.waypoints[1:]]  # engage, contact
+        self._quat = np.asarray(bb.affordance.quat_cup_down, dtype=float)
         try:
+            # Snapshot the object's affordance pose ONCE, now, while it is
+            # sitting still. Do NOT chase it live: the affordance site rides the
+            # free body, so a live target lunges after the box the instant it is
+            # nudged (the jumping IK marker) and amplifies a knock-off. A fixed
+            # snapshot gives a clean straight-down descent to where the box IS.
+            surf, quat = synced_site_pose(bb.client, "affordance_suction_top")
+            R = np.zeros(9)
+            mujoco.mju_quat2Mat(R, quat)
+            normal = np.asarray(R).reshape(3, 3)[:, 2]
+            normal = normal / (np.linalg.norm(normal) or 1.0)
             p0, _ = synced_site_pose(bb.client, "cup_site")
         except RuntimeError as e:
-            bb.fail_reason = f"DescendEngage[{self.name}]: {e}"
-            self._legs = []
+            self._init_error = str(e)
             return
-        self._leg_start_pose = p0
-        self._leg_idx = 0
-        self._leg_t0 = time.time()
-        self._per_leg = self.duration / max(1, len(self._legs))
-        self._engaged = False
+        self._surf = np.asarray(surf, dtype=float)
+        self._pressed = self._surf - self.PRESS_M * normal
+        self._start_pose = p0
+        self._t0 = time.time()
 
     def update(self):
         bb = self.bb
         client = bb.client
-        if not self._legs:
+        if self._init_error is not None:
+            bb.fail_reason = f"DescendEngage[{self.name}]: {self._init_error}"
             return py_trees.common.Status.FAILURE
-
-        target = self._legs[self._leg_idx]
-        a = min(1.0, (time.time() - self._leg_t0) / max(self._per_leg, 1e-6))
-        pos = (1.0 - a) * self._leg_start_pose + a * target
-        stream_target(client, bb.name, pos, self._quat)
 
         try:
             cup_pos, _ = synced_site_pose(client, "cup_site")
         except RuntimeError as e:
             bb.fail_reason = f"DescendEngage[{self.name}]: {e}"
             return py_trees.common.Status.FAILURE
-        dist = float(np.linalg.norm(cup_pos - bb.affordance.point))
-        if not self._engaged and dist <= self.ENGAGE_DIST_M:
+
+        pressed = self._pressed  # fixed snapshot target
+        dist_to_surf = float(np.linalg.norm(cup_pos - self._surf))
+
+        # Engage suction once close, so it's on before contact.
+        if not self._engaged and dist_to_surf <= self.ENGAGE_DIST_M:
             client.runtime.set_suction(articulation=bb.name, value=1.0)
             self._engaged = True
 
-        if a < 1.0:
-            return py_trees.common.Status.RUNNING
-        if self._leg_idx + 1 < len(self._legs):
-            self._leg_idx += 1
-            self._leg_start_pose = target
-            self._leg_t0 = time.time()
+        if not self._settling:
+            # Ramp phase: bounded-error descent from the pre-approach pose.
+            a = min(1.0, (time.time() - self._t0) / max(self.ramp_duration, 1e-6))
+            stream_target(client, bb.name, (1.0 - a) * self._start_pose + a * pressed, self._quat)
+            if a >= 1.0:
+                self._settling = True
+                self._settle_t0 = time.time()
             return py_trees.common.Status.RUNNING
 
-        if not self._engaged:
-            # Final leg complete without crossing the engage threshold (e.g. a
-            # shallow approach angle) -- force engage at the contact waypoint
-            # rather than silently finishing unattached.
+        # Settle phase: keep pressing the live target until real contact, so the
+        # arm converges and adhesion grabs (rather than lifting off a lagging ramp).
+        stream_target(client, bb.name, pressed, self._quat)
+        if not self._engaged:  # belt-and-braces: never finish unattached
             client.runtime.set_suction(articulation=bb.name, value=1.0)
             self._engaged = True
-        return py_trees.common.Status.SUCCESS
+        if dist_to_surf <= self.CONTACT_DIST_M:
+            return py_trees.common.Status.SUCCESS
+        if time.time() - self._settle_t0 >= self.SETTLE_TIMEOUT_S:
+            # Hand off to VerifyAttach — it decides pass/fail on the actual lift.
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.RUNNING
 
     def terminate(self, new_status):
         if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
