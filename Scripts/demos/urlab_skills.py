@@ -59,6 +59,20 @@ def approach_waypoints(point: np.ndarray, normal: np.ndarray) -> list:
     return [p + PRE_APPROACH_M * n, p + ENGAGE_M * n, p.copy()]
 
 
+def quat_slerp(q0: np.ndarray, q1: np.ndarray, a: float) -> np.ndarray:
+    """Spherical interpolation between two wxyz quats, shortest arc."""
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:
+        q1, d = -q1, -d
+    if d > 0.9995:
+        q = (1.0 - a) * q0 + a * q1
+        return q / np.linalg.norm(q)
+    th = np.arccos(np.clip(d, -1.0, 1.0))
+    return (np.sin((1.0 - a) * th) * q0 + np.sin(a * th) * q1) / np.sin(th)
+
+
 def cup_down_quat(normal: np.ndarray) -> np.ndarray:
     """Target EE quat (wxyz) with the cup axis anti-parallel to the affordance
     normal. The cup/pinch frame convention has the tool axis along local -z of
@@ -484,9 +498,12 @@ class ReachRamp(py_trees.behaviour.Behaviour):
     stale bind-pose target yanks — tidybot_twist_follow_demo.py Phase B),
     THEN enables all four tasks, then ramps the EE position linearly through
     bb.<waypoints_key> (a list of world points) over `duration` seconds total
-    (split evenly across legs), holding orientation at bb.<quat_key>
-    throughout — the wall-clock position ramp is
-    tidybot_guarded_reach_demo.py's Phase B pattern."""
+    (split evenly across legs). Orientation slerps from the seed pose to
+    bb.<quat_key> across the FIRST leg (then holds): snapping the target to
+    cup-down in one tick while the cup is still stowed next to the mast is
+    infeasible for the arm alone, so the whole-body QP recruits the base --
+    live-measured as a ~0.6 m backward lunge at reach start. The wall-clock
+    position ramp is tidybot_guarded_reach_demo.py's Phase B pattern."""
 
     def __init__(self, name, bb, waypoints_key, quat_key, duration: float = 6.0):
         super().__init__(name)
@@ -500,6 +517,7 @@ class ReachRamp(py_trees.behaviour.Behaviour):
         self._leg_t0 = None
         self._per_leg = None
         self._quat = None
+        self._q0 = None
 
     def initialise(self):
         bb = self.bb
@@ -522,6 +540,7 @@ class ReachRamp(py_trees.behaviour.Behaviour):
             articulation=bb.name, params={"task_enabled": [True, True, True, True]},
         )
 
+        self._q0 = np.asarray(q0, dtype=float)
         self._legs = [np.asarray(w, dtype=float) for w in waypoints]
         self._leg_idx = 0
         self._leg_start_pose = p0
@@ -536,7 +555,10 @@ class ReachRamp(py_trees.behaviour.Behaviour):
         target = self._legs[self._leg_idx]
         a = min(1.0, (time.time() - self._leg_t0) / max(self._per_leg, 1e-6))
         pos = (1.0 - a) * self._leg_start_pose + a * target
-        stream_target(client, bb.name, pos, self._quat)
+        quat = self._quat
+        if self._leg_idx == 0 and self._q0 is not None:
+            quat = quat_slerp(self._q0, self._quat, a)
+        stream_target(client, bb.name, pos, quat)
         if a < 1.0:
             return py_trees.common.Status.RUNNING
         if self._leg_idx + 1 >= len(self._legs):
