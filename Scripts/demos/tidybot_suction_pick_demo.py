@@ -19,7 +19,8 @@ and executes it exactly via the posture_target wire, rather than letting the
 greedy QP rediscover a base path. Reachable and CorridorClear stay loud-abort
 gates ahead of it (a blocked corridor or an out-of-annulus affordance point
 fails the tree rather than replanning); ReachRamp itself is unchanged and
-still lives in urlab_skills.py for the other demos that use it.
+retained in urlab_skills.py as a reusable skill (no current constructor —
+retired from this tree, kept for reuse).
 
 Run with the bridge venv's python, editor open (the user drives Simulate):
     /home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python \

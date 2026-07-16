@@ -105,7 +105,12 @@ def reach_annulus_ok(shoulder: np.ndarray, target: np.ndarray,
 
 def due_waypoint(waypoints, elapsed_s):
     """Index of the waypoint that should currently be streamed: the LAST
-    waypoint whose scheduled time <= elapsed_s (0 before the first)."""
+    waypoint whose scheduled time <= elapsed_s (0 before the first).
+
+    Retained committed helper (with its self-tests) — a clock-scheduled
+    lookup. PlannedReach now streams SELF-PACED (advances only when the
+    current waypoint is tracked), so it no longer calls this, but the
+    function stands on its own for any clock-paced streaming."""
     idx = 0
     for i, (t, _q) in enumerate(waypoints):
         if t <= elapsed_s:
@@ -603,11 +608,17 @@ class ReachRamp(py_trees.behaviour.Behaviour):
 class PlannedReach(py_trees.behaviour.Behaviour):
     """Whole-body planned reach to the affordance pre-grasp pose: plans an
     RRT-Connect path in initialise (blocking, seconds — acceptable at BT
-    rate for v1), then streams posture_target waypoints on schedule.
-    SUCCESS when the final waypoint tracks within tolerance; FAILURE on
-    PlanError or watchdog divergence. Replaces ReachRamp's straight-line
-    carpet — the planned BASE path executes exactly instead of being
-    rediscovered by the greedy QP.
+    rate for v1), then streams posture_target waypoints SELF-PACED (advances
+    to the next waypoint only once the current one is tracked, never on
+    wall-clock). SUCCESS when the final waypoint settles within tolerance;
+    FAILURE on plan error, sustained tracking divergence, or a settle stall.
+    Replaces ReachRamp's straight-line carpet — the planned BASE path
+    executes exactly instead of being rediscovered by the greedy QP.
+
+    Self-paced advancement (mirrors the probe's proven Phase C, NOT a clock
+    schedule): the QP is never yanked toward a far-ahead waypoint across an
+    edge the planner never collision-checked — slow-but-correct tracking just
+    takes longer instead of failing.
 
     Handoff contract (live-validated in tidybot_planned_reach_probe.py's
     Phase C/D): frame + twist_follow tasks disabled during execution;
@@ -620,14 +631,17 @@ class PlannedReach(py_trees.behaviour.Behaviour):
     TRACK_TOL = 0.15
     TRACK_GRACE_S = 4.0
     SETTLE_TOL = 0.05
+    STALL_TIMEOUT_S = 10.0   # no waypoint advance / no SUCCESS for this long -> FAIL
+                             # (matches the probe's settle-loop ceiling)
 
     def __init__(self, name, bb):
         super().__init__(name)
         self.bb = bb
         self._plan = None
         self._joints = None
-        self._t0 = None
+        self._wp_idx = 0
         self._diverged_since = None
+        self._last_advance_t = None
         self._failed = None
 
     def initialise(self):
@@ -635,10 +649,17 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         bb = self.bb
         client = bb.client
         self._joints = PLANNED_JOINTS
+        self._wp_idx = 0
         self._failed = None
         self._diverged_since = None
-        # ResolveAffordance publishes bb.affordance (an Affordance dataclass:
-        # point, normal, quat_cup_down, waypoints) and bb.q_cup.
+        # Guard a missing affordance (matches ReachRamp/Reachable/DescendEngage):
+        # ResolveAffordance must have run first and published bb.affordance
+        # (an Affordance dataclass: point, normal, quat_cup_down, waypoints)
+        # and bb.q_cup.
+        if bb.affordance is None:
+            bb.fail_reason = f"PlannedReach[{self.name}]: no affordance resolved"
+            self._failed = bb.fail_reason
+            return
         aff = bb.affordance
         pre_grasp = np.asarray(aff.point, dtype=float) \
             + self.PRE_GRASP_M * np.asarray(aff.normal, dtype=float)
@@ -647,6 +668,15 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         except PlanError as e:
             self._plan = None
             bb.fail_reason = f"PlannedReach[{self.name}]: plan {e.stage}: {e}"
+            self._failed = bb.fail_reason
+            return
+        except Exception as e:
+            # plan_reach can also raise ValueError (unresolved joint/site), a
+            # mink import error, or an RPC error — fail the tick cleanly rather
+            # than crash with a traceback. No exec config has been sent yet, so
+            # there is nothing to clean up.
+            self._plan = None
+            bb.fail_reason = f"PlannedReach[{self.name}]: plan failed: {e}"
             self._failed = bb.fail_reason
             return
         # Frame + twist_follow OFF, posture dominates; relax the lazy-base
@@ -659,7 +689,7 @@ class PlannedReach(py_trees.behaviour.Behaviour):
             "task_costs": {str(POSTURE_TASK): {"cost": 5.0},
                            str(DAMPING_TASK): {"cost": 0.05}},
         })
-        self._t0 = time.time()
+        self._last_advance_t = time.time()
 
     def update(self):
         if self._failed:
@@ -667,18 +697,30 @@ class PlannedReach(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         bb = self.bb
         client = bb.client
-        elapsed = time.time() - self._t0
-        idx = due_waypoint(self._plan.waypoints, elapsed)
-        t_wp, wp = self._plan.waypoints[idx]
+        idx = self._wp_idx
+        _t_wp, wp = self._plan.waypoints[idx]
+        # Stream the CURRENT waypoint, then measure how well it is tracked.
         client._rpc_configure_controller(articulation=bb.name,
                                          params={"posture_target": wp})
-        # Watchdog + terminal check on synced state.
         q = _synced_planned_q(client, self._joints)
         err = max(abs(q[i] - wp[jn]) for i, jn in enumerate(self._joints))
         is_last = idx == len(self._plan.waypoints) - 1
-        if is_last and elapsed >= t_wp and err < self.SETTLE_TOL:
-            return py_trees.common.Status.SUCCESS
-        if err > self.TRACK_TOL and elapsed >= t_wp:
+
+        if err <= self.TRACK_TOL:
+            # Tracked: divergence timer clears.
+            self._diverged_since = None
+            if not is_last:
+                # Advance ONLY when the current waypoint is reached (self-paced,
+                # never on the clock — the whole point of the probe's design).
+                self._wp_idx += 1
+                self._last_advance_t = time.time()
+                return py_trees.common.Status.RUNNING
+            if err < self.SETTLE_TOL:
+                return py_trees.common.Status.SUCCESS
+            # Last waypoint tracked but not yet settled — fall through to the
+            # stall guard so this cannot spin RUNNING forever.
+        else:
+            # Diverged: start/continue the divergence timer.
             self._diverged_since = self._diverged_since or time.time()
             if time.time() - self._diverged_since > self.TRACK_GRACE_S:
                 self.feedback_message = f"watchdog: err {err:.3f} at waypoint {idx}"
@@ -687,8 +729,17 @@ class PlannedReach(py_trees.behaviour.Behaviour):
                     f"{self.TRACK_TOL} at waypoint {idx} for {self.TRACK_GRACE_S}s"
                 )
                 return py_trees.common.Status.FAILURE
-        else:
-            self._diverged_since = None
+
+        # Stall guard: no advance and no SUCCESS for STALL_TIMEOUT_S (e.g. a
+        # final error stuck in (SETTLE_TOL, TRACK_TOL]) -> fail rather than
+        # spin RUNNING forever.
+        if time.time() - self._last_advance_t > self.STALL_TIMEOUT_S:
+            self.feedback_message = f"stalled at waypoint {idx} (err {err:.3f})"
+            bb.fail_reason = (
+                f"PlannedReach[{self.name}]: stalled at waypoint {idx} "
+                f"(err {err:.3f})"
+            )
+            return py_trees.common.Status.FAILURE
         return py_trees.common.Status.RUNNING
 
     def terminate(self, new_status):
