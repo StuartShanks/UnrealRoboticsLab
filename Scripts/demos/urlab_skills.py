@@ -690,14 +690,18 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
         client = bb.client
         self._init_error = None
         try:
-            p0, q0 = synced_site_pose(client, "cup_site")
+            p0, _ = synced_site_pose(client, "cup_site")
             self._z_before = _object_z(client, bb.object_actor_id)
         except RuntimeError as e:
             self._init_error = str(e)
             return
         _hold_suction(client, bb.name)  # the two synced reads above zeroed suction
         self._start_pose = p0
-        self._quat = q0
+        # Hold the CANONICAL cup-down orientation (bb.q_cup, computed once by
+        # ResolveAffordance), NOT the live-read cup pose — a slightly drifted
+        # descent pose would otherwise lock a tilted/flipped orientation into
+        # the lift. The target orientation must never change from cup-down.
+        self._quat = np.asarray(bb.q_cup, dtype=float)
         self._target = p0 + np.array([0.0, 0.0, self.LIFT_M])
         self._t0 = time.time()
         self._retried = False
@@ -782,13 +786,15 @@ class StowCarry(py_trees.behaviour.Behaviour):
         client = bb.client
         self._init_error = None
         try:
-            p0, q0 = synced_site_pose(client, "cup_site")
+            p0, _ = synced_site_pose(client, "cup_site")
         except RuntimeError as e:
             self._init_error = str(e)
             return
         _hold_suction(client, bb.name)  # keep the grip through the carry (read zeroed it)
         self._start_pose = p0
-        self._quat = q0
+        # Canonical cup-down orientation (see VerifyAttach) — never the live-read
+        # pose, so the carried box stays flat and the target never flips.
+        self._quat = np.asarray(bb.q_cup, dtype=float)
         self._target = p0 + self.OFFSET
         self._t0 = time.time()
         self._stowed = False
