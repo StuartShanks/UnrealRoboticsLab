@@ -21,30 +21,45 @@ regardless of consumer.
 
 ## Axis 1 — nav intent through the whole-body QP (current)
 
-Adopted from design review, amended order:
+Adopted from design review, amended order. **Steps 0–3 are DONE and
+live-validated** (2026-07-16; commits 3895e15, f1d403b, 5af9d0f, 96b1819,
+demos 62ac238/8396a31; full findings in `.superpowers/sdd/progress.md`):
 
-0. **Surface per-task cost updates in `ApplyConfig`.** Known gap: live
-   reconfigure of task costs is a NO-OP today (only scalars, `task_enabled`,
-   frame targets). Blocks fast tuning loops in every later step.
-1. **Carrot prototype (throwaway, zero-physics-C++).** Base-body Frame task in
-   the `add_controller` stack; expose the pursuit lookahead **pose** (position
-   AND yaw — heading comes from pursuit, a point is not enough) via
-   `get_nav_status`; demo script streams it as `target_task=1` while streaming
-   the EE as task 0 (`ApplyConfigInternal` already routes `target_task`).
-   Purpose: validate whole-body nav-through-mink + tune costs. Not the
-   architecture.
-2. **`TwistFollow` task kind in `FMinkTaskSpec`.** Mink becomes a twist-bus
-   consumer: resolve sibling `UMjTwistController` at Bind; rotate twist by base
-   yaw from the IK reference (open-loop contract, not live qpos); integrate an
-   internal base target with base-drive's leash/reseed semantics — **lift
-   `MjBaseDriveController.cpp:150-160` into a shared pure function**, don't
-   duplicate. Gate the lazy-base damping task via `task_enabled` while
-   navigating (it fights the twist task for the base DOFs).
-3. **Surface `EMinkLimitKind::CollisionAvoidance`.** `FMinkCollisionAvoidanceLimit`
-   is already ported in URLabMink, spec-side only exposes Configuration/Velocity.
-   Geom pairs by name (robot group vs environment group). This is the layer the
-   navmesh cannot give (arm envelope, reach-over-table) — velocity-level, local,
-   greedy; it prevents penetration, it does not plan around.
+0. ✅ **Per-task cost updates in `ApplyConfig`** (`task_costs` sparse map) —
+   via the existing `MarkSpecsChanged` rebuild path, not a second mechanism.
+1. ✅ **Carrot prototype** — validated whole-body nav-through-mink live.
+   Enduring findings: `max_iters=1` is real-time tracking mode (the default 20
+   is a per-step convergence loop that multiplies wall-clock speed ~20x — the
+   real cause of v1's "instant clip"); QP velocity limits are the pace
+   governors; a world-frame EE "hold" during transit is a rubber band to the
+   spawn point (disable the task; posture holds the arm).
+2. ✅ **`TwistFollow` task kind** — the mink as a twist-bus consumer;
+   `MjBaseIntegrate` shared pure helpers (base-drive refactored onto them).
+   Live transit profile identical to base_drive's — interchangeable consumers,
+   zero streaming. Demo: `tidybot_twist_follow_demo.py` (swap demo kept as the
+   base_drive-consumer reference).
+3. ✅ **`EMinkLimitKind::CollisionAvoidance` surfaced** — GeomsA×GeomsB
+   geom-or-body groups (body expansion is REQUIRED in practice: imported mesh
+   geoms are unnamed). Live proof: EE commanded INSIDE a table (within
+   kinematic reach) held at a stable 0.175 m standoff. The claim is a
+   velocity-level no-contact guarantee on guarded links for ANY streamed
+   target — NOT planning. Hard-won practice notes:
+   - Quick-converted obstacles compile as `<UE actor name>_MjBody` (UE
+     auto-names; `actor_id` is a tag) — capture `actor_name` from the
+     `spawn_box` reply; a missing group resolves to 0 and the limit SKIPS
+     (warning only in the bind log — verify pair count at bind).
+   - Guard the FULL kinematic chain: one unguarded link contacting at 1e6-gain
+     stiffness explodes physics (QACC → MuJoCo auto-reset mid-run). Grippers:
+     envelope standoff covering the finger extent beats enumerating linkage
+     bodies.
+   - **Bounded-error streaming is doctrine**: unbounded far targets caused
+     cost-ratio inversion (2 m EE error outguns a 5 cm leashed twist error at
+     any cost), reach-envelope singularity parking (looks like a guard hold;
+     isn't), and v1's clip. Always ramp/carrot streamed goals.
+   - Reach-while-driving through clutter is NOT a default: the QP tracks and
+     avoids, it does not plan — "reach only in free space" is policy above the
+     controller. Stowed transit + reach-at-arrival is the pattern;
+     reach-early is a free-corridor opt-in.
 4. **Repath policy + dynamic navmesh.** Periodic repath + repath on path
    invalidation — but note the hidden scope: `spawn_nav_bounds` bakes statically;
    dynamic obstacles need `RuntimeGeneration=Dynamic` on the RecastNavMesh and
