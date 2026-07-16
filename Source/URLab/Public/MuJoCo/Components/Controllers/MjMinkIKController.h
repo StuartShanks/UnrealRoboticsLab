@@ -417,7 +417,8 @@ private:
 	 *  "fingers_actuator" never appear there. ComputeAndApply's non-drive
 	 *  pass-through needs the full roster to honor the BaseDrive contract for
 	 *  every actuator, not just the joint-driven subset. */
-	TMap<int32, UMjActuator*> AllActuatorIdMap;
+	UPROPERTY()
+	TMap<int32, TObjectPtr<UMjActuator>> AllActuatorIdMap;
 
 	/** Sibling twist source for TwistFollow tasks; resolved in Bind, read on
 	 *  the physics thread via its thread-safe GetTwist() (BaseDrive pattern).

@@ -275,7 +275,11 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 	// Captured verbatim (not the transmission-type-filtered Bindings) so the
 	// non-drive pass-through in ComputeAndApply can reach tendon/site-driven
 	// actuators too — see the member comment in the header.
-	AllActuatorIdMap = ActuatorIdMap;
+	AllActuatorIdMap.Reset();
+	for (const TPair<int32, UMjActuator*>& Elem : ActuatorIdMap)
+	{
+		AllActuatorIdMap.Add(Elem.Key, Elem.Value);
+	}
 
 	Mink.Reset();
 	DriveCtrlIds.Reset();
@@ -947,7 +951,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 	// Bind, unfiltered by transmission type) rather than the inherited
 	// Bindings array, which only covers joint-transmission actuators — a
 	// tendon-driven gripper (e.g. fingers_actuator) never appears in Bindings.
-	for (const TPair<int32, UMjActuator*>& Elem : AllActuatorIdMap)
+	for (const TPair<int32, TObjectPtr<UMjActuator>>& Elem : AllActuatorIdMap)
 	{
 		const int32 ActId = Elem.Key;
 		UMjActuator* Comp = Elem.Value;
