@@ -25,6 +25,7 @@
 
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Input/MjTwistController.h"
+#include "MuJoCo/Navigation/MjBaseIntegrate.h"
 
 #include <mujoco/mujoco.h>
 
@@ -122,7 +123,9 @@ void UMjBaseDriveController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source
 	if (!bBaseResolved)
 		return;
 
-	// Twist (robot frame, bus convention) → world-frame velocity.
+	// Twist (robot frame, bus convention) → world-frame velocity, then
+	// integrate-with-leash per DOF — both via the shared MjBaseIntegrate
+	// helpers (same math drives the mink TwistFollow task).
 	double Vx = 0, Vy = 0, W = 0;
 	if (TwistSource)
 	{
@@ -132,8 +135,13 @@ void UMjBaseDriveController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source
 		W = T.Z;
 	}
 	const double Theta = d->qpos[Bindings[BaseBindingIdx[2]].QposAddr];
-	const double C = FMath::Cos(Theta), S = FMath::Sin(Theta);
-	const double VWorld[3] = {C * Vx - S * Vy, S * Vx + C * Vy, W};
+	double VWorld[3];
+	MjBaseIntegrate::TwistToWorld(Vx, Vy, W, Theta, VWorld);
+
+	MjBaseIntegrate::FLeashParams Leash;
+	Leash.MaxLeashLinear = MaxLeashLinear;
+	Leash.MaxLeashAngular = MaxLeashAngular;
+	Leash.ReseedThreshold = ReseedThreshold;
 
 	const double Dt = m->opt.timestep;
 	for (int32 k = 0; k < 3; ++k)
@@ -149,17 +157,12 @@ void UMjBaseDriveController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source
 
 		// PositionIntegrate: integrate, re-seed on discontinuity, leash,
 		// clamp to joint range.
-		Target[k] += VWorld[k] * Dt;
-		const double Leash = (k == 2) ? MaxLeashAngular : MaxLeashLinear;
-		if (FMath::Abs(Target[k] - Qpos) > ReseedThreshold)
-			Target[k] = Qpos;
-		Target[k] = FMath::Clamp(Target[k], Qpos - Leash, Qpos + Leash);
-
-		// Respect joint limits if present.
 		const int32 Jid = m->actuator_trnid[B.ActuatorMjID * 2];
-		if (Jid >= 0 && m->jnt_limited[Jid])
-			Target[k] = FMath::Clamp(Target[k],
-				(double)m->jnt_range[Jid * 2], (double)m->jnt_range[Jid * 2 + 1]);
+		const bool bLimited = Jid >= 0 && m->jnt_limited[Jid];
+		Target[k] = MjBaseIntegrate::IntegrateLeashed(Target[k], VWorld[k], Dt, Qpos,
+			/*bAngular*/ k == 2, Leash, bLimited,
+			bLimited ? (double)m->jnt_range[Jid * 2] : 0.0,
+			bLimited ? (double)m->jnt_range[Jid * 2 + 1] : 0.0);
 
 		d->ctrl[B.ActuatorMjID] = Target[k];
 	}

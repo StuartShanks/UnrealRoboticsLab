@@ -1832,129 +1832,135 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 	// config lock — hold it while structurally mutating Tasks/Limits/DriveJoints
 	// (a concurrent TArray reallocation is use-after-free, not just staleness).
 	{
-	FScopeLock SpecLock(&Ctrl->GetConfigLock());
+		FScopeLock SpecLock(&Ctrl->GetConfigLock());
 
-	// --- tasks ----------------------------------------------------------------
-	const TArray<TSharedPtr<FJsonValue>>* TasksArr = nullptr;
-	if (Req->TryGetArrayField(TEXT("tasks"), TasksArr) && TasksArr)
-	{
-		Ctrl->Tasks.Reset();
-		for (const TSharedPtr<FJsonValue>& TV : *TasksArr)
+		// --- tasks ----------------------------------------------------------------
+		const TArray<TSharedPtr<FJsonValue>>* TasksArr = nullptr;
+		if (Req->TryGetArrayField(TEXT("tasks"), TasksArr) && TasksArr)
 		{
-			const TSharedPtr<FJsonObject>* TO = nullptr;
-			if (!TV->TryGetObject(TO) || !TO->IsValid())
-				continue;
-			const TSharedPtr<FJsonObject>& T = *TO;
-
-			FMinkTaskSpec Spec;
-			FString Kind;
-			T->TryGetStringField(TEXT("kind"), Kind);
-			if (Kind.Equals(TEXT("frame"), ESearchCase::IgnoreCase))
+			Ctrl->Tasks.Reset();
+			for (const TSharedPtr<FJsonValue>& TV : *TasksArr)
 			{
-				Spec.Kind = EMinkTaskKind::Frame;
-				FString FrameName;
-				T->TryGetStringField(TEXT("frame"), FrameName);
-				// Capture the raw MjName: survives PIE/Simulate world duplication and
-				// lets the controller re-resolve the frame by name when the ref is lost.
-				Spec.FrameName = FrameName;
-				UMjComponent* Frame = FindMjComponentByName<UMjSite>(Art, FrameName);
-				if (!Frame)
-					Frame = FindMjComponentByName<UMjBody>(Art, FrameName);
-				if (!Frame)
-					Frame = FindMjComponentByName<UMjGeom>(Art, FrameName);
-				if (Frame)
-					Spec.Frame = Frame;
-				else
-					Warn(FString::Printf(TEXT("frame '%s' not found (site/body/geom)"), *FrameName));
+				const TSharedPtr<FJsonObject>* TO = nullptr;
+				if (!TV->TryGetObject(TO) || !TO->IsValid())
+					continue;
+				const TSharedPtr<FJsonObject>& T = *TO;
 
-				FString MocapName;
-				if (T->TryGetStringField(TEXT("mocap_body"), MocapName) && !MocapName.IsEmpty())
+				FMinkTaskSpec Spec;
+				FString Kind;
+				T->TryGetStringField(TEXT("kind"), Kind);
+				if (Kind.Equals(TEXT("frame"), ESearchCase::IgnoreCase))
 				{
-					Spec.TargetMocapBodyName = MocapName; // duplication-safe fallback
-					if (UMjBody* Mb = FindMjComponentByName<UMjBody>(Art, MocapName))
-						Spec.TargetMocapBody = Mb;
+					Spec.Kind = EMinkTaskKind::Frame;
+					FString FrameName;
+					T->TryGetStringField(TEXT("frame"), FrameName);
+					// Capture the raw MjName: survives PIE/Simulate world duplication and
+					// lets the controller re-resolve the frame by name when the ref is lost.
+					Spec.FrameName = FrameName;
+					UMjComponent* Frame = FindMjComponentByName<UMjSite>(Art, FrameName);
+					if (!Frame)
+						Frame = FindMjComponentByName<UMjBody>(Art, FrameName);
+					if (!Frame)
+						Frame = FindMjComponentByName<UMjGeom>(Art, FrameName);
+					if (Frame)
+						Spec.Frame = Frame;
 					else
-						Warn(FString::Printf(TEXT("mocap_body '%s' not found"), *MocapName));
+						Warn(FString::Printf(TEXT("frame '%s' not found (site/body/geom)"), *FrameName));
+
+					FString MocapName;
+					if (T->TryGetStringField(TEXT("mocap_body"), MocapName) && !MocapName.IsEmpty())
+					{
+						Spec.TargetMocapBodyName = MocapName; // duplication-safe fallback
+						if (UMjBody* Mb = FindMjComponentByName<UMjBody>(Art, MocapName))
+							Spec.TargetMocapBody = Mb;
+						else
+							Warn(FString::Printf(TEXT("mocap_body '%s' not found"), *MocapName));
+					}
+					double V;
+					if (T->TryGetNumberField(TEXT("position_cost"), V))
+						Spec.PositionCost = V;
+					if (T->TryGetNumberField(TEXT("orientation_cost"), V))
+						Spec.OrientationCost = V;
 				}
+				else if (Kind.Equals(TEXT("posture"), ESearchCase::IgnoreCase))
+				{
+					Spec.Kind = EMinkTaskKind::Posture;
+				}
+				else if (Kind.Equals(TEXT("damping"), ESearchCase::IgnoreCase))
+				{
+					Spec.Kind = EMinkTaskKind::Damping;
+				}
+				else if (Kind.Equals(TEXT("twist_follow"), ESearchCase::IgnoreCase))
+				{
+					// joints must list the 3 base joints IN ORDER (x, y, th); the
+					// controller warns and skips the task otherwise.
+					Spec.Kind = EMinkTaskKind::TwistFollow;
+				}
+				else
+				{
+					Warn(FString::Printf(TEXT("unknown task kind '%s' — skipped"), *Kind));
+					continue;
+				}
+
 				double V;
-				if (T->TryGetNumberField(TEXT("position_cost"), V))
-					Spec.PositionCost = V;
-				if (T->TryGetNumberField(TEXT("orientation_cost"), V))
-					Spec.OrientationCost = V;
-			}
-			else if (Kind.Equals(TEXT("posture"), ESearchCase::IgnoreCase))
-			{
-				Spec.Kind = EMinkTaskKind::Posture;
-			}
-			else if (Kind.Equals(TEXT("damping"), ESearchCase::IgnoreCase))
-			{
-				Spec.Kind = EMinkTaskKind::Damping;
-			}
-			else
-			{
-				Warn(FString::Printf(TEXT("unknown task kind '%s' — skipped"), *Kind));
-				continue;
-			}
+				if (T->TryGetNumberField(TEXT("cost"), V))
+					Spec.Cost = V;
+				if (T->TryGetNumberField(TEXT("gain"), V))
+					Spec.Gain = V;
+				if (T->TryGetNumberField(TEXT("lm_damping"), V))
+					Spec.LmDamping = V;
+				bool B;
+				if (T->TryGetBoolField(TEXT("enabled"), B))
+					Spec.bEnabled = B;
 
-			double V;
-			if (T->TryGetNumberField(TEXT("cost"), V))
-				Spec.Cost = V;
-			if (T->TryGetNumberField(TEXT("gain"), V))
-				Spec.Gain = V;
-			if (T->TryGetNumberField(TEXT("lm_damping"), V))
-				Spec.LmDamping = V;
-			bool B;
-			if (T->TryGetBoolField(TEXT("enabled"), B))
-				Spec.bEnabled = B;
+				const TArray<TSharedPtr<FJsonValue>>* JN = nullptr;
+				T->TryGetArrayField(TEXT("joints"), JN);
+				ResolveJoints(JN, Spec.Joints, *FString::Printf(TEXT("tasks[%d]"), Ctrl->Tasks.Num()),
+					&Spec.JointNames);
 
-			const TArray<TSharedPtr<FJsonValue>>* JN = nullptr;
-			T->TryGetArrayField(TEXT("joints"), JN);
-			ResolveJoints(JN, Spec.Joints, *FString::Printf(TEXT("tasks[%d]"), Ctrl->Tasks.Num()),
-				&Spec.JointNames);
-
-			Ctrl->Tasks.Add(MoveTemp(Spec));
+				Ctrl->Tasks.Add(MoveTemp(Spec));
+			}
 		}
-	}
 
-	// --- limits ----------------------------------------------------------------
-	const TArray<TSharedPtr<FJsonValue>>* LimArr = nullptr;
-	if (Req->TryGetArrayField(TEXT("limits"), LimArr) && LimArr)
-	{
-		Ctrl->Limits.Reset();
-		for (const TSharedPtr<FJsonValue>& LV : *LimArr)
+		// --- limits ----------------------------------------------------------------
+		const TArray<TSharedPtr<FJsonValue>>* LimArr = nullptr;
+		if (Req->TryGetArrayField(TEXT("limits"), LimArr) && LimArr)
 		{
-			const TSharedPtr<FJsonObject>* LO = nullptr;
-			if (!LV->TryGetObject(LO) || !LO->IsValid())
-				continue;
-			FMinkLimitSpec LSpec;
-			FString LKind;
-			(*LO)->TryGetStringField(TEXT("kind"), LKind);
-			if (LKind.Equals(TEXT("velocity"), ESearchCase::IgnoreCase))
+			Ctrl->Limits.Reset();
+			for (const TSharedPtr<FJsonValue>& LV : *LimArr)
 			{
-				LSpec.Kind = EMinkLimitKind::Velocity;
-				double V;
-				if ((*LO)->TryGetNumberField(TEXT("max_velocity"), V))
-					LSpec.MaxVelocity = V;
-				const TArray<TSharedPtr<FJsonValue>>* LJ = nullptr;
-				(*LO)->TryGetArrayField(TEXT("joints"), LJ);
-				ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"), &LSpec.JointNames);
+				const TSharedPtr<FJsonObject>* LO = nullptr;
+				if (!LV->TryGetObject(LO) || !LO->IsValid())
+					continue;
+				FMinkLimitSpec LSpec;
+				FString LKind;
+				(*LO)->TryGetStringField(TEXT("kind"), LKind);
+				if (LKind.Equals(TEXT("velocity"), ESearchCase::IgnoreCase))
+				{
+					LSpec.Kind = EMinkLimitKind::Velocity;
+					double V;
+					if ((*LO)->TryGetNumberField(TEXT("max_velocity"), V))
+						LSpec.MaxVelocity = V;
+					const TArray<TSharedPtr<FJsonValue>>* LJ = nullptr;
+					(*LO)->TryGetArrayField(TEXT("joints"), LJ);
+					ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"), &LSpec.JointNames);
+				}
+				else // configuration (default)
+				{
+					double V;
+					if ((*LO)->TryGetNumberField(TEXT("gain"), V))
+						LSpec.Gain = V;
+					if ((*LO)->TryGetNumberField(TEXT("min_distance"), V))
+						LSpec.MinDistance = V;
+				}
+				Ctrl->Limits.Add(LSpec);
 			}
-			else // configuration (default)
-			{
-				double V;
-				if ((*LO)->TryGetNumberField(TEXT("gain"), V))
-					LSpec.Gain = V;
-				if ((*LO)->TryGetNumberField(TEXT("min_distance"), V))
-					LSpec.MinDistance = V;
-			}
-			Ctrl->Limits.Add(LSpec);
 		}
-	}
 
-	// --- drive joints + solver params -------------------------------------------
-	const TArray<TSharedPtr<FJsonValue>>* DJ = nullptr;
-	if (Req->TryGetArrayField(TEXT("drive_joints"), DJ))
-		ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"), &Ctrl->DriveJointNames);
+		// --- drive joints + solver params -------------------------------------------
+		const TArray<TSharedPtr<FJsonValue>>* DJ = nullptr;
+		if (Req->TryGetArrayField(TEXT("drive_joints"), DJ))
+			ResolveJoints(DJ, Ctrl->DriveJoints, TEXT("drive_joints"), &Ctrl->DriveJointNames);
 
 	} // SpecLock — released before ApplyConfig takes the same lock itself
 

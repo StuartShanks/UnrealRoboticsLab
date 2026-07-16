@@ -34,6 +34,7 @@
 class UMjComponent;
 class UMjJoint;
 class UMjBody;
+class UMjTwistController;
 
 /** Which mink task a spec entry builds. Mirrors the ported task catalogue. */
 UENUM(BlueprintType)
@@ -44,7 +45,19 @@ enum class EMinkTaskKind : uint8
 	/** Regularize joints toward a reference posture (redundancy resolution). */
 	Posture,
 	/** Penalize joint velocity — heavy cost on a subset freezes it (e.g. fix-base). */
-	Damping
+	Damping,
+	/**
+	 * Consume the sibling UMjTwistController bus (the same signal WASD, set_twist,
+	 * and the nav stack's pure pursuit produce): each physics step the robot-frame
+	 * twist is rotated by the base yaw from the IK reference and integrated into a
+	 * base pose target with UMjBaseDriveController's leash/reseed semantics
+	 * (shared MjBaseIntegrate helpers), then tracked as a posture task over the
+	 * base DOFs. Joints must list EXACTLY the 3 base joints IN ORDER: x, y, th.
+	 * Makes the mink a drop-in whole-body consumer of navigation intent — no
+	 * controller swap, no target streaming. Pair with a base velocity limit and
+	 * max_iters=1 so the QP paces the base at true wall-clock speed.
+	 */
+	TwistFollow
 };
 
 /** Which mink limit a spec entry builds. */
@@ -355,6 +368,13 @@ private:
 	/** ctrl index / qpos address per driven actuator, resolved at Bind. */
 	TArray<int32> DriveCtrlIds;
 	TArray<int32> DriveQposAddrs;
+
+	/** Sibling twist source for TwistFollow tasks; resolved in Bind, read on
+	 *  the physics thread via its thread-safe GetTwist() (BaseDrive pattern).
+	 *  Null when the actor has no twist controller — TwistFollow tasks then
+	 *  hold their seed pose. */
+	UPROPERTY()
+	TObjectPtr<UMjTwistController> TwistSource = nullptr;
 
 	/** Spec revision, incremented on the game thread by MarkSpecsChanged() and
 	 *  compared on the physics thread to trigger a live rebuild. */

@@ -25,6 +25,7 @@
 #include "Tests/MjTestHelpers.h"
 #include "MuJoCo/Components/Controllers/MjMinkIKController.h"
 #include "MuJoCo/Components/Joints/MjJoint.h"
+#include "MuJoCo/Input/MjTwistController.h"
 #include "MuJoCo/Components/Geometry/MjSite.h"
 #include "MuJoCo/Components/Bodies/MjBody.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
@@ -2115,4 +2116,199 @@ bool FMjMinkIKTidybotLiveTaskCosts::RunTest(const FString&)
 
 	S.Cleanup();
 	return bPhaseBOk && bPhaseDOk;
+}
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.TwistFollow
+//   The TwistFollow task kind (nav roadmap step 2): the mink consumes the
+//   twist BUS — the same signal pursuit/WASD/set_twist produce — instead of a
+//   streamed carrot. Each step the twist is rotated by the reference yaw and
+//   integrated (shared MjBaseIntegrate leash semantics) into a posture-task
+//   target over the base DOFs. Real-time tracking config (max_iters=1 + base
+//   velocity limit), per the carrot-probe findings.
+//     1) zero twist            -> base holds
+//     2) forward 0.3 m/s x 2s  -> base advances ~0.6 m along +x, no drift
+//     3) zero twist            -> base stops (no windup / runaway target)
+//     4) yaw 0.5 rad/s x 1s    -> base yaw ~0.5 rad, position holds
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotTwistFollow,
+	"URLab.MinkIK.TidyBot.TwistFollow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotTwistFollow::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Resolve the ten joints (base x/y/th + arm) -------------------------
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, JointNames[i]);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved"), JointNames[i]));
+			S.Cleanup();
+			return false;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+	const int32 QxAdr = QposAdrs[0], QyAdr = QposAdrs[1], QthAdr = QposAdrs[2];
+
+	// --- 3. Twist bus + controller: posture(arm) + twist_follow(base) ----------
+	UMjTwistController* Twist = NewObject<UMjTwistController>(Robot, TEXT("TwistBus"));
+	Twist->RegisterComponent();
+
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKTwistFollow"));
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Follow;
+	Follow.Kind = EMinkTaskKind::TwistFollow;
+	Follow.Cost = 1.0f;
+	Follow.Joints = BaseJoints; // ORDERED x, y, th
+
+	Ctrl->Tasks = {Posture, Follow};
+
+	FMinkLimitSpec ConfLimit;
+	FMinkLimitSpec VelLimit;
+	VelLimit.Kind = EMinkLimitKind::Velocity;
+	VelLimit.MaxVelocity = 0.6f;
+	VelLimit.Joints = BaseJoints;
+	Ctrl->Limits = {ConfLimit, VelLimit};
+
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = 1; // real-time tracking — velocity limits govern pace
+	Ctrl->RegisterComponent();
+
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	auto RunSteps = [&](int32 N) -> bool {
+		for (int32 K = 0; K < N; ++K)
+		{
+			Ctrl->ComputeAndApply(M, D, 0);
+			mj_step(M, D);
+			for (int32 v = 0; v < M->nv; ++v)
+			{
+				if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+				{
+					AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	// --- 4. Zero twist: base must hold --------------------------------------
+	if (!RunSteps(200))
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double HoldX = D->qpos[QxAdr], HoldY = D->qpos[QyAdr];
+	TestTrue(FString::Printf(TEXT("zero twist holds (|x| %.4f, |y| %.4f < 0.01)"), HoldX, HoldY),
+		FMath::Abs(HoldX) < 0.01 && FMath::Abs(HoldY) < 0.01);
+
+	// --- 5. Forward 0.3 m/s for 2 s: base advances ~0.6 m ---------------------
+	Twist->SetTwist(0.3f, 0.f, 0.f);
+	if (!RunSteps(1000)) // 2 s at the model's 0.002 timestep
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double FwdX = D->qpos[QxAdr];
+	TestTrue(FString::Printf(TEXT("forward twist tracked (x %.3f in [0.45, 0.65])"), FwdX),
+		FwdX > 0.45 && FwdX < 0.65);
+	TestTrue(FString::Printf(TEXT("no lateral drift (|y| %.4f < 0.05)"), D->qpos[QyAdr]),
+		FMath::Abs(D->qpos[QyAdr]) < 0.05);
+
+	// --- 6. Zero twist: base stops, no target windup ---------------------------
+	Twist->SetTwist(0.f, 0.f, 0.f);
+	if (!RunSteps(200)) // settle
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double StopX = D->qpos[QxAdr];
+	if (!RunSteps(200))
+	{
+		S.Cleanup();
+		return false;
+	}
+	TestTrue(FString::Printf(TEXT("base stopped (drift %.4f < 0.01 over 0.4 s)"),
+				 FMath::Abs(D->qpos[QxAdr] - StopX)),
+		FMath::Abs(D->qpos[QxAdr] - StopX) < 0.01);
+
+	// --- 7. Yaw 0.5 rad/s for 1 s: base rotates in place ------------------------
+	const double YawX0 = D->qpos[QxAdr], YawY0 = D->qpos[QyAdr];
+	Twist->SetTwist(0.f, 0.f, 0.5f);
+	const bool bYawOk = RunSteps(500);
+	Twist->SetTwist(0.f, 0.f, 0.f);
+	const double Th = D->qpos[QthAdr];
+	TestTrue(FString::Printf(TEXT("yaw tracked (th %.3f in [0.35, 0.60])"), Th),
+		Th > 0.35 && Th < 0.60);
+	TestTrue(FString::Printf(TEXT("position holds under yaw (|dx| %.4f, |dy| %.4f < 0.05)"),
+				 FMath::Abs(D->qpos[QxAdr] - YawX0), FMath::Abs(D->qpos[QyAdr] - YawY0)),
+		FMath::Abs(D->qpos[QxAdr] - YawX0) < 0.05 && FMath::Abs(D->qpos[QyAdr] - YawY0) < 0.05);
+
+	S.Cleanup();
+	return bYawOk;
 }

@@ -38,6 +38,8 @@
 #include "MuJoCo/Components/Geometry/MjGeom.h"
 #include "MuJoCo/Components/Bodies/MjBody.h"
 #include "MuJoCo/Components/Joints/MjJoint.h"
+#include "MuJoCo/Input/MjTwistController.h"
+#include "MuJoCo/Navigation/MjBaseIntegrate.h"
 #include "MuJoCo/Utils/MjUtils.h"
 #include "Utils/URLabLogging.h"
 #include "DrawDebugHelpers.h"
@@ -204,9 +206,16 @@ struct UMjMinkIKController::FMinkIKState
 	{
 		TUniquePtr<FMinkBaseTask> Task;
 		FMinkFrameTask* AsFrame = nullptr;     // non-owning view iff Kind==Frame
-		FMinkPostureTask* AsPosture = nullptr; // non-owning view iff Kind==Posture
+		FMinkPostureTask* AsPosture = nullptr; // non-owning view iff Kind==Posture||TwistFollow
 		int32 SpecIndex = INDEX_NONE;
 		int32 MocapIndex = -1; // m->body_mocapid slot, or -1
+
+		// TwistFollow only: the base-DOF integrator state (physics thread).
+		bool bTwistFollow = false;
+		int32 TwistQposAdr[3] = {-1, -1, -1}; // x, y, th qpos addresses
+		int32 TwistJointId[3] = {-1, -1, -1}; // x, y, th joint ids (range clamps)
+		double TwistTarget[3] = {0.0, 0.0, 0.0};
+		bool bTwistSeeded = false; // (re)seed from the reference on first use
 	};
 
 	TUniquePtr<FMinkConfiguration> Config;
@@ -246,6 +255,11 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 	Mink = MakePimpl<FMinkIKState>();
 	Mink->Config = MakeUnique<FMinkConfiguration>(m);
 	Mink->Config->Update(d->qpos);
+
+	// Sibling twist source for TwistFollow tasks. Bind runs before stepping, so
+	// component discovery is safe here (BaseDrive does the same); GetTwist() is
+	// thread-safe for the physics-thread reads later.
+	TwistSource = GetOwner() ? GetOwner()->FindComponentByClass<UMjTwistController>() : nullptr;
 
 	RebuildFromSpecs(m, d);
 	BuiltGeneration = SpecGeneration.GetValue();
@@ -407,6 +421,41 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 				TArray<int32> JointIds;
 				ResolveJointIds(m, S.Joints, S.JointNames, JointIds);
 				Built.Task = MakeUnique<FMinkDampingTask>(m, SubsetCost(m, JointIds, (double)S.Cost));
+				break;
+			}
+			case EMinkTaskKind::TwistFollow:
+			{
+				// A posture task over the base DOFs whose target the per-step
+				// integrator advances from the twist bus (see ComputeAndApply).
+				// Joints must be EXACTLY the 3 base joints in x, y, th order —
+				// ResolveJointIds preserves the spec order.
+				TArray<int32> JointIds;
+				ResolveJointIds(m, S.Joints, S.JointNames, JointIds);
+				if (JointIds.Num() != 3)
+				{
+					UE_LOG(LogURLabRuntime, Warning,
+						TEXT("[MinkIK] Tasks[%d]: TwistFollow needs exactly 3 joints (x, y, th in order), got %d — skipped."),
+						i, JointIds.Num());
+					continue;
+				}
+				if (!TwistSource)
+				{
+					UE_LOG(LogURLabRuntime, Warning,
+						TEXT("[MinkIK] Tasks[%d]: TwistFollow has no UMjTwistController sibling — base will hold its seed pose."),
+						i);
+				}
+				auto Twist = MakeUnique<FMinkPostureTask>(m, SubsetCost(m, JointIds, (double)S.Cost),
+					(double)S.Gain, (double)S.LmDamping);
+				Twist->SetTargetFromConfiguration(Config);
+				for (int32 k = 0; k < 3; ++k)
+				{
+					Built.TwistJointId[k] = JointIds[k];
+					Built.TwistQposAdr[k] = m->jnt_qposadr[JointIds[k]];
+				}
+				Built.bTwistFollow = true;
+				Built.bTwistSeeded = false; // seeded from the reference on first step
+				Built.AsPosture = Twist.Get();
+				Built.Task = MoveTemp(Twist);
 				break;
 			}
 		}
@@ -705,6 +754,8 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 				// Kevin sets the posture target after the home reset; ours was
 				// captured at Bind (spawn) — refresh it from the re-based reference.
 				B.AsPosture->SetTargetFromConfiguration(Config);
+				// TwistFollow integrators re-seed from the re-based reference too.
+				B.bTwistSeeded = false;
 			}
 			else if (B.AsFrame)
 			{
@@ -723,6 +774,54 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 /*Source*
 			TEXT("[MinkIK] first integration (bind or sim reset): re-based reference + passive targets from live state"));
 	}
 	LastSimTime = Now;
+
+	// TwistFollow: advance each follower's base target from the twist bus —
+	// ONCE per physics step (this step's Dt), before the solve iterations.
+	// Everything runs in REFERENCE space (the IK's open-loop config), not live
+	// qpos: if the QP starves the base to serve another task, the reference
+	// stops advancing and the leash self-limits the target — no windup. The
+	// twist -> world rotation + integrate/leash/reseed math is shared with
+	// UMjBaseDriveController (MjBaseIntegrate).
+	for (FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
+	{
+		if (!B.bTwistFollow || !B.AsPosture)
+		{
+			continue;
+		}
+		const bool bTaskOn = !CfgSpecEnabled.IsValidIndex(B.SpecIndex) || CfgSpecEnabled[B.SpecIndex];
+		if (!bTaskOn)
+		{
+			B.bTwistSeeded = false; // re-seed cleanly on re-enable
+			continue;
+		}
+		FMinkVec TargetQ = Config.GetQ();
+		if (!B.bTwistSeeded)
+		{
+			for (int32 k = 0; k < 3; ++k)
+			{
+				B.TwistTarget[k] = TargetQ[B.TwistQposAdr[k]];
+			}
+			B.bTwistSeeded = true;
+		}
+		const FVector Tw = TwistSource ? TwistSource->GetTwist() : FVector::ZeroVector;
+		double VWorld[3];
+		MjBaseIntegrate::TwistToWorld(Tw.X, Tw.Y, Tw.Z, TargetQ[B.TwistQposAdr[2]], VWorld);
+		const MjBaseIntegrate::FLeashParams Leash; // BaseDrive defaults
+		for (int32 k = 0; k < 3; ++k)
+		{
+			const int32 Jid = B.TwistJointId[k];
+			const bool bLimited = Jid >= 0 && m->jnt_limited[Jid];
+			B.TwistTarget[k] = MjBaseIntegrate::IntegrateLeashed(B.TwistTarget[k], VWorld[k], Dt,
+				/*Measured*/ TargetQ[B.TwistQposAdr[k]], /*bAngular*/ k == 2, Leash, bLimited,
+				bLimited ? (double)m->jnt_range[Jid * 2] : 0.0,
+				bLimited ? (double)m->jnt_range[Jid * 2 + 1] : 0.0);
+			TargetQ[B.TwistQposAdr[k]] = B.TwistTarget[k];
+		}
+		// Non-base entries carry the current reference q — their cost is zero
+		// (SubsetCost), so only the 3 base entries shape the QP objective.
+		B.AsPosture->SetTarget(TargetQ);
+	}
+
 	for (int32 It = 0; It < CfgMaxIters; ++It)
 	{
 		const FMinkIKResult R = MinkSolveIK(Config, Active, Dt, (double)CfgQpDamping,
