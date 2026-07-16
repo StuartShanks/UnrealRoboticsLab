@@ -101,6 +101,7 @@ FPursuitResult ComputeTwist(const TArray<FVector>& PathPoints,
 	const FPursuitState& State, const FPursuitParams& P)
 {
 	FPursuitResult R;
+	R.DesiredYawRad = State.YawRad; // hold current heading unless steering below
 	if (PathPoints.Num() == 0)
 	{
 		R.bArrived = true;
@@ -132,12 +133,15 @@ FPursuitResult ComputeTwist(const TArray<FVector>& PathPoints,
 		Dir = (Goal - Pos).GetSafeNormal();
 	const float Speed = P.MaxSpeed * FMath::Min(1.f, DistToGoal / P.DecelRadius);
 
-	// 4. Yaw command toward direction of travel (UE yaw, +CW from above).
+	// 4. Yaw command toward direction of travel (UE yaw, +CW from above). The
+	//    desired heading is always reported (carrot consumers need it); the
+	//    yaw-RATE command stays gated on MinSpeedForHeading so a crawling base
+	//    doesn't spin in place chasing heading noise.
+	R.DesiredYawRad = FMath::Atan2(Dir.Y, Dir.X);
 	float UEYawRate = 0.f;
 	if (Speed >= P.MinSpeedForHeading)
 	{
-		const float DesiredYaw = FMath::Atan2(Dir.Y, Dir.X);
-		const float Err = ShortestAngleRad(State.YawRad, DesiredYaw);
+		const float Err = ShortestAngleRad(State.YawRad, R.DesiredYawRad);
 		UEYawRate = FMath::Clamp(P.YawGain * Err, -P.MaxYawRate, P.MaxYawRate);
 	}
 

@@ -126,3 +126,49 @@ bool FMjNavPursuitShortestAngle::RunTest(const FString&)
 		ShortestAngleRad(-PI + 0.1f, PI - 0.1f), -0.2f, 1e-4f);
 	return true;
 }
+
+// URLab.Nav.Pursuit.DesiredYaw — the carrot heading (nav-through-mink step 1):
+// always reported toward the direction of travel, independent of the
+// MinSpeedForHeading gate on the yaw-RATE command; held at State.YawRad on
+// arrival and on an empty path.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavPursuitDesiredYaw,
+	"URLab.Nav.Pursuit.DesiredYaw",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavPursuitDesiredYaw::RunTest(const FString&)
+{
+	FPursuitParams P;
+	FPursuitState S; // origin, yaw 0
+
+	// Straight +X: desired heading 0.
+	TArray<FVector> PathX = {FVector::ZeroVector, FVector(1000, 0, 0)};
+	FPursuitResult R = ComputeTwist(PathX, S, P);
+	TestEqual(TEXT("+X path → desired yaw 0"), R.DesiredYawRad, 0.f, 1e-3f);
+
+	// Straight +Y (UE): desired heading +PI/2 (UE yaw, +CW from above).
+	TArray<FVector> PathY = {FVector::ZeroVector, FVector(0, 1000, 0)};
+	R = ComputeTwist(PathY, S, P);
+	TestEqual(TEXT("+Y path → desired yaw +PI/2"), R.DesiredYawRad, HALF_PI, 1e-3f);
+
+	// Crawling (goal just outside acceptance, deep in decel → speed below
+	// MinSpeedForHeading): yaw RATE must stay gated to zero, but the desired
+	// heading is still reported toward the direction of travel.
+	FPursuitParams Slow = P;
+	Slow.MinSpeedForHeading = 10.0f; // force the gate closed at any speed
+	TArray<FVector> PathYSlow = {FVector::ZeroVector, FVector(0, P.AcceptanceRadius * 2.f, 0)};
+	R = ComputeTwist(PathYSlow, S, Slow);
+	TestEqual(TEXT("gated: yaw rate 0"), R.YawRate, 0.f, 1e-4f);
+	TestEqual(TEXT("gated: desired yaw still reported"), R.DesiredYawRad, HALF_PI, 1e-3f);
+
+	// Arrival: hold the CURRENT heading (no snap toward the goal direction).
+	FPursuitState Held = S;
+	Held.YawRad = 1.234f;
+	TArray<FVector> PathClose = {FVector::ZeroVector, FVector(P.AcceptanceRadius * 0.5f, 0, 0)};
+	R = ComputeTwist(PathClose, Held, P);
+	TestTrue(TEXT("arrived"), R.bArrived);
+	TestEqual(TEXT("arrival holds current yaw"), R.DesiredYawRad, 1.234f, 1e-4f);
+
+	// Empty path: hold too.
+	R = ComputeTwist({}, Held, P);
+	TestEqual(TEXT("empty path holds current yaw"), R.DesiredYawRad, 1.234f, 1e-4f);
+	return true;
+}

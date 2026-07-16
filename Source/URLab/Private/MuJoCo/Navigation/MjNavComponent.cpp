@@ -151,11 +151,25 @@ void UMjNavComponent::SetPathForTesting(const TArray<FVector>& PathPoints)
 	SetState(EMjNavState::Navigating);
 }
 
+bool UMjNavComponent::GetLookahead(FVector& OutUEPos, float& OutUEYawRad) const
+{
+	if (!bHasLookahead)
+		return false;
+	OutUEPos = LookaheadUE;
+	OutUEYawRad = LookaheadYawUE;
+	return true;
+}
+
 void UMjNavComponent::StopWithState(EMjNavState S)
 {
 	if (UMjTwistController* T = FindTwist())
 		T->SetTwist(0.f, 0.f, 0.f);
 	DistToGoalM.store(S == EMjNavState::Arrived ? 0.f : -1.f, std::memory_order_release);
+	// Arrived keeps the final carrot (the goal pose, stored by the tick that
+	// detected arrival) so a carrot consumer can hold station; Idle/Failed
+	// invalidate it.
+	if (S != EMjNavState::Arrived)
+		bHasLookahead = false;
 	SetState(S);
 	if (S == EMjNavState::Arrived)
 		OnNavGoalReached.Broadcast();
@@ -193,6 +207,13 @@ void UMjNavComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	P.MinSpeedForHeading = MinSpeedForHeading;
 
 	const MjNavPursuit::FPursuitResult R = MjNavPursuit::ComputeTwist(Path, S, P);
+
+	// Publish the carrot before the arrival check: on the arrival tick the
+	// result carries the goal point + held yaw, which is exactly the pose a
+	// carrot consumer should hold after Arrived.
+	LookaheadUE = R.LookaheadPoint;
+	LookaheadYawUE = R.DesiredYawRad;
+	bHasLookahead = true;
 
 	const float DistCm = FVector::Dist2D(S.Position, Path.Last());
 	DistToGoalM.store(DistCm / 100.f, std::memory_order_release);

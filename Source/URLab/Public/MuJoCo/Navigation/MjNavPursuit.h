@@ -60,6 +60,12 @@ struct FPursuitResult
 	float YawRate = 0.f; // rad/s, CCW positive (bus convention)
 	bool bArrived = false;
 	FVector LookaheadPoint = FVector::ZeroVector; // UE cm, for debug draw
+	/** Desired heading toward the direction of travel, UE yaw rad (+CW from
+	 *  above). Always computed (the yaw-RATE command stays gated on
+	 *  MinSpeedForHeading); on arrival / empty path it holds State.YawRad.
+	 *  LookaheadPoint + this is the "carrot" pose a whole-body IK consumer
+	 *  can track instead of the twist. */
+	float DesiredYawRad = 0.f;
 };
 
 /** Signed shortest angular error FromRad→ToRad in (-PI, PI]. */

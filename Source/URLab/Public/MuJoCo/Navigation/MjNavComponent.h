@@ -110,6 +110,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Nav")
 	float GetDistanceToGoal() const { return DistToGoalM.load(std::memory_order_acquire); }
 
+	/** Latest pursuit lookahead ("carrot") pose: position in UE cm plus the
+	 *  desired UE yaw (rad, +CW from above — heading toward the direction of
+	 *  travel). Valid while Navigating (from the first tick after a goal is
+	 *  set) and after Arrived (holds the goal point); returns false when
+	 *  Idle/Failed. Game thread only — written by TickComponent, and the
+	 *  get_nav_status bridge op marshals its read to the game thread. This is
+	 *  the pose a whole-body IK consumer streams as a base Frame-task target
+	 *  instead of consuming the twist. */
+	bool GetLookahead(FVector& OutUEPos, float& OutUEYawRad) const;
+
 	/** TEST SEAM: start following an injected polyline (UE cm) without a
 	 *  navmesh. Same follower path as SetNavGoal. */
 	void SetPathForTesting(const TArray<FVector>& PathPoints);
@@ -126,6 +136,11 @@ private:
 	// Watchdog bookkeeping (game thread).
 	float BestDistToGoalCm = TNumericLimits<float>::Max();
 	float TimeSinceProgress = 0.f;
+
+	// Latest pursuit carrot (game thread; see GetLookahead).
+	FVector LookaheadUE = FVector::ZeroVector;
+	float LookaheadYawUE = 0.f;
+	bool bHasLookahead = false;
 
 	void SetState(EMjNavState S) { StateAtomic.store((uint8)S, std::memory_order_release); }
 	void StopWithState(EMjNavState S); // zero twist + set state (+ fire delegate)

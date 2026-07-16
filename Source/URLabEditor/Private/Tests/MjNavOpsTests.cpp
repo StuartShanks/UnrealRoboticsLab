@@ -131,3 +131,59 @@ bool FMjNavOpsStatus::RunTest(const FString&)
 	S.Cleanup();
 	return true;
 }
+
+// URLab.Nav.Ops.StatusLookahead — get_nav_status carries the pursuit carrot in
+// MuJoCo convention (nav-through-mink step 1): absent before the first
+// navigating tick, then lookahead_pos (metres, y = −UE_Y/100) + lookahead_yaw
+// (rad, CCW = −UE yaw) — the inverse of set_nav_goal's MJ→UE mapping, so a
+// script can stream it straight into a base Frame-task target.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavOpsStatusLookahead,
+	"URLab.Nav.Ops.StatusLookahead",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavOpsStatusLookahead::RunTest(const FString&)
+{
+	UMjNavComponent* Nav = nullptr;
+	FMjUESession S;
+	if (!S.Init([&Nav](FMjUESession& Sess) {
+			Nav = NewObject<UMjNavComponent>(Sess.Robot, TEXT("NavComp"));
+			Nav->RegisterComponent();
+		}))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+	Disp->SetActiveSessionIdForTest(TEXT("test-session"));
+
+	// No goal yet: has_lookahead false, pose fields omitted.
+	TSharedPtr<FJsonObject> Reply = Disp->Dispatch(NavReq(TEXT("get_nav_status"), S.Robot->GetName()));
+	bool bHas = true;
+	TestTrue(TEXT("has_lookahead field present"), Reply->TryGetBoolField(TEXT("has_lookahead"), bHas));
+	TestFalse(TEXT("no carrot before a goal"), bHas);
+	TestFalse(TEXT("pose omitted when invalid"), Reply->HasField(TEXT("lookahead_pos")));
+
+	// Path 5 m along UE −Y from the origin-spawned robot, one tick: carrot UE
+	// (0, −LookaheadDist) → MJ [0, +LookaheadDist/100]; UE heading −PI/2 → MJ
+	// yaw +PI/2 (CCW toward MuJoCo left, same convention as the twist bus).
+	Nav->SetPathForTesting({FVector::ZeroVector, FVector(0, -500, 0)});
+	Nav->TickComponent(0.016f, LEVELTICK_All, nullptr);
+	Reply = Disp->Dispatch(NavReq(TEXT("get_nav_status"), S.Robot->GetName()));
+	Reply->TryGetBoolField(TEXT("has_lookahead"), bHas);
+	if (TestTrue(TEXT("carrot valid while navigating"), bHas))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Pos = nullptr;
+		if (TestTrue(TEXT("lookahead_pos [x, y]"),
+				Reply->TryGetArrayField(TEXT("lookahead_pos"), Pos) && Pos && Pos->Num() == 2))
+		{
+			TestEqual(TEXT("x (MJ m)"), (*Pos)[0]->AsNumber(), 0.0, 1e-2);
+			TestEqual(TEXT("y = -UE_Y/100 (MJ m)"), (*Pos)[1]->AsNumber(),
+				(double)Nav->LookaheadDist / 100.0, 1e-2);
+		}
+		double Yaw = 0.0;
+		TestTrue(TEXT("lookahead_yaw field"), Reply->TryGetNumberField(TEXT("lookahead_yaw"), Yaw));
+		TestEqual(TEXT("yaw = -UE yaw (MJ CCW)"), Yaw, (double)HALF_PI, 1e-3);
+	}
+	S.Cleanup();
+	return true;
+}

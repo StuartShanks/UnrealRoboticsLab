@@ -40,6 +40,8 @@
 #include "MjTestHelpers.h"
 #include "Bridge/RpcDispatcher.h"
 #include "Bridge/BridgeServer.h"
+#include "Bridge/OpRegistry.h"
+#include "MuJoCo/Components/Sensors/MjCamera.h"
 #include "Transport/ZmqRpcTransport.h"
 #include "Bridge/MsgpackHelpers.h"
 #include "MuJoCo/Components/Controllers/MjPDController.h"

@@ -164,3 +164,52 @@ bool FMjNavCompClear::RunTest(const FString&)
 	S.Cleanup();
 	return true;
 }
+
+// URLab.Nav.Component.LookaheadPose — the carrot accessor (nav-through-mink
+// step 1): invalid until the first navigating tick; tracks the pursuit
+// lookahead while navigating; holds the goal after arrival; invalidated by
+// ClearNavGoal.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavCompLookahead,
+	"URLab.Nav.Component.LookaheadPose",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavCompLookahead::RunTest(const FString&)
+{
+	FNavRig Rig;
+	FMjUESession S;
+	if (!S.Init([&Rig](FMjUESession& Sess) { Rig.Configure(Sess); }))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	FVector Look;
+	float LookYaw = 0.f;
+	TestFalse(TEXT("no carrot before a goal"), Rig.Nav->GetLookahead(Look, LookYaw));
+
+	// Path 5 m straight +X from the origin-spawned robot: after one tick the
+	// carrot sits LookaheadDist ahead on the path, heading 0.
+	Rig.Nav->SetPathForTesting({FVector::ZeroVector, FVector(500, 0, 0)});
+	TestFalse(TEXT("no carrot until the first tick"), Rig.Nav->GetLookahead(Look, LookYaw));
+	Rig.Nav->TickComponent(0.016f, LEVELTICK_All, nullptr);
+	if (TestTrue(TEXT("carrot valid while navigating"), Rig.Nav->GetLookahead(Look, LookYaw)))
+	{
+		TestEqual(TEXT("carrot X = LookaheadDist along path"), (float)Look.X, Rig.Nav->LookaheadDist, 1.f);
+		TestEqual(TEXT("carrot Y on path"), (float)Look.Y, 0.f, 1.f);
+		TestEqual(TEXT("carrot yaw = path heading"), LookYaw, 0.f, 1e-3f);
+	}
+
+	// Goal within AcceptanceRadius: the arrival tick stores the goal pose and
+	// Arrived keeps it (a carrot consumer holds station).
+	Rig.Nav->SetPathForTesting({FVector::ZeroVector, FVector(5, 0, 0)});
+	Rig.Nav->TickComponent(0.016f, LEVELTICK_All, nullptr);
+	TestEqual(TEXT("arrived"), (int)Rig.Nav->GetNavState(), (int)EMjNavState::Arrived);
+	if (TestTrue(TEXT("carrot survives arrival"), Rig.Nav->GetLookahead(Look, LookYaw)))
+	{
+		TestEqual(TEXT("carrot = goal after arrival"), (float)Look.X, 5.f, 1e-2f);
+	}
+
+	Rig.Nav->ClearNavGoal();
+	TestFalse(TEXT("carrot invalidated by ClearNavGoal"), Rig.Nav->GetLookahead(Look, LookYaw));
+	S.Cleanup();
+	return true;
+}

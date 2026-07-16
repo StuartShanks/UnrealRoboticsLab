@@ -219,7 +219,9 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 		/*Required=*/{TEXT("articulation"), TEXT("x"), TEXT("y")});
 	Reg(TEXT("get_nav_status"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleGetNavStatus(R); },
-		/*Reply=*/{TEXT("op:string"), TEXT("state:string"), TEXT("distance_to_goal:float")},
+		/*Reply=*/
+		{TEXT("op:string"), TEXT("state:string"), TEXT("distance_to_goal:float"),
+			TEXT("has_lookahead:bool"), TEXT("lookahead_pos:array"), TEXT("lookahead_yaw:float")},
 		/*Required=*/{TEXT("articulation")});
 	Reg(TEXT("set_active_controller"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetActiveController(R); },
@@ -2740,6 +2742,9 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	EMjNavState NavState = EMjNavState::Idle;
 	float DistanceToGoal = 0.0f;
 	bool bHasComponent = false;
+	bool bHasLookahead = false;
+	FVector LookaheadUE = FVector::ZeroVector;
+	float LookaheadYawUE = 0.0f;
 	if (IsInGameThread())
 	{
 		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
@@ -2747,6 +2752,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 			bHasComponent = true;
 			NavState = Nav->GetNavState();
 			DistanceToGoal = Nav->GetDistanceToGoal();
+			bHasLookahead = Nav->GetLookahead(LookaheadUE, LookaheadYawUE);
 		}
 	}
 	else
@@ -2762,6 +2768,8 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 			std::atomic<EMjNavState> NavState{EMjNavState::Idle};
 			FThreadSafeBool bHasComponent{false};
 			std::atomic<float> DistanceToGoal{0.0f};
+			FThreadSafeBool bHasLookahead{false};
+			std::atomic<float> LookX{0.0f}, LookY{0.0f}, LookYaw{0.0f}; // UE cm / UE yaw rad
 		};
 		TSharedPtr<FNavStatusResult, ESPMode::ThreadSafe> Result =
 			MakeShared<FNavStatusResult, ESPMode::ThreadSafe>();
@@ -2775,6 +2783,15 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 					Result->bHasComponent = true;
 					Result->NavState = Nav->GetNavState();
 					Result->DistanceToGoal = Nav->GetDistanceToGoal();
+					FVector Look;
+					float LookYaw = 0.f;
+					if (Nav->GetLookahead(Look, LookYaw))
+					{
+						Result->bHasLookahead = true;
+						Result->LookX = (float)Look.X;
+						Result->LookY = (float)Look.Y;
+						Result->LookYaw = LookYaw;
+					}
 				}
 			}
 			Done->Trigger();
@@ -2784,6 +2801,9 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 		bHasComponent = Result->bHasComponent;
 		NavState = Result->NavState.load();
 		DistanceToGoal = Result->DistanceToGoal.load();
+		bHasLookahead = Result->bHasLookahead;
+		LookaheadUE = FVector(Result->LookX.load(), Result->LookY.load(), 0.f);
+		LookaheadYawUE = Result->LookYaw.load();
 	}
 
 	if (!bHasComponent)
@@ -2809,6 +2829,19 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	Reply->SetStringField(TEXT("op"), TEXT("get_nav_status_ok"));
 	Reply->SetStringField(TEXT("state"), StateStr);
 	Reply->SetNumberField(TEXT("distance_to_goal"), DistanceToGoal);
+	// Pursuit carrot pose, MuJoCo convention (metres, yaw CCW) — the inverse of
+	// set_nav_goal's MJ→UE mapping above (x=X/100, y=−Y/100, yaw=−UE yaw). This
+	// is the pose a whole-body IK consumer streams as its base Frame-task
+	// target. Valid while navigating and after arrival (holds the goal).
+	Reply->SetBoolField(TEXT("has_lookahead"), bHasLookahead);
+	if (bHasLookahead)
+	{
+		TArray<TSharedPtr<FJsonValue>> Pos;
+		Pos.Add(MakeShared<FJsonValueNumber>(LookaheadUE.X / 100.0));
+		Pos.Add(MakeShared<FJsonValueNumber>(-LookaheadUE.Y / 100.0));
+		Reply->SetArrayField(TEXT("lookahead_pos"), Pos);
+		Reply->SetNumberField(TEXT("lookahead_yaw"), -LookaheadYawUE);
+	}
 	return Reply;
 }
 
