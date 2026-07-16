@@ -182,6 +182,19 @@ def synced_site_pose(client, site_suffix: str):
     return pos, quat
 
 
+def _hold_suction(client, name: str) -> None:
+    """Re-assert suction=1.0. A direct-mode client.step (which every synced
+    physics read does) ZEROS actuator NetworkValues server-side — an engine
+    behavior (the step pushes the client's zero ctrl array), so any synced read
+    silently un-sets an engaged suction. Grip/verify phases must re-assert after
+    every stepping read. (Engine follow-up: direct-step should preserve
+    NetworkValues it isn't explicitly overwriting.)"""
+    try:
+        client.runtime.set_suction(articulation=name, value=1.0)
+    except Exception:
+        pass  # never let a re-assert crash a tick
+
+
 def _object_z(client, object_actor_id: str) -> float:
     """Read the object's LIVE PHYSICS z (its MuJoCo body world pos via the synced
     mirror). find_actors(in_pie=True) must NOT be used here: for a spawned free
@@ -619,6 +632,8 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         if not self._engaged and dist_to_surf <= self.ENGAGE_DIST_M:
             client.runtime.set_suction(articulation=bb.name, value=1.0)
             self._engaged = True
+        elif self._engaged:
+            _hold_suction(client, bb.name)  # the synced read above zeroed it
 
         if not self._settling:
             # Ramp phase: bounded-error descent from the pre-approach pose.
@@ -632,9 +647,8 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         # Settle phase: keep pressing the live target until real contact, so the
         # arm converges and adhesion grabs (rather than lifting off a lagging ramp).
         stream_target(client, bb.name, pressed, self._quat)
-        if not self._engaged:  # belt-and-braces: never finish unattached
-            client.runtime.set_suction(articulation=bb.name, value=1.0)
-            self._engaged = True
+        client.runtime.set_suction(articulation=bb.name, value=1.0)  # re-assert (read zeroed it)
+        self._engaged = True
         if dist_to_surf <= self.CONTACT_DIST_M:
             return py_trees.common.Status.SUCCESS
         if time.time() - self._settle_t0 >= self.SETTLE_TIMEOUT_S:
@@ -681,6 +695,7 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
         except RuntimeError as e:
             self._init_error = str(e)
             return
+        _hold_suction(client, bb.name)  # the two synced reads above zeroed suction
         self._start_pose = p0
         self._quat = q0
         self._target = p0 + np.array([0.0, 0.0, self.LIFT_M])
@@ -706,6 +721,7 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         rose = z_after - self._z_before
         if rose >= self.RISE_OK_M:
+            _hold_suction(client, bb.name)  # the _object_z read zeroed it — keep gripping for the carry
             return py_trees.common.Status.SUCCESS
 
         if self._retried:
@@ -770,6 +786,7 @@ class StowCarry(py_trees.behaviour.Behaviour):
         except RuntimeError as e:
             self._init_error = str(e)
             return
+        _hold_suction(client, bb.name)  # keep the grip through the carry (read zeroed it)
         self._start_pose = p0
         self._quat = q0
         self._target = p0 + self.OFFSET
