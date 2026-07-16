@@ -1,0 +1,11 @@
+<mujoco model="suction_box">
+  <worldbody>
+    <body name="pick_box">
+      <freejoint/>
+      <geom name="pick_box_geom" type="box" size="0.05 0.05 0.05"
+            density="300" rgba="0.9 0.6 0.1 1"/>
+      <site name="affordance_suction_top" pos="0 0 0.05" zaxis="0 0 1"
+            type="cylinder" size="0.01 0.001" rgba="0 1 0 0.5"/>
+    </body>
+  </worldbody>
+</mujoco>
