@@ -1075,6 +1075,13 @@ void UMjMinkIKController::TickComponent(float DeltaTime, ELevelTick TickType,
 		// shapes; see MjPerturbation.cpp / MjNavComponent.cpp) is enough.
 		DrawDebugSphere(World, WorldPos, DrawTargetSize, 12, FColor::Red, false, -1.0f, 0, 1.0f);
 		DrawDebugCoordinateSystem(World, WorldPos, WorldRot.Rotator(), DrawTargetSize * 2.0f, false, -1.0f, 0, 1.5f);
+		// Bold approach arrow along the target frame's local +Z (the tool axis:
+		// for a top-down suction pick this points DOWN when correctly oriented),
+		// so the target ORIENTATION is readable at a glance, not just position.
+		const FVector ApproachDir = WorldRot.RotateVector(FVector::ZAxisVector);
+		const float ArrowLen = DrawTargetSize * 5.0f;
+		DrawDebugDirectionalArrow(World, WorldPos, WorldPos + ApproachDir * ArrowLen,
+			ArrowLen * 0.3f, FColor::Cyan, false, -1.0f, 0, 2.5f);
 	}
 #endif // ENABLE_DRAW_DEBUG
 }
