@@ -42,6 +42,7 @@ from tidybot_mobile_manip_demo import (
     STAGING,
 )
 from tidybot_guarded_reach_demo import LINK_STANDOFF, ROBOT_LINKS, TABLE
+from tidybot_mink_demo import ARM_JOINTS, BASE_JOINTS
 from tidybot_twist_follow_demo import DAMPING_TASK, EE_TASK, twist_follow_controller_payload
 from urlab_skills import (
     CorridorClear,
@@ -118,6 +119,11 @@ def suction_pick_controller_payload(obstacle_bodies: list) -> dict:
     parent `base`, which is a real collision mesh one link above the cup."""
     payload = twist_follow_controller_payload()
     payload["tasks"][0]["frame"] = "cup_site"
+    # Posture over ALL TEN joints (not just the arm): the posture_target wire
+    # streams whole-body plans through this task, and SubsetCost zeroes any
+    # joint not listed — base entries would be inert. Deliberate divergence
+    # from the golden-parity example payload (which must stay arm-only).
+    payload["tasks"][1]["joints"] = BASE_JOINTS + ARM_JOINTS
     payload["limits"] += [
         {
             "kind": "collision_avoidance",

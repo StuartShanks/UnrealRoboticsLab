@@ -26,4 +26,15 @@ shoulder = np.array([4.2, 0.0, 0.49])
 assert reach_annulus_ok(shoulder, np.array([4.9, 0.0, 0.5]))          # 0.70 -> ok
 assert not reach_annulus_ok(shoulder, np.array([5.3, 0.0, 0.5]))      # 1.10 -> too far
 assert not reach_annulus_ok(shoulder, np.array([4.3, 0.0, 0.45]))     # 0.11 -> too close
+
+# suction payload: posture task must span all 10 joints (posture_target wire
+# streams whole-body plans through it; SubsetCost makes unlisted joints inert).
+from tidybot_suction_pick_demo import suction_pick_controller_payload
+_payload = suction_pick_controller_payload([])
+assert _payload["tasks"][1]["kind"] == "posture", _payload["tasks"][1]
+assert _payload["tasks"][1]["joints"] == [
+    "joint_x", "joint_y", "joint_th",
+    "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7",
+], _payload["tasks"][1]["joints"]
+
 print("urlab_skills self-tests OK")
