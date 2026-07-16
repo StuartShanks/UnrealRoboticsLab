@@ -23,7 +23,7 @@ from urlab_client.errors import URLabRPCError
 
 from urlab_skills import synced_site_pose, cup_down_quat, _object_z
 from urlab_planner import PLANNED_JOINTS, PlanError, plan_reach
-from tidybot_mink_demo import stream_target
+from tidybot_mink_demo import stream_target, resolve_id_by_suffix
 from tidybot_twist_follow_demo import POSTURE_TASK, DAMPING_TASK
 from tidybot_suction_pick_demo import (ACTOR_ID, ASSETS, MODEL_XML,
                                        PICK_LOCATION, PICK_STAGING,
@@ -120,7 +120,9 @@ def drive():
         m, d = c.model, c.data
         q = np.empty(len(PLANNED_JOINTS))
         for i, jn in enumerate(PLANNED_JOINTS):
-            jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, jn)
+            # suffix resolve: the importer prefixes compiled joint names, so a
+            # bare mj_name2id returns -1 and qposadr[-1] would read garbage.
+            jid = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, jn)
             q[i] = d.qpos[m.jnt_qposadr[jid]]
         return q
 
