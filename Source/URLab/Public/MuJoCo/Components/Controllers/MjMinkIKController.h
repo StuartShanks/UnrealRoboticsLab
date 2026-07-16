@@ -304,9 +304,10 @@ public:
 	 * Bump the spec generation so the running solver rebuilds its task stack from
 	 * the current Tasks / Limits / DriveJoints on the next physics step. Call this
 	 * after mutating the spec arrays on a live controller (e.g. add_controller
-	 * reconfigure). Task costs, damping, and joint subsets are baked into the
-	 * solver when it builds, so they only take effect via this; per-task bEnabled,
-	 * targets, and the solver sliders are read live and don't need it.
+	 * reconfigure; configure_controller's "task_costs" field calls it for you).
+	 * Task costs, damping, and joint subsets are baked into the solver when it
+	 * builds, so they only take effect via this; per-task bEnabled, targets, and
+	 * the solver sliders are read live and don't need it.
 	 */
 	void MarkSpecsChanged() { SpecGeneration.Increment(); }
 

@@ -1458,8 +1458,8 @@ bool FMjMinkIKTidybotFixBaseHolds::RunTest(const FString&)
 	const double FreeBaseTravel = FMath::Sqrt(
 		D->qpos[QxAdr] * D->qpos[QxAdr] + D->qpos[QyAdr] * D->qpos[QyAdr]);
 	if (!TestTrue(FString::Printf(
-			TEXT("precondition: free base drives toward the far target (|base xy| %.3f m > 0.15)"),
-			FreeBaseTravel),
+					  TEXT("precondition: free base drives toward the far target (|base xy| %.3f m > 0.15)"),
+					  FreeBaseTravel),
 			FreeBaseTravel > 0.15))
 	{
 		S.Cleanup();
@@ -1481,8 +1481,8 @@ bool FMjMinkIKTidybotFixBaseHolds::RunTest(const FString&)
 	// reduction vs the free run — not absolute lock; the broken behavior
 	// (enable never reaching the solver) shows no reduction at all.
 	TestTrue(FString::Printf(
-			 TEXT("fix_base engaged: |base xy| %.4f m < 25%% of free-run travel %.3f m (and < 0.15 m)"),
-			 FixedBaseTravel, FreeBaseTravel),
+				 TEXT("fix_base engaged: |base xy| %.4f m < 25%% of free-run travel %.3f m (and < 0.15 m)"),
+				 FixedBaseTravel, FreeBaseTravel),
 		FixedBaseTravel < 0.25 * FreeBaseTravel && FixedBaseTravel < 0.15);
 
 	S.Cleanup();
@@ -1825,4 +1825,294 @@ bool FMjMinkIKTidybotCtrlParity::RunTest(const FString&)
 
 	S.Cleanup();
 	return !bDiverged;
+}
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.LiveTaskCosts
+//   Live per-task cost updates through ApplyConfig ("task_costs" — the nav
+//   roadmap's step 0). The v1 mobile-manip finding this encodes: cost changes
+//   sent via configure_controller were silently ignored (costs are baked into
+//   the built tasks at Bind), which made lazy_base_cost un-tunable live.
+//   Same stack as FixBaseHolds, but the damping task stays ENABLED throughout
+//   and only its COST changes:
+//     A) damping cost 0.01 (negligible) -> base MUST drive (precondition)
+//     B) raise damping cost to 100 live  -> base must hold (the lazy-base case)
+//     C) readback: GetCurrentConfig echoes the updated costs
+//     D) one sparse call zeroes the frame costs AND restores damping 0.01
+//        -> nothing pulls; EE and base must stay put (Frame setters + multi-
+//        task update in a single ApplyConfig)
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotLiveTaskCosts,
+	"URLab.MinkIK.TidyBot.LiveTaskCosts",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotLiveTaskCosts::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Find components (same resolution as FixBaseHolds) -----------------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const TCHAR* Nm = JointNames[i];
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- 3. FixBaseHolds stack, but damping ENABLED at a negligible cost ------
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKLiveCosts"));
+
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr;
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 0.01f; // negligible — the base is effectively free
+	Damping.Joints = BaseJoints;
+	Damping.bEnabled = true; // NEVER toggled in this test; only its cost changes
+
+	Ctrl->Tasks = {Frame, Posture, Damping};
+
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 4. Start clean at home ------------------------------------------------
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	const FVector P0(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1], D->site_xpos[3 * SiteMjId + 2]);
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+	const int32 QxAdr = QposAdrs[0];
+	const int32 QyAdr = QposAdrs[1];
+
+	// Far x-target only the base can chase (same as FixBaseHolds).
+	auto SendTarget = [&]() {
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.X + 0.6));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(P0.Z));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+	};
+
+	// Sparse task_costs update: {SpecIndex -> {field -> value}}.
+	auto SendCosts = [&](std::initializer_list<TTuple<int32, const TCHAR*, double>> Updates) {
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> Costs = MakeShared<FJsonObject>();
+		for (const auto& U : Updates)
+		{
+			const FString Key = FString::FromInt(U.Get<0>());
+			TSharedPtr<FJsonObject> Fields =
+				Costs->HasField(Key) ? Costs->GetObjectField(Key) : MakeShared<FJsonObject>();
+			Fields->SetNumberField(U.Get<1>(), U.Get<2>());
+			Costs->SetObjectField(Key, Fields);
+		}
+		Cfg->SetObjectField(TEXT("task_costs"), Costs);
+		Ctrl->ApplyConfig(Cfg);
+	};
+
+	auto RunSteps = [&](int32 N) -> bool {
+		for (int32 K = 0; K < N; ++K)
+		{
+			Ctrl->ComputeAndApply(M, D, 0);
+			mj_step(M, D);
+			for (int32 v = 0; v < M->nv; ++v)
+			{
+				if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+				{
+					AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	auto BaseTravel = [&]() -> double {
+		return FMath::Sqrt(D->qpos[QxAdr] * D->qpos[QxAdr] + D->qpos[QyAdr] * D->qpos[QyAdr]);
+	};
+
+	auto ResetHome = [&]() {
+		mj_resetDataKeyframe(M, D, KeyId);
+		mj_forward(M, D);
+		UMjArticulationController::NotifySimReset();
+	};
+
+	// --- 5. Phase A: negligible damping cost — base MUST drive (precondition) --
+	SendTarget();
+	if (!RunSteps(500))
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double FreeBaseTravel = BaseTravel();
+	if (!TestTrue(FString::Printf(
+					  TEXT("precondition: near-zero damping cost lets the base drive (|base xy| %.3f m > 0.15)"),
+					  FreeBaseTravel),
+			FreeBaseTravel > 0.15))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- 6. Phase B: raise the damping cost LIVE — base must hold --------------
+	// This is the exact lazy_base_cost scenario that was a silent no-op in
+	// mobile-manip v1: the spec cost changed but the built task kept its
+	// Bind-time cost, so the base drove exactly as in Phase A.
+	ResetHome();
+	SendCosts({MakeTuple(2, TEXT("cost"), 100.0)});
+	SendTarget();
+	const bool bPhaseBOk = RunSteps(500);
+	const double HeavyBaseTravel = BaseTravel();
+	TestTrue(FString::Printf(
+				 TEXT("live damping cost engaged: |base xy| %.4f m < 25%% of free travel %.3f m (and < 0.15 m)"),
+				 HeavyBaseTravel, FreeBaseTravel),
+		HeavyBaseTravel < 0.25 * FreeBaseTravel && HeavyBaseTravel < 0.15);
+
+	// --- 7. Phase C: readback echoes the live costs -----------------------------
+	{
+		TSharedPtr<FJsonObject> Out;
+		Ctrl->GetCurrentConfig(Out);
+		const TArray<TSharedPtr<FJsonValue>>* CostsArr = nullptr;
+		if (TestTrue(TEXT("config reports task_costs"),
+				Out.IsValid() && Out->TryGetArrayField(TEXT("task_costs"), CostsArr) && CostsArr
+					&& CostsArr->Num() == 3))
+		{
+			const TSharedPtr<FJsonObject>* Frame0 = nullptr;
+			const TSharedPtr<FJsonObject>* Damp2 = nullptr;
+			if (TestTrue(TEXT("task_costs entries are objects"),
+					(*CostsArr)[0]->TryGetObject(Frame0) && (*CostsArr)[2]->TryGetObject(Damp2)))
+			{
+				TestEqual(TEXT("frame position_cost echoed"),
+					(*Frame0)->GetNumberField(TEXT("position_cost")), 1.0, 1e-6);
+				TestEqual(TEXT("damping cost echoed after live update"),
+					(*Damp2)->GetNumberField(TEXT("cost")), 100.0, 1e-6);
+			}
+		}
+	}
+
+	// --- 8. Phase D: one sparse call — zero the frame costs, relax the damping --
+	// Frame costs 0 => nothing pulls the EE; base free again but unmotivated.
+	// Tests the Frame setters and a multi-task update in a single ApplyConfig.
+	ResetHome();
+	SendCosts({MakeTuple(0, TEXT("position_cost"), 0.0), MakeTuple(0, TEXT("orientation_cost"), 0.0),
+		MakeTuple(2, TEXT("cost"), 0.01)});
+	SendTarget(); // target set, but the frame task no longer cares
+	const bool bPhaseDOk = RunSteps(300);
+	const double IdleBaseTravel = BaseTravel();
+	const FVector IdleEe(D->site_xpos[3 * SiteMjId + 0], D->site_xpos[3 * SiteMjId + 1],
+		D->site_xpos[3 * SiteMjId + 2]);
+	TestTrue(FString::Printf(
+				 TEXT("zeroed frame costs: base stays (|base xy| %.4f m < 0.05) and EE holds (|dEE| %.4f m < 0.05)"),
+				 IdleBaseTravel, (IdleEe - P0).Length()),
+		IdleBaseTravel < 0.05 && (IdleEe - P0).Length() < 0.05);
+
+	S.Cleanup();
+	return bPhaseBOk && bPhaseDOk;
 }

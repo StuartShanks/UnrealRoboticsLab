@@ -894,6 +894,8 @@ void UMjMinkIKController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) co
 	OutSchema->SetStringField(TEXT("sync_from_live_state"), TEXT("bool"));
 	OutSchema->SetStringField(TEXT("draw_target"), TEXT("bool"));
 	OutSchema->SetStringField(TEXT("task_enabled"), TEXT("array<bool>"));
+	OutSchema->SetStringField(TEXT("task_costs"),
+		TEXT("map<spec index, {position_cost, orientation_cost | cost}>"));
 }
 
 void UMjMinkIKController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const
@@ -912,6 +914,23 @@ void UMjMinkIKController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutP
 		Enabled.Add(MakeShared<FJsonValueBoolean>(S.bEnabled));
 	}
 	OutParams->SetArrayField(TEXT("task_enabled"), Enabled);
+	// Dense per-spec cost report (write side is the sparse "task_costs" map).
+	TArray<TSharedPtr<FJsonValue>> Costs;
+	for (const FMinkTaskSpec& S : Tasks)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		if (S.Kind == EMinkTaskKind::Frame)
+		{
+			O->SetNumberField(TEXT("position_cost"), S.PositionCost);
+			O->SetNumberField(TEXT("orientation_cost"), S.OrientationCost);
+		}
+		else
+		{
+			O->SetNumberField(TEXT("cost"), S.Cost);
+		}
+		Costs.Add(MakeShared<FJsonValueObject>(O));
+	}
+	OutParams->SetArrayField(TEXT("task_costs"), Costs);
 }
 
 void UMjMinkIKController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams)
@@ -956,6 +975,88 @@ void UMjMinkIKController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InP
 		for (int32 i = 0; i < Enabled->Num() && i < Tasks.Num(); ++i)
 		{
 			Tasks[i].bEnabled = (*Enabled)[i]->AsBool();
+		}
+	}
+
+	// Live per-task cost updates. Sparse map keyed by spec index; only the
+	// fields present change:
+	//   "task_costs": { "<idx>": {"position_cost": f, "orientation_cost": f},  (Frame)
+	//                   "<idx>": {"cost": f} }                                 (Posture/Damping)
+	// Costs clamp to >= 0; kind-mismatched fields warn and are ignored. Unlike
+	// task_enabled/targets (read live each solve), costs are BAKED into the
+	// built solver stack — so any accepted change bumps the spec generation and
+	// the physics thread rebuilds from specs on its next step (MarkSpecsChanged,
+	// the same path add_controller reconfigure uses).
+	const TSharedPtr<FJsonObject>* CostsObj = nullptr;
+	if (InParams->TryGetObjectField(TEXT("task_costs"), CostsObj) && CostsObj && CostsObj->IsValid())
+	{
+		bool bAnyCostChanged = false;
+		for (const auto& Pair : (*CostsObj)->Values)
+		{
+			// Strict index parse: Atoi maps junk to 0, so require a round-trip.
+			const int32 Idx = FCString::Atoi(*Pair.Key);
+			if (FString::FromInt(Idx) != Pair.Key || !Tasks.IsValidIndex(Idx))
+			{
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] task_costs: key '%s' is not a valid spec index (have %d specs) — entry ignored."),
+					*Pair.Key, Tasks.Num());
+				continue;
+			}
+			const TSharedPtr<FJsonObject>* Fields = nullptr;
+			if (!Pair.Value.IsValid() || !Pair.Value->TryGetObject(Fields) || !Fields || !Fields->IsValid())
+			{
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] task_costs[%s]: expected an object of cost fields — entry ignored."),
+					*Pair.Key);
+				continue;
+			}
+			FMinkTaskSpec& Spec = Tasks[Idx];
+			const bool bFrame = Spec.Kind == EMinkTaskKind::Frame;
+			double CV = 0.0;
+			if ((*Fields)->TryGetNumberField(TEXT("position_cost"), CV))
+			{
+				if (bFrame)
+				{
+					Spec.PositionCost = (float)FMath::Max(0.0, CV);
+					bAnyCostChanged = true;
+				}
+				else
+				{
+					UE_LOG(LogURLabRuntime, Warning,
+						TEXT("[MinkIK] task_costs[%d]: position_cost only applies to Frame tasks — ignored."), Idx);
+				}
+			}
+			if ((*Fields)->TryGetNumberField(TEXT("orientation_cost"), CV))
+			{
+				if (bFrame)
+				{
+					Spec.OrientationCost = (float)FMath::Max(0.0, CV);
+					bAnyCostChanged = true;
+				}
+				else
+				{
+					UE_LOG(LogURLabRuntime, Warning,
+						TEXT("[MinkIK] task_costs[%d]: orientation_cost only applies to Frame tasks — ignored."), Idx);
+				}
+			}
+			if ((*Fields)->TryGetNumberField(TEXT("cost"), CV))
+			{
+				if (!bFrame)
+				{
+					Spec.Cost = (float)FMath::Max(0.0, CV);
+					bAnyCostChanged = true;
+				}
+				else
+				{
+					UE_LOG(LogURLabRuntime, Warning,
+						TEXT("[MinkIK] task_costs[%d]: cost applies to Posture/Damping tasks — use position_cost/orientation_cost for Frame."),
+						Idx);
+				}
+			}
+		}
+		if (bAnyCostChanged)
+		{
+			MarkSpecsChanged();
 		}
 	}
 
