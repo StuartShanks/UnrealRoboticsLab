@@ -227,6 +227,10 @@ void FURLabRpcDispatcher::RegisterDispatcherOps()
 		[this](auto& R) { return HandleSetActiveController(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("active:string"), TEXT("was_active:bool")},
 		/*Required=*/{TEXT("articulation"), TEXT("controller")});
+	Reg(TEXT("set_suction"), EOpCategory::ManagerRequired, TEXT("runtime"),
+		[this](auto& R) { return HandleSetSuction(R); },
+		/*Reply=*/{TEXT("op:string"), TEXT("actuator:string"), TEXT("value:float")},
+		/*Required=*/{TEXT("articulation"), TEXT("value")});
 	Reg(TEXT("set_qpos"), EOpCategory::ManagerRequired, TEXT("runtime"),
 		[this](auto& R) { return HandleSetQpos(R); },
 		/*Reply=*/{TEXT("op:string"), TEXT("target:string"), TEXT("actor_id:string?"), TEXT("actor_name:string?"), TEXT("qpos:array"), TEXT("free_base_shortcut:bool")},
@@ -2969,6 +2973,94 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetActiveController(
 	Reply->SetStringField(TEXT("op"), TEXT("set_active_controller_ok"));
 	Reply->SetStringField(TEXT("active"), ActiveClass);
 	Reply->SetBoolField(TEXT("was_active"), Result->bWasActive);
+	return Reply;
+}
+
+// -----------------------------------------------------------------------------
+// set_suction — stage a value on the articulation's adhesion actuator.
+//
+// Resolves the (sole, or filter-matched) attached UMjActuator whose Type is
+// EMjActuatorType::Adhesion and pushes the clamped [0,1] value into its
+// network control, mirroring HandleSetNavGoal's game-thread marshal idiom
+// since actuator discovery walks OwnedComponents (game-thread-owned).
+// -----------------------------------------------------------------------------
+TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetSuction(const TSharedPtr<FJsonObject>& Req)
+{
+	AAMjManager* Mgr = OwnerMgr.Get();
+	if (!Mgr)
+		return MakeError(TEXT("not_ready"), TEXT("Manager missing"));
+
+	FString ArtName;
+	Req->TryGetStringField(TEXT("articulation"), ArtName);
+	double Value = 0.0;
+	Req->TryGetNumberField(TEXT("value"), Value);
+	Value = FMath::Clamp(Value, 0.0, 1.0);
+	FString ActFilter; // optional disambiguator
+	Req->TryGetStringField(TEXT("actuator"), ActFilter);
+
+	AMjArticulation* Art = Mgr->GetArticulation(ArtName);
+	if (!Art)
+		return MakeError(TEXT("unknown_articulation"), ArtName);
+
+	// Component discovery is game-thread-owned; marshal like HandleSetNavGoal.
+	struct FSuctionResult
+	{
+		FThreadSafeBool bFound{false};
+		FThreadSafeBool bAmbiguous{false};
+		FString Name; // written before Trigger, read after Wait — ordered by the event
+	};
+	TSharedPtr<FSuctionResult, ESPMode::ThreadSafe> Result =
+		MakeShared<FSuctionResult, ESPMode::ThreadSafe>();
+	TWeakObjectPtr<AMjArticulation> WeakArt(Art);
+	const float ValueF = (float)Value;
+	auto DoSet = [WeakArt, ValueF, ActFilter, Result]() {
+		if (AMjArticulation* ArtPtr = WeakArt.Get())
+		{
+			UMjActuator* Match = nullptr;
+			for (UMjActuator* A : ArtPtr->GetActuators())
+			{
+				if (!A || A->Type != EMjActuatorType::Adhesion)
+					continue;
+				if (!ActFilter.IsEmpty() && !A->GetMjName().Contains(ActFilter))
+					continue;
+				if (Match)
+				{
+					Result->bAmbiguous = true;
+					return;
+				}
+				Match = A;
+			}
+			if (Match)
+			{
+				Match->SetNetworkControl(ValueF);
+				Result->Name = Match->GetMjName();
+				Result->bFound = true;
+			}
+		}
+	};
+	if (IsInGameThread())
+	{
+		DoSet();
+	}
+	else
+	{
+		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+		AsyncTask(ENamedThreads::GameThread, [DoSet, Done]() { DoSet(); Done->Trigger(); });
+		Done->Wait(2000);
+		FPlatformProcess::ReturnSynchEventToPool(Done);
+	}
+
+	if (Result->bAmbiguous)
+		return MakeError(TEXT("ambiguous_adhesion_actuator"),
+			TEXT("multiple adhesion actuators — pass 'actuator' to disambiguate"));
+	if (!Result->bFound)
+		return MakeError(TEXT("no_adhesion_actuator"),
+			FString::Printf(TEXT("'%s' has no adhesion actuator"), *ArtName));
+
+	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+	Reply->SetStringField(TEXT("op"), TEXT("set_suction_ok"));
+	Reply->SetStringField(TEXT("actuator"), Result->Name);
+	Reply->SetNumberField(TEXT("value"), Value);
 	return Reply;
 }
 

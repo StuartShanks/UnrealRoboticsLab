@@ -187,3 +187,82 @@ bool FMjNavOpsStatusLookahead::RunTest(const FString&)
 	S.Cleanup();
 	return true;
 }
+
+// URLab.Nav.Ops.SetSuction — set_suction stages the value on the articulation's
+// adhesion actuator; robots without one error cleanly.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjNavOpsSetSuction,
+	"URLab.Nav.Ops.SetSuction",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMjNavOpsSetSuction::RunTest(const FString&)
+{
+	// Error path: the plain test-rig robot has no adhesion actuator.
+	{
+		FMjUESession S;
+		if (!S.Init([](FMjUESession&) {}))
+		{
+			AddError(S.LastError);
+			S.Cleanup();
+			return false;
+		}
+		FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+		Disp->SetActiveSessionIdForTest(TEXT("test-session"));
+		TSharedPtr<FJsonObject> Req = NavReq(TEXT("set_suction"), S.Robot->GetName());
+		Req->SetNumberField(TEXT("value"), 1.0);
+		TSharedPtr<FJsonObject> Reply = Disp->Dispatch(Req);
+		FString Err;
+		// MakeError() puts the error string in the "code" field (see
+		// FMjNavOpsNoComponent above) — not "error"; the brief's draft test
+		// checked "error", which doesn't match the dispatcher's actual error
+		// contract anywhere else in this file.
+		TestTrue(TEXT("code field"), Reply->TryGetStringField(TEXT("code"), Err));
+		TestEqual(TEXT("no_adhesion_actuator"), Err, TEXT("no_adhesion_actuator"));
+		S.Cleanup();
+	}
+	// Happy path: the suction variant has exactly one adhesion actuator.
+	//
+	// FMjXmlImportSession::Compile() spawns the Manager but — unlike
+	// FMjUESession::Init(), which stands up Manager->BridgeServer right after
+	// Compile() because BeginPlay never fires in headless test worlds — it
+	// does not construct a BridgeServer at all (none of its other tests need
+	// a dispatcher). MjNavDemoOpsTests.cpp's imported-robot-style ops tests
+	// all actually use FMjUESession, not FMjXmlImportSession, so there's no
+	// existing "imported robot + dispatcher" example to mirror verbatim.
+	// Closest faithful option: apply FMjUESession::Init's own
+	// BridgeServer-standup lines (and Cleanup's teardown-before-DestroyWorld
+	// lines) here, since that IS the established pattern for bringing up a
+	// dispatcher in a headless test world — just applied to the import
+	// session instead of the minimal rig.
+	{
+		const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+			TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_suction_ue.xml"));
+		FMjXmlImportSession S;
+		if (!S.InitFromFile(XmlPath) || !S.Compile())
+		{
+			AddError(S.LastError);
+			S.Cleanup();
+			return false;
+		}
+		S.Manager->BridgeServer = NewObject<UURLabBridgeServer>(S.Manager, TEXT("BridgeServer"));
+		S.Manager->BridgeServer->SetOwnedByManager(true);
+		S.Manager->BridgeServer->Start(TEXT(""));
+		S.Manager->BridgeServer->RegisterManager(S.Manager);
+		FURLabRpcDispatcher* Disp = S.Manager->BridgeServer->GetDispatcher();
+		Disp->SetActiveSessionIdForTest(TEXT("test-session"));
+		TSharedPtr<FJsonObject> Req = NavReq(TEXT("set_suction"), S.Robot->GetName());
+		Req->SetNumberField(TEXT("value"), 0.7);
+		TSharedPtr<FJsonObject> Reply = Disp->Dispatch(Req);
+		double V = 0.0;
+		TestTrue(TEXT("value echoed"), Reply->TryGetNumberField(TEXT("value"), V));
+		TestEqual(TEXT("value"), V, 0.7, 1e-6);
+		FString ActName;
+		TestTrue(TEXT("actuator named"), Reply->TryGetStringField(TEXT("actuator"), ActName));
+		TestTrue(TEXT("named 'suction'"), ActName.Contains(TEXT("suction")));
+		// Mirror FMjUESession::Cleanup()'s teardown order: unregister + stop
+		// the bridge before the world (and its PhysicsEngine) go away.
+		S.Manager->BridgeServer->UnregisterManager(S.Manager);
+		S.Manager->BridgeServer->Stop();
+		S.Manager->BridgeServer = nullptr;
+		S.Cleanup();
+	}
+	return true;
+}
