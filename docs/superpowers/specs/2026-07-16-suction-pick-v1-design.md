@@ -71,14 +71,16 @@ inside Descend.
    `ApplyControls` + the new pass-through deliver it in live AND direct modes.
    Reply: `{actuator, value}`. Marshal: HandleSetNavGoal idiom.
 
-3. **`check_clearance` runtime op** (`RpcDispatcher.cpp`, namespace `runtime`).
-   Corridor probe via `mj_ray`: request `{from:[xyz], to:[xyz],
-   exclude_bodies:[names]}` (MuJoCo metres; excludes resolve suffix-tolerantly
-   and mask that body's geoms AND its subtree's). Casts the ray from `from`
-   toward `to`; reply `{clear:bool, hit_distance, hit_geom}` where `clear` =
-   no hit within `|to-from|` (minus 1 cm tolerance). Runs under the physics
-   CallbackMutex (needs m+d). v1 is a single center ray — a swept-radius
-   multi-ray upgrade lives inside the same op later.
+3. **`check_clearance` — CLIENT-SIDE, no C++ op** (plan-time refinement).
+   The Python client already mirrors the compiled model + synced data
+   (`client.model` / `client.data`, refreshed by direct-mode steps — the
+   Tracker pattern), and the `mujoco` bindings expose `mj_ray` locally. So the
+   corridor probe is a pure-Python helper in `urlab_skills.py`: cast from
+   `from` toward `to` on the mirror, marching past hits on excluded bodies
+   (mj_ray's `bodyexclude` takes ONE body id; multiple exclusions = re-cast
+   just past each excluded hit, capped at 8 marches). `clear` = no
+   non-excluded hit within `|to-from|` minus 1 cm. Run it immediately after a
+   synced dip so the mirror is fresh. v1 is a single center ray.
 
 ### Model — `Scripts/mink_golden/models/stanford_tidybot/tidybot_suction_ue.xml`
 
