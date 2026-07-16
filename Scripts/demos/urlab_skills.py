@@ -37,10 +37,14 @@ ENGAGE_M = 0.02
 SHOULDER_HEIGHT_M = 0.49
 
 NAV_TIMEOUT_S = 120.0
-# A dist-to-goal jump this large after progress was made matches the
-# physics-auto-reset fingerprint called out in tidybot_twist_follow_demo.py's
-# module doc — never re-drive across a reset, abort with a diagnostic instead.
-RESET_FINGERPRINT_JUMP_M = 0.5
+# Physics-auto-reset guard (brief-mandated): the MuJoCo QACC auto-reset
+# teleports the robot to spawn, so distance-to-goal jumps back toward its
+# initial value in a single poll; threshold tuned live. Rounding the
+# obstacle wall at ~0.6 m/s with ~1 s polls can legitimately move the
+# straight-line distance-to-goal by up to ~0.7 m per poll, so the threshold
+# must clear that with margin while staying well below a multi-metre
+# teleport (tuned live in Task 6).
+RESET_FINGERPRINT_JUMP_M = 1.5
 
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +111,8 @@ def corridor_clear(client, p_from, p_to, exclude_body_suffixes,
     p0 = np.asarray(p_from, dtype=float)
     vec = np.asarray(p_to, dtype=float) - p0
     length = float(np.linalg.norm(vec))
+    if length < 1e-9:
+        return True, 0.0
     direction = vec / length
     travelled = 0.0
     for _ in range(max_marches):
@@ -194,6 +200,8 @@ def _base_xy(client) -> np.ndarray:
     m = client.model
     jx = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, "joint_x")
     jy = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, "joint_y")
+    if jx < 0 or jy < 0:
+        raise RuntimeError(f"base joint not found")
     d = client.data
     return np.array([d.qpos[m.jnt_qposadr[jx]], d.qpos[m.jnt_qposadr[jy]]])
 
@@ -252,9 +260,10 @@ class Drive(py_trees.behaviour.Behaviour):
     base in-engine. Relaxes the lazy-base damping task (bb.damping_task) for
     the transit and restores it on arrival, live task_costs — lifted verbatim
     from tidybot_twist_follow_demo.py Phase A. Aborts if dist-to-goal jumps
-    back up after progress was made (the physics-auto-reset fingerprint named
-    in that demo's module doc) rather than silently re-driving across a
-    reset."""
+    back up after progress was made (physics-auto-reset guard, brief-mandated:
+    the MuJoCo QACC auto-reset teleports the robot to spawn, so distance-to-
+    goal jumps back toward its initial value in a single poll; threshold
+    tuned live) rather than silently re-driving across a reset."""
 
     def __init__(self, name, bb, goal_xy, timeout_s: float = NAV_TIMEOUT_S):
         super().__init__(name)
@@ -398,9 +407,9 @@ class CorridorClear(py_trees.behaviour.Behaviour):
         p_to = self._resolve(self.p_to)
         client.runtime.set_mode("direct")
         client.step(n_steps=1)
+        clear, dist = corridor_clear(client, p_from, p_to, self.exclude_body_suffixes)
         client.runtime.set_mode("live")
         client.runtime.set_paused(paused=False)
-        clear, dist = corridor_clear(client, p_from, p_to, self.exclude_body_suffixes)
         if clear:
             return py_trees.common.Status.SUCCESS
         bb.fail_reason = (
@@ -444,7 +453,12 @@ class ReachRamp(py_trees.behaviour.Behaviour):
             return
         self._quat = np.asarray(getattr(bb, self.quat_key), dtype=float)
 
-        p0, q0 = synced_site_pose(client, "cup_site")
+        try:
+            p0, q0 = synced_site_pose(client, "cup_site")
+        except RuntimeError as e:
+            bb.fail_reason = f"ReachRamp[{self.name}]: {e}"
+            self._legs = []
+            return
         stream_target(client, bb.name, p0, q0)  # seed while disabled -- no yank
         client._rpc_configure_controller(
             articulation=bb.name, params={"task_enabled": [True, True, True, True]},
@@ -510,7 +524,12 @@ class DescendEngage(py_trees.behaviour.Behaviour):
             return
         self._quat = np.asarray(aff.quat_cup_down, dtype=float)
         self._legs = [np.asarray(w, dtype=float) for w in aff.waypoints[1:]]  # engage, contact
-        p0, _ = synced_site_pose(bb.client, "cup_site")
+        try:
+            p0, _ = synced_site_pose(bb.client, "cup_site")
+        except RuntimeError as e:
+            bb.fail_reason = f"DescendEngage[{self.name}]: {e}"
+            self._legs = []
+            return
         self._leg_start_pose = p0
         self._leg_idx = 0
         self._leg_t0 = time.time()
@@ -528,7 +547,11 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         pos = (1.0 - a) * self._leg_start_pose + a * target
         stream_target(client, bb.name, pos, self._quat)
 
-        cup_pos, _ = synced_site_pose(client, "cup_site")
+        try:
+            cup_pos, _ = synced_site_pose(client, "cup_site")
+        except RuntimeError as e:
+            bb.fail_reason = f"DescendEngage[{self.name}]: {e}"
+            return py_trees.common.Status.FAILURE
         dist = float(np.linalg.norm(cup_pos - bb.affordance.point))
         if not self._engaged and dist <= self.ENGAGE_DIST_M:
             client.runtime.set_suction(articulation=bb.name, value=1.0)
@@ -577,12 +600,18 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
         self._quat = None
         self._z_before = None
         self._retried = False
+        self._init_error = None
 
     def initialise(self):
         bb = self.bb
         client = bb.client
-        p0, q0 = synced_site_pose(client, "cup_site")
-        self._z_before = _object_z(client, bb.object_actor_id)
+        self._init_error = None
+        try:
+            p0, q0 = synced_site_pose(client, "cup_site")
+            self._z_before = _object_z(client, bb.object_actor_id)
+        except RuntimeError as e:
+            self._init_error = str(e)
+            return
         self._start_pose = p0
         self._quat = q0
         self._target = p0 + np.array([0.0, 0.0, self.LIFT_M])
@@ -592,13 +621,20 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
     def update(self):
         bb = self.bb
         client = bb.client
+        if self._init_error is not None:
+            bb.fail_reason = f"VerifyAttach[{self.name}]: {self._init_error}"
+            return py_trees.common.Status.FAILURE
         a = min(1.0, (time.time() - self._t0) / self.duration)
         pos = (1.0 - a) * self._start_pose + a * self._target
         stream_target(client, bb.name, pos, self._quat)
         if a < 1.0:
             return py_trees.common.Status.RUNNING
 
-        z_after = _object_z(client, bb.object_actor_id)
+        try:
+            z_after = _object_z(client, bb.object_actor_id)
+        except RuntimeError as e:
+            bb.fail_reason = f"VerifyAttach[{self.name}]: {e}"
+            return py_trees.common.Status.FAILURE
         rose = z_after - self._z_before
         if rose >= self.RISE_OK_M:
             return py_trees.common.Status.SUCCESS
@@ -615,9 +651,16 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
         client.runtime.set_suction(articulation=bb.name, value=0.0)
         retry_point = bb.affordance.point - np.array([0.0, 0.0, self.RETRY_DROP_M])
         stream_target(client, bb.name, retry_point, self._quat)
+        client.runtime.set_mode("direct")
         client.step(n_steps=1)  # let the ramp target land before re-engaging
+        client.runtime.set_mode("live")
+        client.runtime.set_paused(paused=False)
         client.runtime.set_suction(articulation=bb.name, value=1.0)
-        self._z_before = _object_z(client, bb.object_actor_id)
+        try:
+            self._z_before = _object_z(client, bb.object_actor_id)
+        except RuntimeError as e:
+            bb.fail_reason = f"VerifyAttach[{self.name}]: {e}"
+            return py_trees.common.Status.FAILURE
         self._start_pose = retry_point
         self._target = retry_point + np.array([0.0, 0.0, self.LIFT_M])
         self._t0 = time.time()
@@ -647,10 +690,17 @@ class StowCarry(py_trees.behaviour.Behaviour):
         self._target = None
         self._quat = None
         self._stowed = False
+        self._init_error = None
 
     def initialise(self):
-        client = self.bb.client
-        p0, q0 = synced_site_pose(client, "cup_site")
+        bb = self.bb
+        client = bb.client
+        self._init_error = None
+        try:
+            p0, q0 = synced_site_pose(client, "cup_site")
+        except RuntimeError as e:
+            self._init_error = str(e)
+            return
         self._start_pose = p0
         self._quat = q0
         self._target = p0 + self.OFFSET
@@ -660,6 +710,9 @@ class StowCarry(py_trees.behaviour.Behaviour):
     def update(self):
         bb = self.bb
         client = bb.client
+        if self._init_error is not None:
+            bb.fail_reason = f"StowCarry[{self.name}]: {self._init_error}"
+            return py_trees.common.Status.FAILURE
         a = min(1.0, (time.time() - self._t0) / self.duration)
         pos = (1.0 - a) * self._start_pose + a * self._target
         stream_target(client, bb.name, pos, self._quat)
@@ -703,16 +756,22 @@ class Release(py_trees.behaviour.Behaviour):
         self._target = None
         self._quat = None
         self._sep_t0 = None
+        self._init_error = None
 
     def initialise(self):
         bb = self.bb
         client = bb.client
-        p0, q0 = synced_site_pose(client, "cup_site")
+        self._init_error = None
+        try:
+            p0, q0 = synced_site_pose(client, "cup_site")
+            base_xy = _base_xy(client)
+        except RuntimeError as e:
+            self._init_error = str(e)
+            return
         stream_target(client, bb.name, p0, q0)  # seed while re-asserting -- no yank
         client._rpc_configure_controller(
             articulation=bb.name, params={"task_enabled": [True, True, True, True]},
         )
-        base_xy = _base_xy(client)
         quat = np.asarray(bb.q_cup, dtype=float) if bb.q_cup is not None else q0
         self._quat = quat
         self._start_pose = p0
@@ -725,6 +784,9 @@ class Release(py_trees.behaviour.Behaviour):
     def update(self):
         bb = self.bb
         client = bb.client
+        if self._init_error is not None:
+            bb.fail_reason = f"Release[{self.name}]: {self._init_error}"
+            return py_trees.common.Status.FAILURE
 
         if self._phase == "ramp":
             a = min(1.0, (time.time() - self._t0) / self.duration)
@@ -738,8 +800,12 @@ class Release(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.RUNNING
 
         if self._phase == "verify_separation":
-            cup_pos, _ = synced_site_pose(client, "cup_site")
-            obj_z = _object_z(client, bb.object_actor_id)
+            try:
+                cup_pos, _ = synced_site_pose(client, "cup_site")
+                obj_z = _object_z(client, bb.object_actor_id)
+            except RuntimeError as e:
+                bb.fail_reason = f"Release[{self.name}]: {e}"
+                return py_trees.common.Status.FAILURE
             if abs(obj_z - float(cup_pos[2])) >= self.SEPARATION_OK_M:
                 self._phase = "restow"
                 self._start_pose = cup_pos
