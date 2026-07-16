@@ -161,8 +161,13 @@ def drive():
     # --- Phase C: execute via the posture_target wire ---------------------------
     # Handoff contract: frame OFF, twist_follow OFF; posture cost bumped so the
     # streamed target dominates; damping + collision guards stay on (insurance).
+    # Also relax the base damping (5.0 -> 0.05, the transit value): the lazy-base
+    # damping penalizes base VELOCITY and would fight the posture task driving
+    # the base to each planned waypoint (the planner deliberately repositions
+    # the base). Collision-avoidance guards are separate limits — unaffected.
     configure({"task_enabled": [False, True, True, False],
-               "task_costs": {str(POSTURE_TASK): {"cost": 5.0}}})
+               "task_costs": {str(POSTURE_TASK): {"cost": 5.0},
+                              str(DAMPING_TASK): {"cost": 0.05}}})
     t0 = time.time()
     diverged_since = None
     wp_idx = 0
@@ -198,14 +203,20 @@ def drive():
         configure({"posture_target": wp})
         time.sleep(0.3)
     else:
+        configure({"posture_target": {},
+                   "task_costs": {str(POSTURE_TASK): {"cost": 1e-3}},
+                   "task_enabled": [True, True, True, False]})
         fail(f"final waypoint never settled (err {err:.3f})")
     log(f"plan executed — at pre-grasp (err {err:.3f})")
 
     # --- Phase D: validated direct-descent suction endgame ----------------------
     # Back to frame-task control: clear the posture latch, restore its
     # regularizer cost, re-enable the frame task (twist_follow stays off).
+    # Restore the lazy-base damping (0.05 -> 5.0) alongside clearing the posture
+    # latch: the endgame is arm-only frame-task control, base held lazy again.
     configure({"posture_target": {},
-               "task_costs": {str(POSTURE_TASK): {"cost": 1e-3}},
+               "task_costs": {str(POSTURE_TASK): {"cost": 1e-3},
+                              str(DAMPING_TASK): {"cost": 5.0}},
                "task_enabled": [True, True, True, False]})
     p0, _ = synced_site_pose(c, "cup_site")
     stream_target(c, name, p0, q_cup)  # seed at current pose (no yank)
