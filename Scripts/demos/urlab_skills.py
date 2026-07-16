@@ -615,10 +615,13 @@ class PlannedReach(py_trees.behaviour.Behaviour):
     Replaces ReachRamp's straight-line carpet — the planned BASE path
     executes exactly instead of being rediscovered by the greedy QP.
 
-    Self-paced advancement (mirrors the probe's proven Phase C, NOT a clock
-    schedule): the QP is never yanked toward a far-ahead waypoint across an
-    edge the planner never collision-checked — slow-but-correct tracking just
-    takes longer instead of failing.
+    Self-paced advancement is deliberately MORE conservative than the probe's
+    proven Phase C (which also clock-gated each waypoint): here the QP is never
+    yanked toward a far-ahead waypoint across an edge the planner never
+    collision-checked — slow-but-correct tracking just takes longer instead of
+    failing. The handoff CONFIG below is byte-identical to the probe's, but this
+    streaming discipline was not itself run at the live gate (the probe was), so
+    a full pick-tree live re-validation with PlannedReach is a recorded next step.
 
     Handoff contract (live-validated in tidybot_planned_reach_probe.py's
     Phase C/D): frame + twist_follow tasks disabled during execution;
