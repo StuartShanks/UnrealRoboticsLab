@@ -877,7 +877,7 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 				FMinkVec TargetQ = Config.GetQ();
 				for (const TPair<FString, double>& JQ : ManualP.JointQ)
 				{
-					const int32 Jid = mj_name2id(m, mjOBJ_JOINT, TCHAR_TO_ANSI(*JQ.Key));
+					const int32 Jid = ResolveIdByName(m, mjOBJ_JOINT, m->njnt, JQ.Key);
 					if (Jid < 0 || (m->jnt_type[Jid] != mjJNT_SLIDE && m->jnt_type[Jid] != mjJNT_HINGE))
 					{
 						if (PostureNameWarnBudget-- > 0)
