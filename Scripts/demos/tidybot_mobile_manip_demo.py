@@ -75,7 +75,8 @@ AGENT_RADIUS = 55.0            # navmesh obstacle clearance (cm)
 # behind v1's "instant clip", which the ramp only masked. Carrot-probe finding,
 # 2026-07-16.)
 BASE_MAX_VEL = 0.6             # m/s — matches UMjNavComponent.MaxSpeed
-ARM_MAX_VEL = 0.3              # rad/s — deliberate, watchable reach pace
+ARM_MAX_VEL = 0.5              # rad/s — deliberate but not sluggish (0.3 read
+                               # as too slow in the step-2 live runs)
 
 
 def manip_controller_payload() -> dict:
