@@ -574,21 +574,23 @@ class ReachRamp(py_trees.behaviour.Behaviour):
 
 
 class DescendEngage(py_trees.behaviour.Behaviour):
-    """Descend the cup onto the object and engage suction. Ramps from the
-    pre-approach pose down to a target pressed PRESS_M INTO the object's top
-    surface (adhesion needs contact, not proximity), tracking the object's LIVE
-    affordance-site pose each tick (a settled/nudged free body drifts, so a
-    static target misses). Engages suction (set_suction value=1.0) once cup_site
-    is within ENGAGE_DIST_M of the surface, then HOLDS the press until the cup is
-    within CONTACT_DIST_M (actual contact, so the arm has time to converge and
-    adhesion to grab) or SETTLE_TIMEOUT_S elapses. SUCCESS when contact is
-    reached or the settle times out with suction engaged (VerifyAttach is the
-    real gate); FAILURE only on a read error."""
+    """Descend the cup to HOVER just ABOVE the object and engage suction. Ramps
+    from the pre-approach pose down to a target HOVER_M above the object's top
+    surface (snapshot ONCE at initialise so it doesn't chase a nudged box). Does
+    NOT press into the object: the adhesion actuator grabs within its 3 cm margin,
+    so pressing a light box only knocks it off the table -- hovering + suction
+    lets adhesion pull the box UP to the cup instead. Engages suction once cup_site
+    is within ENGAGE_DIST_M, then holds at the hover target until the cup is within
+    CONTACT_DIST_M of it or SETTLE_TIMEOUT_S elapses. SUCCESS then (VerifyAttach is
+    the real gate); FAILURE only on a read error."""
 
-    ENGAGE_DIST_M = 0.04    # fire suction once this close to the surface
-    CONTACT_DIST_M = 0.015  # "in contact" -> stop pressing, done
-    PRESS_M = 0.005         # press the target this far below the surface (light)
-    SETTLE_TIMEOUT_S = 4.0  # hold-and-press ceiling before giving up to VerifyAttach
+    ENGAGE_DIST_M = 0.05    # fire suction once this close to the surface
+    CONTACT_DIST_M = 0.025  # cup within this of the hover target -> settled, done
+    HOVER_M = 0.012         # hover the cup this far ABOVE the surface. Do NOT press
+                            # into the object: the cup grabs within the adhesion
+                            # margin (3 cm), so pressing only knocks the light box
+                            # off the table. Hover + suction -> adhesion pulls it up.
+    SETTLE_TIMEOUT_S = 3.0  # hold ceiling for adhesion to grab before VerifyAttach
 
     def __init__(self, name, bb, ramp_duration: float = 4.0):
         super().__init__(name)
@@ -597,7 +599,7 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         self._quat = None
         self._start_pose = None
         self._surf = None       # object surface point, SNAPSHOT once (see initialise)
-        self._pressed = None    # fixed descent target (surf - PRESS_M*normal)
+        self._pressed = None    # fixed descent target (surf + HOVER_M*normal, ABOVE)
         self._t0 = None
         self._engaged = False
         self._settling = False
@@ -630,7 +632,7 @@ class DescendEngage(py_trees.behaviour.Behaviour):
             self._init_error = str(e)
             return
         self._surf = np.asarray(surf, dtype=float)
-        self._pressed = self._surf - self.PRESS_M * normal
+        self._pressed = self._surf + self.HOVER_M * normal  # hover ABOVE, don't press
         self._start_pose = p0
         self._t0 = time.time()
 
