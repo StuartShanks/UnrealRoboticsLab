@@ -179,8 +179,18 @@
                         <geom class="2f85/collision" mesh="base"/>
                         <!-- <site name="pinch" pos="0 0 0.145" type="sphere" group="5" rgba="0.9 0.9 0.9 1" size="0.005"/> -->
                         <body name="cup" pos="0 0 0.10">
-                          <geom name="cup_geom" type="cylinder" size="0.03 0.01" rgba="0.15 0.15 0.15 1"/>
-                          <site name="cup_site" pos="0 0 0.01" quat="0 1 0 0"/>
+                          <!-- margin+gap give the adhesion actuator a contact zone to
+                               pull across: without them the normal (repulsive) contact
+                               force cancels the suction and NOTHING is gripped (verified
+                               in pure MuJoCo). Also lets the cup grab from up to 3 cm
+                               away, so the pick tolerates an imperfect touch. -->
+                          <geom name="cup_geom" type="cylinder" size="0.03 0.01"
+                                margin="0.03" gap="0.03" rgba="0.15 0.15 0.15 1"/>
+                          <!-- Identity quat: cup_site frame z = the cup's outward suction
+                               direction (the 2f85 mount's grasping axis). pinch_site used
+                               quat="0 1 0 0" (a 180deg flip) for the finger convention, which
+                               aimed the suction cup at the ceiling on a top-down pick. -->
+                          <site name="cup_site" pos="0 0 0.01" quat="1 0 0 0"/>
                         </body>
                       </body>
                       <camera name="wrist" pos="0 -0.05639 -0.058475" quat="0 0 0 1" fovy="41.83792730009236"
