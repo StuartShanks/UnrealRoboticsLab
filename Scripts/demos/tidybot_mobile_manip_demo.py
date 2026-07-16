@@ -4,10 +4,11 @@
 Phase A (LIVE): the nav stack drives the base around an obstacle wall to a
 staging pose (arm passed through, holding home).
 SWITCH: set_active_controller repoints the bound controller to the mink IK.
-Phase B (LIVE): ramp an EE goal from the current pose to a reachable target and
-let the mink track it in real time (smooth, continuous rendering); accept when
-the pinch_site settles within tolerance. v1 reaches a free-space pose; a
-table-surface / whole-body reach is v1.1 (see REACH_TARGET note).
+Phase B (LIVE): stream the EE goal once and let the mink track it as a
+real-time, velocity-governed tracker (max_iters=1 + QP velocity limits — see
+manip_controller_payload); accept when the pinch_site settles within
+tolerance. v1 reaches a free-space pose; a table-surface / whole-body reach
+is v1.1 (see REACH_TARGET note).
 
 Spec: docs/superpowers/specs/2026-07-15-mobile-manip-v1-design.md.
 Run with the bridge venv's python, editor open (the user drives Simulate):
@@ -30,6 +31,8 @@ from urlab_client.errors import URLabRPCError
 
 # Reuse the mink demo's proven helpers (same directory).
 from tidybot_mink_demo import (
+    ARM_JOINTS,
+    BASE_JOINTS,
     Tracker,
     build_controller_payload,
     stream_target,
@@ -60,9 +63,32 @@ NAV_POLL_S = 0.5
 # Reaching a target ON a table needs the base closer than the 55 cm nav
 # clearance allows, so table-surface / whole-body reach is v1.1.
 REACH_TARGET = np.array([4.5, 0.0, 1.1])
-REACH_RAMP_SEC = 6.0            # wall-clock seconds to ramp the goal (paces the arm)
 ACCEPT_EE_ERR = 0.02           # m, sustained
+REACH_SETTLE_S = 15.0          # generous ceiling; the reach itself takes ~2-4 s
 AGENT_RADIUS = 55.0            # navmesh obstacle clearance (cm)
+
+# Velocity governance (replaces the old 6 s goal ramp). max_iters=1 makes the
+# mink a real-time tracker — ONE Newton step per physics step — so the QP
+# velocity limits below are the true wall-clock pace. (The default max_iters=20
+# is the golden-parity convergence loop: it integrates up to 20 velocity-
+# limited iterations PER STEP, i.e. up to 20x the cap — the actual mechanism
+# behind v1's "instant clip", which the ramp only masked. Carrot-probe finding,
+# 2026-07-16.)
+BASE_MAX_VEL = 0.6             # m/s — matches UMjNavComponent.MaxSpeed
+ARM_MAX_VEL = 0.3              # rad/s — deliberate, watchable reach pace
+
+
+def manip_controller_payload() -> dict:
+    """The mink stack for this demo: the example payload + real-time tracking
+    (max_iters=1) + QP velocity limits on base and arm. Import this from
+    probe/validation scripts so they exercise the exact committed stack."""
+    payload = build_controller_payload(draw_target=True, lazy_base_cost=5.0)
+    payload["max_iters"] = 1
+    payload["limits"] += [
+        {"kind": "velocity", "joints": BASE_JOINTS, "max_velocity": BASE_MAX_VEL},
+        {"kind": "velocity", "joints": ARM_JOINTS, "max_velocity": ARM_MAX_VEL},
+    ]
+    return payload
 
 
 def log(msg: str) -> None:
@@ -121,9 +147,7 @@ def main() -> None:
         # Source/URLabEditor/Private/MjEditorOpHandlers.cpp — the sibling
         # add_nav_stack registration is deliberately `scene`, and a comment
         # there calls out add_controller as the contrasting `ik` case).
-        ik = client.ik.add_controller(
-            target=ACTOR_ID, **build_controller_payload(draw_target=True,
-                                                        lazy_base_cost=5.0))
+        ik = client.ik.add_controller(target=ACTOR_ID, **manip_controller_payload())
         log(f"ik controller: was_existing={ik.get('was_existing')}")
 
         # ---- Phase A: drive (live) ------------------------------------------
@@ -186,14 +210,13 @@ def main() -> None:
             fail(f"switch to IK failed: {r}")
         log("switched to MjMinkIKController")
 
-        # ---- Phase B: reach (LIVE — smooth real-time rendering) -------------
-        # The mink integrates velocity per physics step, so in live mode (500 Hz)
-        # it drives the arm to the goal smoothly on its own. We ramp the GOAL
-        # slowly over wall-clock time so the arm tracks at a deliberate pace, and
-        # only dip into direct for synced qpos reads (seed + acceptance) — the
-        # reach itself runs live so the viewport renders every pose continuously.
-        # (Running Phase B in direct mode makes the sim advance only per client
-        # step, which renders as an unnatural clip even though the joints ramp.)
+        # ---- Phase B: reach (LIVE — velocity-governed) -----------------------
+        # The controller runs as a real-time tracker (max_iters=1, see
+        # manip_controller_payload), so we stream the FINAL goal once and the QP
+        # velocity limits pace the reach — no wall-clock goal ramp needed (the
+        # old 6 s ramp was masking the max_iters=20 per-step convergence loop).
+        # Phase B runs live so the viewport renders continuously; direct mode is
+        # used only for synced qpos reads (seed + acceptance).
         #
         # configure_controller (which stream_target uses) targets the ACTIVE
         # controller (GetActiveController first; RpcDispatcher.cpp, commit 67e5dfa),
@@ -210,21 +233,16 @@ def main() -> None:
             client.runtime.set_paused(paused=False)
             return p, q
 
-        p0, q0 = synced_ee()  # seed pose; home EE orientation becomes the goal quat
-        log(f"Phase B: seed EE={np.round(p0, 3)} — ramping goal to {REACH_TARGET} "
-            f"over {REACH_RAMP_SEC}s in LIVE mode")
-        t_ramp0 = time.time()
-        while True:
-            a = min(1.0, (time.time() - t_ramp0) / REACH_RAMP_SEC)
-            stream_target(client, nav_name, (1.0 - a) * p0 + a * REACH_TARGET, q0)
-            time.sleep(0.04)  # ~25 Hz goal updates; physics runs 500 Hz between
-            if a >= 1.0:
-                break
+        p0, q0 = synced_ee()  # seed read; home EE orientation becomes the goal quat
+        log(f"Phase B: EE={np.round(p0, 3)} — streaming goal {REACH_TARGET}; "
+            f"pace governed by ARM_MAX_VEL={ARM_MAX_VEL} rad/s")
+        stream_target(client, nav_name, REACH_TARGET, q0)
 
-        # Settle + verify at the final goal (a few synced reads).
+        # Settle + verify (synced reads until sustained acceptance or timeout).
         ok_streak, err = 0, 9.9
-        for _ in range(8):
-            time.sleep(0.3)
+        deadline_b = time.time() + REACH_SETTLE_S
+        while time.time() < deadline_b:
+            time.sleep(0.4)
             ee, _ = synced_ee()
             err = float(np.linalg.norm(ee - REACH_TARGET))
             log(f"  B settle: ee={np.round(ee, 3)} err={err:.4f}")
