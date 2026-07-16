@@ -2643,3 +2643,297 @@ bool FMjMinkIKTidybotNonDrivePassThrough::RunTest(const FString&)
 	S.Cleanup();
 	return true;
 }
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.PostureTargetTracks
+//   The posture_target wire (whole-body RRT connector execution channel):
+//   a posture task whose cost subset spans ALL TEN joints (base + arm) must
+//   track a streamed joint-space target when the frame task is disabled and
+//   the posture cost is bumped live. Also: readback round-trip, {} clears,
+//   unknown joint warns (budgeted), zero-cost subset entries are inert.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotPostureTargetTracks,
+	"URLab.MinkIK.TidyBot.PostureTargetTracks",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	// --- 1. Import + compile (same fixture as the sibling tests) --------------
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath))
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	if (!S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M)
+		|| !TestNotNull(TEXT("Data compiled"), D))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- 2. Find components (same resolution as FixBaseHolds) ------------------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	if (!TestTrue(TEXT("pinch_site found in compiled model"), SiteMjId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	if (!TestNotNull(TEXT("pinch_site UMjSite component resolved"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	bool bAllJointsFound = true;
+	int32 QposAdrs[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const TCHAR* Nm = JointNames[i];
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, Nm);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved (mjId=%d)"), Nm, JMjId));
+			bAllJointsFound = false;
+			continue;
+		}
+		TenJoints.Add(J);
+		QposAdrs[i] = M->jnt_qposadr[JMjId];
+	}
+	if (!bAllJointsFound || TenJoints.Num() != 10)
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+
+	// Stack: frame (will be disabled), posture over ALL TEN joints, base damping.
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKPostureTarget"));
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr;
+	Frame.PositionCost = 1.0f;
+	Frame.OrientationCost = 1.0f;
+	Frame.LmDamping = 1.0f;
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = TenJoints; // ALL TEN — the connector payload's divergence
+	FMinkTaskSpec Damping;
+	Damping.Kind = EMinkTaskKind::Damping;
+	Damping.Cost = 5.0f; // lazy base
+	Damping.Joints = BaseJoints;
+	Ctrl->Tasks = {Frame, Posture, Damping};
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit};
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->PosThreshold = PosThreshold;
+	Ctrl->OriThreshold = OriThreshold;
+	Ctrl->RegisterComponent();
+
+	// --- 4. Start clean at home ------------------------------------------------
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe found"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	auto RunSteps = [&](int32 N) -> bool {
+		for (int32 K = 0; K < N; ++K)
+		{
+			Ctrl->ComputeAndApply(M, D, 0);
+			mj_step(M, D);
+			for (int32 v = 0; v < M->nv; ++v)
+			{
+				if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+				{
+					AddError(FString::Printf(TEXT("NON-FINITE qacc/qvel at step %d dof %d"), K, v));
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	// --- Phase A: stream a displaced whole-body target, must track -------------
+	// Displacements chosen small enough to be reachable from home in 2000 steps
+	// under the configuration limit, large enough to be unambiguous.
+	const double Delta[10] = {0.30, -0.20, 0.40, 0.20, -0.20, 0.20, -0.20, 0.20, -0.20, 0.20};
+	double TargetQ[10];
+	for (int32 i = 0; i < 10; ++i)
+	{
+		TargetQ[i] = D->qpos[QposAdrs[i]] + Delta[i];
+	}
+	{
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Enabled;
+		Enabled.Add(MakeShared<FJsonValueBoolean>(false)); // frame OFF
+		Enabled.Add(MakeShared<FJsonValueBoolean>(true));  // posture ON
+		Enabled.Add(MakeShared<FJsonValueBoolean>(true));  // damping ON
+		Cfg->SetArrayField(TEXT("task_enabled"), Enabled);
+		TSharedPtr<FJsonObject> Costs = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> P1 = MakeShared<FJsonObject>();
+		P1->SetNumberField(TEXT("cost"), 5.0);
+		Costs->SetObjectField(TEXT("1"), P1); // bump posture: execution mode
+		Cfg->SetObjectField(TEXT("task_costs"), Costs);
+		TSharedPtr<FJsonObject> PT = MakeShared<FJsonObject>();
+		for (int32 i = 0; i < 10; ++i)
+		{
+			PT->SetNumberField(JointNames[i], TargetQ[i]);
+		}
+		Cfg->SetObjectField(TEXT("posture_target"), PT);
+		Ctrl->ApplyConfig(Cfg);
+	}
+	if (!RunSteps(2000))
+	{
+		S.Cleanup();
+		return false;
+	}
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const double Err = FMath::Abs(D->qpos[QposAdrs[i]] - TargetQ[i]);
+		TestTrue(FString::Printf(TEXT("joint %s tracked (|err| %.4f < 0.05)"), JointNames[i], Err),
+			Err < 0.05);
+	}
+
+	// --- Phase B: readback round-trip ------------------------------------------
+	{
+		TSharedPtr<FJsonObject> Params;
+		Ctrl->GetCurrentConfig(Params);
+		const TSharedPtr<FJsonObject>* PT = nullptr;
+		if (TestTrue(TEXT("posture_target present in readback"),
+				Params.IsValid() && Params->TryGetObjectField(TEXT("posture_target"), PT) && PT))
+		{
+			TestEqual(TEXT("readback entry count"), (*PT)->Values.Num(), 10);
+			double V = 0.0;
+			(*PT)->TryGetNumberField(TEXT("joint_x"), V);
+			TestTrue(TEXT("joint_x round-trips"), FMath::Abs(V - TargetQ[0]) < 1e-9);
+		}
+	}
+
+	// --- Phase C: unknown joint warns (budgeted), run survives -----------------
+	AddExpectedError(TEXT("posture_target: joint 'joint_nope'"), EAutomationExpectedErrorFlags::Contains, 0);
+	{
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> PT = MakeShared<FJsonObject>();
+		PT->SetNumberField(TEXT("joint_nope"), 1.0);
+		PT->SetNumberField(JointNames[0], TargetQ[0]);
+		Cfg->SetObjectField(TEXT("posture_target"), PT);
+		Ctrl->ApplyConfig(Cfg);
+	}
+	if (!RunSteps(50))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- Phase D: {} clears the latch ------------------------------------------
+	{
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		Cfg->SetObjectField(TEXT("posture_target"), MakeShared<FJsonObject>());
+		Ctrl->ApplyConfig(Cfg);
+		TSharedPtr<FJsonObject> Params;
+		Ctrl->GetCurrentConfig(Params);
+		const TSharedPtr<FJsonObject>* PT = nullptr;
+		if (Params.IsValid() && Params->TryGetObjectField(TEXT("posture_target"), PT) && PT)
+		{
+			TestEqual(TEXT("cleared latch reads back empty"), (*PT)->Values.Num(), 0);
+		}
+	}
+	if (!RunSteps(50)) // stepping after clear must not crash/yank
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- Phase E: TwistFollow precedence — its per-step write wins ------------
+	// Rebuild the controller with a TwistFollow spec appended (no UMjTwistController
+	// sibling: expected warning; zero twist => its target holds the seed pose).
+	// Route posture_target AT the twist spec explicitly; the base must NOT move.
+	AddExpectedError(TEXT("TwistFollow has no UMjTwistController sibling"),
+		EAutomationExpectedErrorFlags::Contains, 0);
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	UMjArticulationController::NotifySimReset();
+	FMinkTaskSpec Twist;
+	Twist.Kind = EMinkTaskKind::TwistFollow;
+	Twist.Cost = 1.0f;
+	Twist.Joints = BaseJoints; // exactly x, y, th in order
+	UMjMinkIKController* Ctrl2 = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKPostureTwist"));
+	Ctrl2->Tasks = {Frame, Posture, Damping, Twist};
+	Ctrl2->Limits = {ConfLimit};
+	Ctrl2->DriveJoints = TenJoints;
+	Ctrl2->MaxIters = MaxIters;
+	Ctrl2->PosThreshold = PosThreshold;
+	Ctrl2->OriThreshold = OriThreshold;
+	Ctrl2->RegisterComponent();
+	Robot->AdoptRuntimeController(Ctrl2);
+	if (!TestTrue(TEXT("controller2 bound"), Ctrl2->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+	{
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Enabled;
+		Enabled.Add(MakeShared<FJsonValueBoolean>(false)); // frame OFF
+		Enabled.Add(MakeShared<FJsonValueBoolean>(false)); // plain posture OFF
+		Enabled.Add(MakeShared<FJsonValueBoolean>(false)); // damping OFF
+		Enabled.Add(MakeShared<FJsonValueBoolean>(true));  // twist ON
+		Cfg->SetArrayField(TEXT("task_enabled"), Enabled);
+		TSharedPtr<FJsonObject> PT = MakeShared<FJsonObject>();
+		PT->SetNumberField(TEXT("joint_x"), D->qpos[QposAdrs[0]] + 0.5);
+		Cfg->SetObjectField(TEXT("posture_target"), PT);
+		Cfg->SetNumberField(TEXT("posture_task"), 3); // route AT the twist spec
+		Ctrl2->ApplyConfig(Cfg);
+	}
+	const double BaseX0 = D->qpos[QposAdrs[0]];
+	const bool bOk = RunSteps(500);
+	TestTrue(FString::Printf(TEXT("twist_follow wins over posture_target routed at it "
+								  "(|base x moved| %.4f < 0.05)"),
+				 FMath::Abs(D->qpos[QposAdrs[0]] - BaseX0)),
+		FMath::Abs(D->qpos[QposAdrs[0]] - BaseX0) < 0.05);
+	S.Cleanup();
+	return bOk;
+}

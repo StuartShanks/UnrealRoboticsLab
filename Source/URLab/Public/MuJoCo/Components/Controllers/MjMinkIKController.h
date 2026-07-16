@@ -394,6 +394,18 @@ private:
 		bool bSet = false;
 	};
 
+	/** Latched manual joint-space posture target (the "posture_target" wire
+	 *  param). JointQ: MuJoCo joint name -> qpos value. Re-applied to the
+	 *  routed posture spec EVERY solve in reference space — unmentioned
+	 *  joints carry the current reference q (TwistFollow's pattern).
+	 *  bSet=false means no latch. */
+	struct FManualPostureTarget
+	{
+		TMap<FString, double> JointQ;
+		int32 SpecIndex = INDEX_NONE; // INDEX_NONE = first non-TwistFollow Posture spec
+		bool bSet = false;
+	};
+
 	/** All Mink-typed solver state (configuration, built tasks/limits) — defined
 	 *  in the .cpp so this public header stays free of URLabMink includes. */
 	struct FMinkIKState;
@@ -436,7 +448,12 @@ private:
 
 	/** Manual targets keyed by spec index; guarded by TargetMutex. */
 	TMap<int32, FManualTarget> ManualTargets;
-	FCriticalSection TargetMutex;
+	mutable FCriticalSection TargetMutex;
+
+	FManualPostureTarget ManualPosture; // guarded by TargetMutex
+	/** Re-armed to 8 on each posture_target apply; decremented per unknown-name
+	 *  warning on the physics thread. Benign race, log-budget only. */
+	int32 PostureNameWarnBudget = 0;
 
 	/** Physics-thread snapshot of one enabled Frame task's current target
 	 *  pose, MuJoCo world coords (whatever the source: mocap, manual, or held

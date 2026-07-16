@@ -287,6 +287,7 @@ void UMjMinkIKController::Bind(mjModel* m, mjData* d, const TMap<int32, UMjActua
 	{
 		FScopeLock Lock(&TargetMutex);
 		ManualTargets.Reset();
+		ManualPosture = FManualPostureTarget();
 	}
 
 	if (!m || !d)
@@ -696,9 +697,11 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 
 	// Snapshot manual targets so the solve loop never holds the lock.
 	TMap<int32, FManualTarget> Manual;
+	FManualPostureTarget ManualP;
 	{
 		FScopeLock Lock(&TargetMutex);
 		Manual = ManualTargets;
+		ManualP = ManualPosture;
 	}
 
 	// Route targets + collect enabled tasks.
@@ -848,6 +851,51 @@ void UMjMinkIKController::ComputeAndApply(mjModel* m, mjData* d, uint8 Source)
 			TEXT("[MinkIK] first integration (bind or sim reset): re-based reference + passive targets from live state"));
 	}
 	LastSimTime = Now;
+
+	// Manual joint-space posture target (the posture_target wire): re-applied
+	// every solve like TwistFollow, in REFERENCE space — unmentioned joints
+	// carry the current reference q. Routed to the explicit "posture_task"
+	// spec index, else the first non-TwistFollow Posture spec. Deliberately
+	// placed BEFORE the TwistFollow loop: if a caller routes it at a
+	// TwistFollow spec while that task is enabled, TwistFollow's per-step
+	// write wins — the documented precedence.
+	if (ManualP.bSet)
+	{
+		for (FMinkIKState::FBuiltTask& B : Mink->BuiltTasks)
+		{
+			if (!B.AsPosture)
+			{
+				continue;
+			}
+			if (ManualP.SpecIndex == INDEX_NONE ? B.bTwistFollow : ManualP.SpecIndex != B.SpecIndex)
+			{
+				continue;
+			}
+			const bool bTaskOn = !CfgSpecEnabled.IsValidIndex(B.SpecIndex) || CfgSpecEnabled[B.SpecIndex];
+			if (bTaskOn)
+			{
+				FMinkVec TargetQ = Config.GetQ();
+				for (const TPair<FString, double>& JQ : ManualP.JointQ)
+				{
+					const int32 Jid = mj_name2id(m, mjOBJ_JOINT, TCHAR_TO_ANSI(*JQ.Key));
+					if (Jid < 0 || (m->jnt_type[Jid] != mjJNT_SLIDE && m->jnt_type[Jid] != mjJNT_HINGE))
+					{
+						if (PostureNameWarnBudget-- > 0)
+						{
+							UE_LOG(LogURLabRuntime, Warning,
+								TEXT("[MinkIK] posture_target: joint '%s' %s — entry ignored."),
+								*JQ.Key,
+								Jid < 0 ? TEXT("not found") : TEXT("is not a scalar (slide/hinge) joint"));
+						}
+						continue;
+					}
+					TargetQ[m->jnt_qposadr[Jid]] = JQ.Value;
+				}
+				B.AsPosture->SetTarget(TargetQ);
+			}
+			break; // routed to exactly one spec (latched even if that task is disabled)
+		}
+	}
 
 	// TwistFollow: advance each follower's base target from the twist bus —
 	// ONCE per physics step (this step's Dt), before the solve iterations.
@@ -1105,6 +1153,10 @@ void UMjMinkIKController::GetConfigSchema(TSharedPtr<FJsonObject>& OutSchema) co
 	OutSchema->SetStringField(TEXT("task_enabled"), TEXT("array<bool>"));
 	OutSchema->SetStringField(TEXT("task_costs"),
 		TEXT("map<spec index, {position_cost, orientation_cost | cost}>"));
+	OutSchema->SetStringField(TEXT("posture_target"),
+		TEXT("map<joint name, qpos> (empty map clears; zero-cost subset entries inert)"));
+	OutSchema->SetStringField(TEXT("posture_task"),
+		TEXT("int (routing spec index; default first non-twist posture)"));
 }
 
 void UMjMinkIKController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutParams) const
@@ -1140,6 +1192,19 @@ void UMjMinkIKController::GetCurrentConfigInternal(TSharedPtr<FJsonObject>& OutP
 		Costs.Add(MakeShared<FJsonValueObject>(O));
 	}
 	OutParams->SetArrayField(TEXT("task_costs"), Costs);
+	// Latched manual posture target (empty object when none is set).
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		FScopeLock Lock(&TargetMutex);
+		if (ManualPosture.bSet)
+		{
+			for (const TPair<FString, double>& JQ : ManualPosture.JointQ)
+			{
+				P->SetNumberField(JQ.Key, JQ.Value);
+			}
+		}
+		OutParams->SetObjectField(TEXT("posture_target"), P);
+	}
 }
 
 void UMjMinkIKController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InParams)
@@ -1314,5 +1379,41 @@ void UMjMinkIKController::ApplyConfigInternal(const TSharedPtr<FJsonObject>& InP
 			FScopeLock Lock(&TargetMutex);
 			ManualTargets.Add(TaskIdx, T);
 		}
+	}
+
+	// Streamed joint-space posture target (MuJoCo joint names -> qpos values).
+	//   "posture_target": {"<joint>": q, ...}   empty map {} clears the latch
+	//   "posture_task":   <spec index>          optional routing; default = the
+	//                                           first non-TwistFollow Posture spec
+	// Entries whose joints carry ZERO cost in the routed task's subset are
+	// inert in the QP — the payload must weight every joint it wants driven.
+	// While a TwistFollow task is enabled it rewrites its own spec's target
+	// every step and wins over a posture_target routed at it.
+	const TSharedPtr<FJsonObject>* PostureObj = nullptr;
+	if (InParams->TryGetObjectField(TEXT("posture_target"), PostureObj) && PostureObj && PostureObj->IsValid())
+	{
+		FManualPostureTarget P;
+		for (const auto& Pair : (*PostureObj)->Values)
+		{
+			double Q = 0.0;
+			if (Pair.Value.IsValid() && Pair.Value->TryGetNumber(Q))
+			{
+				P.JointQ.Add(Pair.Key, Q);
+			}
+			else
+			{
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] posture_target['%s']: expected a number — entry ignored."), *Pair.Key);
+			}
+		}
+		double IdxV = 0.0;
+		if (InParams->TryGetNumberField(TEXT("posture_task"), IdxV))
+		{
+			P.SpecIndex = (int32)IdxV;
+		}
+		P.bSet = P.JointQ.Num() > 0; // "posture_target": {} clears the latch
+		FScopeLock Lock(&TargetMutex);
+		ManualPosture = MoveTemp(P);
+		PostureNameWarnBudget = 8; // re-arm the unknown-name warning per apply
 	}
 }
