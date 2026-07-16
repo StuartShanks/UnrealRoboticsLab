@@ -2779,10 +2779,10 @@ bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
 		return false;
 	}
 
-	auto RunSteps = [&](int32 N) -> bool {
+	auto RunSteps = [&](UMjMinkIKController* C, int32 N) -> bool {
 		for (int32 K = 0; K < N; ++K)
 		{
-			Ctrl->ComputeAndApply(M, D, 0);
+			C->ComputeAndApply(M, D, 0);
 			mj_step(M, D);
 			for (int32 v = 0; v < M->nv; ++v)
 			{
@@ -2825,7 +2825,7 @@ bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
 		Cfg->SetObjectField(TEXT("posture_target"), PT);
 		Ctrl->ApplyConfig(Cfg);
 	}
-	if (!RunSteps(2000))
+	if (!RunSteps(Ctrl, 2000))
 	{
 		S.Cleanup();
 		return false;
@@ -2862,7 +2862,7 @@ bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
 		Cfg->SetObjectField(TEXT("posture_target"), PT);
 		Ctrl->ApplyConfig(Cfg);
 	}
-	if (!RunSteps(50))
+	if (!RunSteps(Ctrl, 50))
 	{
 		S.Cleanup();
 		return false;
@@ -2881,7 +2881,7 @@ bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
 			TestEqual(TEXT("cleared latch reads back empty"), (*PT)->Values.Num(), 0);
 		}
 	}
-	if (!RunSteps(50)) // stepping after clear must not crash/yank
+	if (!RunSteps(Ctrl, 50)) // stepping after clear must not crash/yank
 	{
 		S.Cleanup();
 		return false;
@@ -2929,7 +2929,7 @@ bool FMjMinkIKTidybotPostureTargetTracks::RunTest(const FString&)
 		Ctrl2->ApplyConfig(Cfg);
 	}
 	const double BaseX0 = D->qpos[QposAdrs[0]];
-	const bool bOk = RunSteps(500);
+	const bool bOk = RunSteps(Ctrl2, 500);
 	TestTrue(FString::Printf(TEXT("twist_follow wins over posture_target routed at it "
 								  "(|base x moved| %.4f < 0.05)"),
 				 FMath::Abs(D->qpos[QposAdrs[0]] - BaseX0)),
