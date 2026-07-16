@@ -43,6 +43,30 @@ class Plan:
     stats: dict = field(default_factory=dict)
 
 
+def _resolve_id(model, objtype, count, suffix):
+    """Compiled MuJoCo object id by exact name, else by name SUFFIX — the UE
+    importer prefixes compiled names (e.g. 'tidybot_suction_ue_C_0_joint_x'),
+    so a bare 'joint_x' never matches exactly on the live model. Mirrors
+    tidybot_mink_demo.resolve_id_by_suffix. Returns -1 if nothing matches.
+    (Synthetic offline test scenes use bare names, so the exact branch wins
+    there — this is a superset of the old exact-only lookup.)"""
+    exact = mujoco.mj_name2id(model, objtype, suffix)
+    if exact >= 0:
+        return exact
+    for i in range(count):
+        nm = mujoco.mj_id2name(model, objtype, i)
+        if nm and nm.endswith(suffix):
+            return i
+    return -1
+
+
+def _resolve_name(model, objtype, count, suffix):
+    """The COMPILED name for a bare suffix (mink's FrameTask resolves its
+    frame_name by exact string, so it needs the prefixed name). None if unmatched."""
+    i = _resolve_id(model, objtype, count, suffix)
+    return mujoco.mj_id2name(model, objtype, i) if i >= 0 else None
+
+
 class PlanContext:
     """Collision-checkable snapshot of the live scene over the client's model
     replica. Start state comes from a SYNCED physics read — never
@@ -56,23 +80,36 @@ class PlanContext:
         self.jids = []
         qadr = []
         for name in self.joints:
-            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            jid = _resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, model.njnt, name)
             if jid < 0:
                 raise ValueError(f"planned joint {name!r} not in model")
             self.jids.append(jid)
             qadr.append(int(model.jnt_qposadr[jid]))
         self.qadr = np.asarray(qadr, dtype=int)
-        # Sampling bounds: joint range where limited, else +-pi.
-        lo, hi = [], []
+        # Sampling bounds + a "limited" mask. For LIMITED joints, the actual
+        # jnt_range. For UNLIMITED joints there is no real limit, only a sampling
+        # convenience: an unlimited HINGE (e.g. base yaw) samples an angle in
+        # +-pi, but an unlimited SLIDE (the base x/y translations) moves in world
+        # METRES and must sample world-scale — a +-pi bound would wrongly clip the
+        # base to ~3.14 m and flag any farther base pose as "out of limits".
+        lo, hi, limited = [], [], []
         for jid in self.jids:
-            if model.jnt_limited[jid]:
+            lim = bool(model.jnt_limited[jid])
+            limited.append(lim)
+            if lim:
                 lo.append(float(model.jnt_range[jid][0]))
                 hi.append(float(model.jnt_range[jid][1]))
+            elif model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE:
+                lo.append(-50.0)   # world-scale; the base sampler re-centres these
+                hi.append(50.0)    # on the start/goal via an annulus/disc anyway
             else:
                 lo.append(-np.pi)
                 hi.append(np.pi)
         self.lo = np.asarray(lo)
         self.hi = np.asarray(hi)
+        # Only limited joints have a range to VIOLATE; unlimited joints never fail
+        # the limit gate (their bounds above are sampling hints, not limits).
+        self.limited = np.asarray(limited, dtype=bool)
         # Geom pairs already PENETRATING at the start config are pre-existing
         # (resting) contacts, not planner failures — exempt them everywhere.
         self.baseline = self._penetrating_pairs(self.q_start())
@@ -108,14 +145,17 @@ class PlanContext:
 
     def collision_free(self, q):
         q = np.asarray(q, dtype=float)
-        if np.any(q < self.lo - 1e-9) or np.any(q > self.hi + 1e-9):
+        # Limit gate applies to LIMITED joints only — unlimited base slides move
+        # in world metres and have no range to violate.
+        if np.any(self.limited & (q < self.lo - 1e-9)) or \
+                np.any(self.limited & (q > self.hi + 1e-9)):
             return False
         return self._penetrating_pairs(q) <= self.baseline
 
     def site_pose(self, q, site):
         """World (pos, quat_wxyz) of a site at configuration q."""
         self._set(q)
-        sid = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_SITE, site)
+        sid = _resolve_id(self.m, mujoco.mjtObj.mjOBJ_SITE, self.m.nsite, site)
         if sid < 0:
             raise ValueError(f"site {site!r} not in model")
         pos = self.d.site_xpos[sid].copy()
@@ -145,7 +185,12 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
 
     rng = np.random.default_rng(seed)
     pos = np.asarray(pos, dtype=float)
-    task = mink.FrameTask(frame_name=site, frame_type="site",
+    # mink resolves frame_name by exact string against the compiled model, so
+    # pass the prefixed compiled name (the caller gives a bare suffix).
+    frame_name = _resolve_name(ctx.m, mujoco.mjtObj.mjOBJ_SITE, ctx.m.nsite, site)
+    if frame_name is None:
+        raise ValueError(f"site {site!r} not in model")
+    task = mink.FrameTask(frame_name=frame_name, frame_type="site",
                           position_cost=1.0, orientation_cost=1.0, lm_damping=1.0)
     rot = mink.SO3(np.asarray(quat_wxyz, dtype=float))
     task.set_target(mink.SE3.from_rotation_and_translation(rot, pos))
