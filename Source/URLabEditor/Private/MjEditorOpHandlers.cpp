@@ -1945,6 +1945,41 @@ TSharedPtr<FJsonObject> HandleAddController(const TSharedPtr<FJsonObject>& Req)
 					(*LO)->TryGetArrayField(TEXT("joints"), LJ);
 					ResolveJoints(LJ, LSpec.Joints, TEXT("limits.velocity"), &LSpec.JointNames);
 				}
+				else if (LKind.Equals(TEXT("collision_avoidance"), ESearchCase::IgnoreCase))
+				{
+					LSpec.Kind = EMinkLimitKind::CollisionAvoidance;
+					// mink's own defaults for this kind (the spec struct's shared
+					// Gain/MinDistance defaults belong to the configuration kind).
+					LSpec.Gain = 0.85f;
+					LSpec.MinDistance = 0.005f;
+					double V;
+					if ((*LO)->TryGetNumberField(TEXT("gain"), V))
+						LSpec.Gain = V;
+					if ((*LO)->TryGetNumberField(TEXT("min_distance"), V))
+						LSpec.MinDistance = V;
+					if ((*LO)->TryGetNumberField(TEXT("detection_distance"), V))
+						LSpec.DetectionDistance = V;
+					if ((*LO)->TryGetNumberField(TEXT("bound_relaxation"), V))
+						LSpec.BoundRelaxation = V;
+					// Entries resolve controller-side: geom name first, else a
+					// body name expanding to all of that body's geoms.
+					auto ReadNames = [&](const TCHAR* Field, TArray<FString>& Out) {
+						const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+						if ((*LO)->TryGetArrayField(Field, Arr) && Arr)
+						{
+							for (const TSharedPtr<FJsonValue>& NV : *Arr)
+							{
+								FString N;
+								if (NV->TryGetString(N) && !N.IsEmpty())
+									Out.Add(N);
+							}
+						}
+					};
+					ReadNames(TEXT("geoms_a"), LSpec.GeomsA);
+					ReadNames(TEXT("geoms_b"), LSpec.GeomsB);
+					if (LSpec.GeomsA.Num() == 0 || LSpec.GeomsB.Num() == 0)
+						Warn(TEXT("limits.collision_avoidance: geoms_a and geoms_b both required"));
+				}
 				else // configuration (default)
 				{
 					double V;

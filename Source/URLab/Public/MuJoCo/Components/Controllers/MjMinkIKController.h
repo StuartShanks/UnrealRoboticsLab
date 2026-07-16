@@ -67,7 +67,17 @@ enum class EMinkLimitKind : uint8
 	/** Joint range limits (mink ConfigurationLimit). */
 	Configuration,
 	/** Hard cap on solved joint velocities (mink VelocityLimit). */
-	Velocity
+	Velocity,
+	/**
+	 * Velocity-level obstacle clearance (mink CollisionAvoidanceLimit): an
+	 * inequality on the normal velocity between geom pairs — geoms may not
+	 * approach each other faster than the limit allows, and stop at
+	 * MinDistance. Pairs = GeomsA x GeomsB (one pair of groups per spec entry;
+	 * add more entries for more pairs). This is the layer the navmesh cannot
+	 * give (the arm envelope, reach-over-obstacle); it is LOCAL and GREEDY —
+	 * it prevents penetration, it does not plan around obstacles.
+	 */
+	CollisionAvoidance
 };
 
 /**
@@ -204,6 +214,36 @@ struct FMinkLimitSpec
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
 		meta = (EditCondition = "Kind==EMinkLimitKind::Velocity"))
 	TArray<FString> JointNames;
+
+	/**
+	 * CollisionAvoidance only: side A of the pair (typically robot geoms).
+	 * Each entry resolves as a GEOM name first, else a BODY name that expands
+	 * to all of that body's geoms — required in practice, since imported mesh
+	 * geoms are commonly unnamed. Suffix-tolerant against import prefixes.
+	 * For this kind, Gain is the avoidance gain (mink default 0.85) and
+	 * MinDistance the standoff to hold (mink default 0.005 m) — the
+	 * add_controller op applies those defaults when the fields are omitted.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::CollisionAvoidance"))
+	TArray<FString> GeomsA;
+
+	/** CollisionAvoidance only: side B of the pair (typically obstacle geoms).
+	 *  Same geom-or-body resolution as GeomsA. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::CollisionAvoidance"))
+	TArray<FString> GeomsB;
+
+	/** CollisionAvoidance only: distance (m) at which pairs enter the QP
+	 *  (mink collision_detection_distance). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::CollisionAvoidance", ClampMin = "0.0"))
+	float DetectionDistance = 0.01f;
+
+	/** CollisionAvoidance only: bound relaxation offset (mink bound_relaxation). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Limit",
+		meta = (EditCondition = "Kind==EMinkLimitKind::CollisionAvoidance"))
+	float BoundRelaxation = 0.0f;
 };
 
 /**

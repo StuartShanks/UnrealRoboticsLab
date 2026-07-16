@@ -30,6 +30,7 @@
 #include "Limits/MinkLimit.h"
 #include "Limits/MinkConfigurationLimit.h"
 #include "Limits/MinkVelocityLimit.h"
+#include "Limits/MinkCollisionAvoidanceLimit.h"
 #include "Lie/MinkSE3.h"
 #include "Lie/MinkSO3.h"
 
@@ -139,6 +140,38 @@ void ResolveJointIds(const mjModel* m, const TArray<TObjectPtr<UMjJoint>>& Refs,
 		{
 			OutIds.AddUnique(Id);
 		}
+	}
+}
+
+/**
+ * Resolve a collision-avoidance geom group: each name resolves as a GEOM first
+ * (suffix-tolerant), else as a BODY whose geoms are all added — imported mesh
+ * geoms are commonly unnamed, so body expansion is the practical way to cover
+ * a link. Warns per unresolved name.
+ */
+void ResolveGeomGroup(const mjModel* m, const TArray<FString>& Names, TArray<int32>& OutIds,
+	int32 SpecIdx, const TCHAR* Side)
+{
+	for (const FString& N : Names)
+	{
+		const int32 Gid = ResolveIdByName(m, mjOBJ_GEOM, m->ngeom, N);
+		if (Gid >= 0)
+		{
+			OutIds.AddUnique(Gid);
+			continue;
+		}
+		const int32 Bid = ResolveIdByName(m, mjOBJ_BODY, m->nbody, N);
+		if (Bid >= 0)
+		{
+			for (int32 g = 0; g < m->body_geomnum[Bid]; ++g)
+			{
+				OutIds.AddUnique(m->body_geomadr[Bid] + g);
+			}
+			continue;
+		}
+		UE_LOG(LogURLabRuntime, Warning,
+			TEXT("[MinkIK] Limits[%d].%s: '%s' matched no geom or body — entry ignored."),
+			SpecIdx, Side, *N);
 	}
 }
 
@@ -467,11 +500,43 @@ void UMjMinkIKController::RebuildFromSpecs(mjModel* m, mjData* d)
 	}
 
 	// --- limits ------------------------------------------------------------------
-	for (FMinkLimitSpec& L : Limits)
+	for (int32 li = 0; li < Limits.Num(); ++li)
 	{
+		FMinkLimitSpec& L = Limits[li];
 		if (L.Kind == EMinkLimitKind::Configuration)
 		{
 			Mink->BuiltLimits.Add(MakeUnique<FMinkConfigurationLimit>(m, (double)L.Gain, (double)L.MinDistance));
+		}
+		else if (L.Kind == EMinkLimitKind::CollisionAvoidance)
+		{
+			// One pair of geom groups per spec entry (A x B, cross-producted,
+			// filtered and deduped inside the limit). Names resolve here with
+			// the suffix-tolerant geom-or-body rules; the limit gets raw ids.
+			FMinkGeomGroup GroupA, GroupB;
+			ResolveGeomGroup(m, L.GeomsA, GroupA.Ids, li, TEXT("GeomsA"));
+			ResolveGeomGroup(m, L.GeomsB, GroupB.Ids, li, TEXT("GeomsB"));
+			if (GroupA.Ids.Num() == 0 || GroupB.Ids.Num() == 0)
+			{
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] Limits[%d]: CollisionAvoidance needs geoms on BOTH sides (A=%d, B=%d) — skipped."),
+					li, GroupA.Ids.Num(), GroupB.Ids.Num());
+				continue;
+			}
+			TArray<FMinkCollisionPair> Pairs;
+			Pairs.Emplace(GroupA, GroupB);
+			auto Lim = MakeUnique<FMinkCollisionAvoidanceLimit>(m, Pairs, (double)L.Gain,
+				(double)L.MinDistance, (double)L.DetectionDistance, (double)L.BoundRelaxation);
+			if (!Lim->bIsValid)
+			{
+				UE_LOG(LogURLabRuntime, Warning,
+					TEXT("[MinkIK] Limits[%d]: CollisionAvoidance construction failed — skipped."), li);
+				continue;
+			}
+			UE_LOG(LogURLabRuntime, Log,
+				TEXT("[MinkIK] Limits[%d]: CollisionAvoidance active with %d geom pair(s) "
+					 "(min_dist=%.3f, detect=%.3f, gain=%.2f)."),
+				li, Lim->MaxNumContacts(), L.MinDistance, L.DetectionDistance, L.Gain);
+			Mink->BuiltLimits.Add(MoveTemp(Lim));
 		}
 		else if (L.Kind == EMinkLimitKind::Velocity)
 		{

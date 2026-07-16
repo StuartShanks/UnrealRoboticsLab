@@ -2312,3 +2312,212 @@ bool FMjMinkIKTidybotTwistFollow::RunTest(const FString&)
 	S.Cleanup();
 	return bYawOk;
 }
+
+// ============================================================================
+// URLab.MinkIK.TidyBot.CollisionAvoidanceFloor
+//   EMinkLimitKind::CollisionAvoidance (nav roadmap step 3): a velocity-level
+//   clearance constraint between geom groups. Comparative, FixBaseHolds-style,
+//   against the one obstacle the fixture already has — the floor plane:
+//     A) EE commanded low over the floor with NO collision limit -> the wrist
+//        (bracelet_link) descends freely (precondition)
+//     B) same target with bracelet_link x floor avoidance (min_dist 0.35) ->
+//        the QP refuses the approach; the wrist holds clearance
+//   B is installed LIVE via spec mutation + MarkSpecsChanged (also covers the
+//   limits path of the live rebuild). bracelet_link's mesh geoms are UNNAMED
+//   in the MJCF — group entries resolve as body names expanding to their
+//   geoms, which is exactly the practical case the surface must support.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMjMinkIKTidybotCollisionAvoidanceFloor,
+	"URLab.MinkIK.TidyBot.CollisionAvoidanceFloor",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMjMinkIKTidybotCollisionAvoidanceFloor::RunTest(const FString&)
+{
+	using namespace MjMinkIKControllerTestsLocal;
+
+	const FString XmlPath = FPaths::Combine(FPaths::ProjectPluginsDir(),
+		TEXT("UnrealRoboticsLab/Scripts/mink_golden/models/stanford_tidybot/tidybot_scene_ue.xml"));
+	if (!FPaths::FileExists(XmlPath))
+	{
+		AddError(TEXT("fixture missing — run Task 4 Step 1"));
+		return false;
+	}
+
+	FMjXmlImportSession S;
+	if (!S.InitFromFile(XmlPath) || !S.Compile())
+	{
+		AddError(S.LastError);
+		S.Cleanup();
+		return false;
+	}
+	mjModel* M = S.Model();
+	mjData* D = S.Data();
+	if (!TestNotNull(TEXT("Robot spawned"), S.Robot) || !TestNotNull(TEXT("Model compiled"), M))
+	{
+		S.Cleanup();
+		return false;
+	}
+	AMjArticulation* Robot = S.Robot;
+
+	// --- components: pinch site, ten joints, wrist body ------------------------
+	const int32 SiteMjId = FindIdBySuffix(M, mjOBJ_SITE, M->nsite, TEXT("pinch_site"));
+	const int32 BraceletBid = FindIdBySuffix(M, mjOBJ_BODY, M->nbody, TEXT("bracelet_link"));
+	const int32 FloorGid = FindIdBySuffix(M, mjOBJ_GEOM, M->ngeom, TEXT("floor"));
+	if (!TestTrue(TEXT("pinch_site / bracelet_link / floor found"),
+			SiteMjId >= 0 && BraceletBid >= 0 && FloorGid >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	TArray<UMjSite*> SiteComps;
+	Robot->GetComponents<UMjSite>(SiteComps);
+	UMjSite* PinchSite = FindComponentByMjId(SiteComps, SiteMjId);
+	TArray<UMjJoint*> JointComps;
+	Robot->GetComponents<UMjJoint>(JointComps);
+	TArray<TObjectPtr<UMjJoint>> TenJoints;
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const int32 JMjId = FindIdBySuffix(M, mjOBJ_JOINT, M->njnt, JointNames[i]);
+		UMjJoint* J = (JMjId >= 0) ? FindComponentByMjId(JointComps, JMjId) : nullptr;
+		if (!J)
+		{
+			AddError(FString::Printf(TEXT("joint '%s' not resolved"), JointNames[i]));
+			S.Cleanup();
+			return false;
+		}
+		TenJoints.Add(J);
+	}
+	if (!TestNotNull(TEXT("pinch_site component"), PinchSite))
+	{
+		S.Cleanup();
+		return false;
+	}
+	TArray<TObjectPtr<UMjJoint>> BaseJoints = {TenJoints[0], TenJoints[1], TenJoints[2]};
+	TArray<TObjectPtr<UMjJoint>> ArmJoints = {TenJoints[3], TenJoints[4], TenJoints[5],
+		TenJoints[6], TenJoints[7], TenJoints[8], TenJoints[9]};
+
+	// --- stack: EE frame + arm posture + base FIXED (arm-only descent) ---------
+	UMjMinkIKController* Ctrl = NewObject<UMjMinkIKController>(Robot, TEXT("MinkIKCollisionFloor"));
+	FMinkTaskSpec Frame;
+	Frame.Kind = EMinkTaskKind::Frame;
+	Frame.Frame = PinchSite;
+	Frame.TargetMocapBody = nullptr;
+	Frame.LmDamping = 1.0f;
+	FMinkTaskSpec Posture;
+	Posture.Kind = EMinkTaskKind::Posture;
+	Posture.Cost = 1e-3f;
+	Posture.Joints = ArmJoints;
+	FMinkTaskSpec FixBase;
+	FixBase.Kind = EMinkTaskKind::Damping;
+	FixBase.Cost = 100.0f;
+	FixBase.Joints = BaseJoints;
+	Ctrl->Tasks = {Frame, Posture, FixBase};
+	FMinkLimitSpec ConfLimit;
+	Ctrl->Limits = {ConfLimit}; // Phase A: NO collision limit
+	Ctrl->DriveJoints = TenJoints;
+	Ctrl->MaxIters = MaxIters;
+	Ctrl->RegisterComponent();
+
+	const int32 KeyId = FindIdBySuffix(M, mjOBJ_KEY, M->nkey, TEXT("home"));
+	if (!TestTrue(TEXT("home keyframe"), KeyId >= 0))
+	{
+		S.Cleanup();
+		return false;
+	}
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	Robot->AdoptRuntimeController(Ctrl);
+	if (!TestTrue(TEXT("controller bound"), Ctrl->IsBound()))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	double Q0[4];
+	mju_mat2Quat(Q0, D->site_xmat + 9 * SiteMjId);
+
+	// Low target over the floor, forward of the (fixed) base.
+	auto SendLowTarget = [&]() {
+		TSharedPtr<FJsonObject> Cfg = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(0.35));
+		PosArr.Add(MakeShared<FJsonValueNumber>(0.0));
+		PosArr.Add(MakeShared<FJsonValueNumber>(0.08));
+		Cfg->SetArrayField(TEXT("target_pos"), PosArr);
+		TArray<TSharedPtr<FJsonValue>> QuatArr;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			QuatArr.Add(MakeShared<FJsonValueNumber>(Q0[i]));
+		}
+		Cfg->SetArrayField(TEXT("target_quat"), QuatArr);
+		Ctrl->ApplyConfig(Cfg);
+	};
+
+	double MinBraceletZ = 99.0;
+	auto RunSteps = [&](int32 N) -> bool {
+		for (int32 K = 0; K < N; ++K)
+		{
+			Ctrl->ComputeAndApply(M, D, 0);
+			mj_step(M, D);
+			MinBraceletZ = FMath::Min(MinBraceletZ, D->xpos[3 * BraceletBid + 2]);
+			for (int32 v = 0; v < M->nv; ++v)
+			{
+				if (!FMath::IsFinite(D->qacc[v]) || !FMath::IsFinite(D->qvel[v]))
+				{
+					AddError(FString::Printf(TEXT("NON-FINITE at step %d dof %d"), K, v));
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+
+	// --- Phase A: no collision limit — wrist descends (precondition) ----------
+	SendLowTarget();
+	if (!RunSteps(800))
+	{
+		S.Cleanup();
+		return false;
+	}
+	const double FreeMinZ = MinBraceletZ;
+	if (!TestTrue(FString::Printf(
+					  TEXT("precondition: without the limit the wrist descends (min z %.3f < 0.30)"), FreeMinZ),
+			FreeMinZ < 0.30))
+	{
+		S.Cleanup();
+		return false;
+	}
+
+	// --- Phase B: install bracelet x floor avoidance LIVE, re-run --------------
+	mj_resetDataKeyframe(M, D, KeyId);
+	mj_forward(M, D);
+	UMjArticulationController::NotifySimReset();
+
+	FMinkLimitSpec Avoid;
+	Avoid.Kind = EMinkLimitKind::CollisionAvoidance;
+	Avoid.GeomsA = {TEXT("bracelet_link")}; // body name -> its (unnamed) geoms
+	Avoid.GeomsB = {TEXT("floor")};         // geom name
+	Avoid.Gain = 0.85f;
+	Avoid.MinDistance = 0.35f;
+	Avoid.DetectionDistance = 0.9f;
+	{
+		FScopeLock Lock(&Ctrl->GetConfigLock());
+		Ctrl->Limits.Add(Avoid);
+	}
+	Ctrl->MarkSpecsChanged(); // live rebuild picks the new limit up next step
+
+	MinBraceletZ = 99.0;
+	SendLowTarget();
+	const bool bOk = RunSteps(800);
+	const double GuardedMinZ = MinBraceletZ;
+	TestTrue(FString::Printf(
+				 TEXT("collision limit holds the wrist off the floor (min z %.3f >= 0.33, free run %.3f)"),
+				 GuardedMinZ, FreeMinZ),
+		GuardedMinZ >= 0.33);
+	TestTrue(FString::Printf(TEXT("comparative: guarded %.3f > free %.3f + 0.04"), GuardedMinZ, FreeMinZ),
+		GuardedMinZ > FreeMinZ + 0.04);
+
+	S.Cleanup();
+	return bOk;
+}
