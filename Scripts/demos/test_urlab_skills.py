@@ -4,7 +4,7 @@ Run: /home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python test_urlab_skill
 import numpy as np
 import sys
 sys.path.insert(0, ".")
-from urlab_skills import approach_waypoints, cup_down_quat, reach_annulus_ok
+from urlab_skills import approach_waypoints, cup_down_quat, due_waypoint, reach_annulus_ok
 
 # approach_waypoints: template from an affordance frame.
 pt = np.array([1.0, 2.0, 0.5]); n = np.array([0.0, 0.0, 1.0])
@@ -36,5 +36,12 @@ assert _payload["tasks"][1]["joints"] == [
     "joint_x", "joint_y", "joint_th",
     "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7",
 ], _payload["tasks"][1]["joints"]
+
+# due_waypoint: schedule lookup for PlannedReach streaming.
+_wps = [(0.0, {"j": 0.0}), (1.0, {"j": 1.0}), (2.5, {"j": 2.0})]
+assert due_waypoint(_wps, -0.1) == 0
+assert due_waypoint(_wps, 0.0) == 0
+assert due_waypoint(_wps, 1.7) == 1
+assert due_waypoint(_wps, 99.0) == 2
 
 print("urlab_skills self-tests OK")

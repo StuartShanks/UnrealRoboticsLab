@@ -8,13 +8,18 @@ reusable skills in urlab_skills.py, orchestrating the full "pick" story with
 ONE controller for the entire run:
 
     ResolveAffordance -> Reachable -> Drive(staging) -> CorridorClear
-    -> ReachRamp(pre-approach, cup-down) -> DescendEngage -> VerifyAttach
+    -> PlannedReach(whole-body RRT-Connect) -> DescendEngage -> VerifyAttach
     -> StowCarry -> Drive(home) -> Release
 
-Spec: docs/superpowers/specs/2026-07-16-suction-pick-v1-design.md.
-No motion planner in v1 (locked premise): Reachable and CorridorClear are
-loud-abort gates, not a planner — a blocked corridor or an out-of-annulus
-affordance point fails the tree rather than replanning.
+Spec: docs/superpowers/specs/2026-07-16-suction-pick-v1-design.md;
+whole-body connector: docs/superpowers/specs/2026-07-16-whole-body-rrt-
+connector-design.md. PlannedReach (urlab_skills.py) replaces the straight-
+line ReachRamp carpet: it plans an RRT-Connect path to the pre-grasp pose
+and executes it exactly via the posture_target wire, rather than letting the
+greedy QP rediscover a base path. Reachable and CorridorClear stay loud-abort
+gates ahead of it (a blocked corridor or an out-of-annulus affordance point
+fails the tree rather than replanning); ReachRamp itself is unchanged and
+still lives in urlab_skills.py for the other demos that use it.
 
 Run with the bridge venv's python, editor open (the user drives Simulate):
     /home/stuart/Unreal_Robotics/URLab_Bridge/.venv/bin/python \
@@ -49,8 +54,8 @@ from urlab_skills import (
     DescendEngage,
     Drive,
     PickBlackboard,
+    PlannedReach,
     Reachable,
-    ReachRamp,
     Release,
     ResolveAffordance,
     StowCarry,
@@ -98,15 +103,11 @@ TICK_PERIOD_S = 0.25
 
 
 class SuctionBlackboard(PickBlackboard):
-    """PickBlackboard + a computed single-point waypoint list for ReachRamp's
-    generic `waypoints_key` contract. ReachRamp only carries the EE out to the
-    pre-approach point (bb.affordance.waypoints[0]); DescendEngage owns the
-    engage+contact legs directly off bb.affordance. No behaviour logic is
-    reimplemented here — this is pure data plumbing between the two."""
-
-    @property
-    def pre_approach_waypoints(self):
-        return [self.affordance.waypoints[0]] if self.affordance is not None else []
+    """PickBlackboard, kept as this demo's named blackboard type. PlannedReach
+    consumes bb.affordance.point/normal directly (no waypoints_key plumbing —
+    that was ReachRamp's contract, retired from this tree when PlannedReach
+    swapped in); DescendEngage still owns the engage+contact legs directly
+    off bb.affordance."""
 
 
 def suction_pick_controller_payload(obstacle_bodies: list) -> dict:
@@ -169,13 +170,12 @@ def build_tree(bb: SuctionBlackboard) -> py_trees.trees.BehaviourTree:
                 p_to=lambda: bb.affordance.waypoints[2],
                 exclude_body_suffixes=CORRIDOR_EXCLUDE,
             ),
-            # No base-assist: the front-edge box is reachable from the aligned
-            # nav-staging pose with a fixed base, so the base stays locked and the
-            # descent is a clean, y-aligned, pure-vertical arm drop. (Free
-            # base-assist gave closeness but drifted the base off-center in y,
-            # descending beside the box; controlled base positioning for a
-            # deep-table pick is v1.1 — SetBaseAssist stays in urlab_skills for it.)
-            ReachRamp("ReachRamp", bb, waypoints_key="pre_approach_waypoints", quat_key="q_cup"),
+            # Whole-body planned reach: RRT-Connect to the pre-grasp pose
+            # (cup ~3cm above the box), executed exactly via the
+            # posture_target wire (see urlab_skills.PlannedReach). Replaces
+            # ReachRamp's straight-line carpet — no more depending on the
+            # greedy QP to rediscover a feasible base path.
+            PlannedReach("PlannedReach", bb),
             DescendEngage("DescendEngage", bb),
             verify_attach,
             StowCarry("StowCarry", bb),

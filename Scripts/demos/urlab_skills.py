@@ -27,6 +27,7 @@ import numpy as np
 import py_trees
 
 from tidybot_mink_demo import resolve_id_by_suffix, stream_target
+from tidybot_twist_follow_demo import POSTURE_TASK, DAMPING_TASK
 
 PRE_APPROACH_M = 0.15
 ENGAGE_M = 0.02
@@ -100,6 +101,16 @@ def reach_annulus_ok(shoulder: np.ndarray, target: np.ndarray,
     """Bent-arm reachability annulus (empirically mapped 2026-07-16)."""
     d = float(np.linalg.norm(np.asarray(target) - np.asarray(shoulder)))
     return r_min <= d <= r_max
+
+
+def due_waypoint(waypoints, elapsed_s):
+    """Index of the waypoint that should currently be streamed: the LAST
+    waypoint whose scheduled time <= elapsed_s (0 before the first)."""
+    idx = 0
+    for i, (t, _q) in enumerate(waypoints):
+        if t <= elapsed_s:
+            idx = i
+    return idx
 
 
 def corridor_clear(client, p_from, p_to, exclude_body_suffixes,
@@ -226,6 +237,22 @@ def _object_z(client, object_actor_id: str) -> float:
     if bid < 0:
         raise RuntimeError(f"object body {object_actor_id!r} not found in compiled model")
     return z
+
+
+def _synced_planned_q(client, joints):
+    """Planned-joint vector from a synced physics read. PRE-suction only (a
+    direct-mode step zeroes actuator NetworkValues server-side). Joint names
+    are SUFFIX-resolved (tidybot_planned_reach_probe.py's synced_q pattern):
+    the importer prefixes compiled joint names (e.g.
+    'tidybot_suction_ue_C_0_joint_x'), so a bare mj_name2id returns -1 and
+    jnt_qposadr[-1] would read garbage."""
+    client.step(n_steps=1)
+    m, d = client.model, client.data
+    out = np.empty(len(joints))
+    for i, jn in enumerate(joints):
+        jid = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, jn)
+        out[i] = d.qpos[m.jnt_qposadr[jid]]
+    return out
 
 
 def _base_xy(client) -> np.ndarray:
@@ -571,6 +598,112 @@ class ReachRamp(py_trees.behaviour.Behaviour):
     def terminate(self, new_status):
         if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
             self.bb.fail_reason = f"ReachRamp[{self.name}]: failed"
+
+
+class PlannedReach(py_trees.behaviour.Behaviour):
+    """Whole-body planned reach to the affordance pre-grasp pose: plans an
+    RRT-Connect path in initialise (blocking, seconds — acceptable at BT
+    rate for v1), then streams posture_target waypoints on schedule.
+    SUCCESS when the final waypoint tracks within tolerance; FAILURE on
+    PlanError or watchdog divergence. Replaces ReachRamp's straight-line
+    carpet — the planned BASE path executes exactly instead of being
+    rediscovered by the greedy QP.
+
+    Handoff contract (live-validated in tidybot_planned_reach_probe.py's
+    Phase C/D): frame + twist_follow tasks disabled during execution;
+    posture cost bumped AND the lazy-base damping cost relaxed (5.0 -> 0.05)
+    so the streamed base waypoints aren't fought by the base-velocity
+    penalty — both restored (damping back to 5.0, posture back to 1e-3) and
+    the posture latch cleared in terminate() regardless of outcome."""
+
+    PRE_GRASP_M = 0.03
+    TRACK_TOL = 0.15
+    TRACK_GRACE_S = 4.0
+    SETTLE_TOL = 0.05
+
+    def __init__(self, name, bb):
+        super().__init__(name)
+        self.bb = bb
+        self._plan = None
+        self._joints = None
+        self._t0 = None
+        self._diverged_since = None
+        self._failed = None
+
+    def initialise(self):
+        from urlab_planner import PLANNED_JOINTS, PlanError, plan_reach
+        bb = self.bb
+        client = bb.client
+        self._joints = PLANNED_JOINTS
+        self._failed = None
+        self._diverged_since = None
+        # ResolveAffordance publishes bb.affordance (an Affordance dataclass:
+        # point, normal, quat_cup_down, waypoints) and bb.q_cup.
+        aff = bb.affordance
+        pre_grasp = np.asarray(aff.point, dtype=float) \
+            + self.PRE_GRASP_M * np.asarray(aff.normal, dtype=float)
+        try:
+            self._plan = plan_reach(client, pre_grasp, np.asarray(bb.q_cup, dtype=float))
+        except PlanError as e:
+            self._plan = None
+            bb.fail_reason = f"PlannedReach[{self.name}]: plan {e.stage}: {e}"
+            self._failed = bb.fail_reason
+            return
+        # Frame + twist_follow OFF, posture dominates; relax the lazy-base
+        # damping (5.0 -> 0.05, the transit value) so it doesn't fight the
+        # posture task driving the base through each planned waypoint (the
+        # planner deliberately repositions the base) — mirrors the probe's
+        # proven Phase C configure() exactly.
+        client._rpc_configure_controller(articulation=bb.name, params={
+            "task_enabled": [False, True, True, False],
+            "task_costs": {str(POSTURE_TASK): {"cost": 5.0},
+                           str(DAMPING_TASK): {"cost": 0.05}},
+        })
+        self._t0 = time.time()
+
+    def update(self):
+        if self._failed:
+            self.feedback_message = self._failed
+            return py_trees.common.Status.FAILURE
+        bb = self.bb
+        client = bb.client
+        elapsed = time.time() - self._t0
+        idx = due_waypoint(self._plan.waypoints, elapsed)
+        t_wp, wp = self._plan.waypoints[idx]
+        client._rpc_configure_controller(articulation=bb.name,
+                                         params={"posture_target": wp})
+        # Watchdog + terminal check on synced state.
+        q = _synced_planned_q(client, self._joints)
+        err = max(abs(q[i] - wp[jn]) for i, jn in enumerate(self._joints))
+        is_last = idx == len(self._plan.waypoints) - 1
+        if is_last and elapsed >= t_wp and err < self.SETTLE_TOL:
+            return py_trees.common.Status.SUCCESS
+        if err > self.TRACK_TOL and elapsed >= t_wp:
+            self._diverged_since = self._diverged_since or time.time()
+            if time.time() - self._diverged_since > self.TRACK_GRACE_S:
+                self.feedback_message = f"watchdog: err {err:.3f} at waypoint {idx}"
+                bb.fail_reason = (
+                    f"PlannedReach[{self.name}]: watchdog err {err:.3f} > "
+                    f"{self.TRACK_TOL} at waypoint {idx} for {self.TRACK_GRACE_S}s"
+                )
+                return py_trees.common.Status.FAILURE
+        else:
+            self._diverged_since = None
+        return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status):
+        bb = self.bb
+        try:
+            bb.client._rpc_configure_controller(articulation=bb.name, params={
+                "posture_target": {},
+                "task_costs": {str(POSTURE_TASK): {"cost": 1e-3},
+                               str(DAMPING_TASK): {"cost": 5.0}},
+                "task_enabled": [True, True, True, False],
+            })
+        except Exception:
+            pass
+        if new_status == py_trees.common.Status.FAILURE and not bb.fail_reason:
+            bb.fail_reason = f"PlannedReach[{self.name}]: failed"
 
 
 class DescendEngage(py_trees.behaviour.Behaviour):
