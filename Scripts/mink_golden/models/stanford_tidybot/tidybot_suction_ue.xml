@@ -184,8 +184,15 @@
                                force cancels the suction and NOTHING is gripped (verified
                                in pure MuJoCo). Also lets the cup grab from up to 3 cm
                                away, so the pick tolerates an imperfect touch. -->
+                          <!-- condim=6 + torsional/rolling friction so the suction
+                               contact resists SPIN (torsion about the cup axis) and
+                               TILT (rolling), not just slide. Lives on the GRIPPER, so
+                               EVERY object the cup grabs inherits it (MuJoCo takes the
+                               max condim/friction of the pair) — no per-object setup.
+                               friction = slide torsion roll. -->
                           <geom name="cup_geom" type="cylinder" size="0.03 0.01"
-                                margin="0.03" gap="0.03" rgba="0.15 0.15 0.15 1"/>
+                                margin="0.03" gap="0.03" condim="6" friction="1 0.2 0.05"
+                                rgba="0.15 0.15 0.15 1"/>
                           <!-- Identity quat: cup_site frame z = the cup's outward suction
                                direction (the 2f85 mount's grasping axis). pinch_site used
                                quat="0 1 0 0" (a 180deg flip) for the finger convention, which
