@@ -30,10 +30,10 @@ from tidybot_suction_pick_demo import (ACTOR_ID, ASSETS, MODEL_XML,
                                        suction_pick_controller_payload)
 
 PRE_GRASP_M = 0.03      # plan target: cup this far above the box top
-TRACK_TOL = 0.15        # rad/m — watchdog per-joint tracking tolerance
-TRACK_GRACE_S = 4.0     # divergence longer than this aborts execution
+TRACK_TOL = 0.15        # rad/m — per-joint tracking tolerance to advance a waypoint
 SETTLE_TOL = 0.05       # final-waypoint convergence
-SETTLE_TIMEOUT_S = 10.0
+NO_PROGRESS_S = 6.0     # abort only if best tracking error stops improving this long
+PROGRESS_EPS = 0.02     # min err drop that counts as progress
 
 
 def log(m):
@@ -170,45 +170,44 @@ def drive():
     configure({"task_enabled": [False, True, True, False],
                "task_costs": {str(POSTURE_TASK): {"cost": 5.0},
                               str(DAMPING_TASK): {"cost": 0.05}}})
-    t0 = time.time()
-    diverged_since = None
+    # Progress-based, self-paced watchdog: advance a waypoint only when tracked,
+    # and abort ONLY when the best tracking error stops improving (not on a fixed
+    # timer). A 2-waypoint plan streams the goal directly and the QP chases it at
+    # the velocity limit, so a big-but-valid move (large base reorientation or a
+    # ~200 deg wrist roll = several seconds) keeps err high while progressing —
+    # the old fixed 4 s grace false-tripped those. Surfaced live on a house table
+    # pick; mirrors PlannedReach.
     wp_idx = 0
-    while wp_idx < len(plan.waypoints):
-        t_wp, wp = plan.waypoints[wp_idx]
-        now = time.time() - t0
-        if now < t_wp:
-            time.sleep(min(0.2, t_wp - now))
+    best_err = float("inf")
+    last_improve = time.time()
+
+    def _abort_cleanup():
+        configure({"posture_target": {},
+                   "task_costs": {str(POSTURE_TASK): {"cost": 1e-3},
+                                  str(DAMPING_TASK): {"cost": 5.0}},
+                   "task_enabled": [True, True, True, False]})
+
+    while True:
+        wp = plan.waypoints[wp_idx][1]
         configure({"posture_target": wp})
-        # Watchdog on the CURRENT waypoint once its scheduled time has passed.
-        if time.time() - t0 >= t_wp:
-            q = synced_q()
-            err = max(abs(q[i] - wp[jn]) for i, jn in enumerate(PLANNED_JOINTS))
-            if err > TRACK_TOL:
-                diverged_since = diverged_since or time.time()
-                if time.time() - diverged_since > TRACK_GRACE_S:
-                    configure({"posture_target": {},
-                               "task_costs": {str(POSTURE_TASK): {"cost": 1e-3}}})
-                    fail(f"watchdog: waypoint {wp_idx} tracking err {err:.3f} "
-                         f"> {TRACK_TOL} for {TRACK_GRACE_S}s — aborted, latch cleared")
-            else:
-                diverged_since = None
-                wp_idx += 1
-                log(f"  waypoint {wp_idx}/{len(plan.waypoints)} (err {err:.3f})")
-    # Settle on the final waypoint.
-    t_wp, wp = plan.waypoints[-1]
-    settle_deadline = time.time() + SETTLE_TIMEOUT_S
-    while time.time() < settle_deadline:
         q = synced_q()
         err = max(abs(q[i] - wp[jn]) for i, jn in enumerate(PLANNED_JOINTS))
-        if err < SETTLE_TOL:
-            break
-        configure({"posture_target": wp})
-        time.sleep(0.3)
-    else:
-        configure({"posture_target": {},
-                   "task_costs": {str(POSTURE_TASK): {"cost": 1e-3}},
-                   "task_enabled": [True, True, True, False]})
-        fail(f"final waypoint never settled (err {err:.3f})")
+        if err < best_err - PROGRESS_EPS:
+            best_err = err
+            last_improve = time.time()
+        if err <= TRACK_TOL:
+            if wp_idx == len(plan.waypoints) - 1:
+                if err < SETTLE_TOL:
+                    break
+            else:
+                wp_idx += 1
+                best_err = float("inf")
+                last_improve = time.time()
+                log(f"  waypoint {wp_idx}/{len(plan.waypoints)} (err {err:.3f})")
+        if time.time() - last_improve > NO_PROGRESS_S:
+            _abort_cleanup()
+            fail(f"no progress for {NO_PROGRESS_S}s at waypoint {wp_idx} (err {err:.3f})")
+        time.sleep(0.25)
     log(f"plan executed — at pre-grasp (err {err:.3f})")
 
     # --- Phase D: validated direct-descent suction endgame ----------------------

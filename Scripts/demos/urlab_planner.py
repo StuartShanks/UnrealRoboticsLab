@@ -350,9 +350,17 @@ def time_parameterize(path, joints=PLANNED_JOINTS, v_limits=None, min_dt=0.1):
 
 
 def plan_reach(client, pos, quat_wxyz, site="cup_site", joints=PLANNED_JOINTS,
-               n_goals=8, max_iters=2000, seed=0, v_limits=None):
+               n_goals=12, max_iters=2000, seed=0, v_limits=None):
     """Full pipeline: synced snapshot -> goal IK -> RRT-Connect -> shortcut ->
-    timed waypoints. Raises PlanError('goal_ik'|'rrt') on failure."""
+    timed waypoints. Raises PlanError('goal_ik'|'rrt') on failure.
+
+    Goal selection: sample n_goals IK solutions, then rank them by TRACKABILITY
+    (the direct start->goal move time, max_j |dq_j| / v_j) and hand rrt_connect
+    the easiest first. A marginal goal can converge in IK yet stall the
+    velocity-limited QP at execution (observed live: a lone awkward goal froze
+    tracking at err 1.68 where a nearer goal reached +11 cm); ranking closest-
+    first makes trivial-connect prefer the trackable one and the extra seeds
+    make a good goal far likelier to exist."""
     import time as _time
     t0 = _time.time()
     ctx = PlanContext.from_client(client, joints)
@@ -360,7 +368,13 @@ def plan_reach(client, pos, quat_wxyz, site="cup_site", joints=PLANNED_JOINTS,
     if not goals:
         raise PlanError("goal_ik",
                         f"no collision-free IK solution for {site} at {np.round(pos, 3)}")
-    path = rrt_connect(ctx, ctx.q_start(), goals, max_iters=max_iters, seed=seed)
+    # Rank by direct-move time from the current config (same metric as
+    # time_parameterize), most-trackable first.
+    q0 = ctx.q_start()
+    vl = v_limits or DEFAULT_V_LIMITS
+    vvec = np.asarray([vl[j] for j in joints], dtype=float)
+    goals.sort(key=lambda g: float(np.max(np.abs(np.asarray(g) - q0) / vvec)))
+    path = rrt_connect(ctx, q0, goals, max_iters=max_iters, seed=seed)
     if path is None:
         raise PlanError("rrt",
                         f"RRT-Connect exhausted {max_iters} iterations ({len(goals)} goals)")
@@ -368,5 +382,6 @@ def plan_reach(client, pos, quat_wxyz, site="cup_site", joints=PLANNED_JOINTS,
     wps = time_parameterize(path, joints, v_limits)
     return Plan(waypoints=wps, stats={
         "n_goals": len(goals), "n_waypoints": len(wps),
+        "goal_reach_s": round(float(np.max(np.abs(np.asarray(path[-1]) - q0) / vvec)), 2),
         "duration_s": wps[-1][0], "plan_wall_s": _time.time() - t0,
     })
