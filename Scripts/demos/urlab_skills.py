@@ -747,13 +747,28 @@ class PlannedReach(py_trees.behaviour.Behaviour):
 
     def terminate(self, new_status):
         bb = self.bb
+        params = {
+            "posture_target": {},
+            "task_costs": {str(POSTURE_TASK): {"cost": 1e-3},
+                           str(DAMPING_TASK): {"cost": 5.0}},
+            "task_enabled": [True, True, True, False],
+        }
+        # SEED-THEN-ENABLE (ReachRamp's rule): the frame task ran DISABLED during
+        # the reach, so its manual target is stale — the bind pose (spawn EE),
+        # metres from where the cup now is. Re-enabling it without a fresh target
+        # makes the whole-body QP lunge at the bind pose and swing the base wildly
+        # for the ticks before DescendEngage streams its own target (seen live as
+        # a violent base veer during the hand-off). Seed the target at the CURRENT
+        # cup pose in the SAME call that re-enables it so the frame task holds
+        # position instead of yanking.
         try:
-            bb.client._rpc_configure_controller(articulation=bb.name, params={
-                "posture_target": {},
-                "task_costs": {str(POSTURE_TASK): {"cost": 1e-3},
-                               str(DAMPING_TASK): {"cost": 5.0}},
-                "task_enabled": [True, True, True, False],
-            })
+            cup_pos, cup_quat = synced_site_pose(bb.client, "cup_site")
+            params["target_pos"] = [float(v) for v in cup_pos]
+            params["target_quat"] = [float(v) for v in cup_quat]
+        except Exception:
+            pass  # best-effort seed; still restore the config below
+        try:
+            bb.client._rpc_configure_controller(articulation=bb.name, params=params)
         except Exception:
             pass
         if new_status == py_trees.common.Status.FAILURE and not bb.fail_reason:
@@ -802,7 +817,6 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         if bb.affordance is None:
             self._init_error = "no affordance resolved"
             return
-        self._quat = np.asarray(bb.affordance.quat_cup_down, dtype=float)
         try:
             # Snapshot the object's affordance pose ONCE, now, while it is
             # sitting still. Do NOT chase it live: the affordance site rides the
@@ -814,10 +828,18 @@ class DescendEngage(py_trees.behaviour.Behaviour):
             mujoco.mju_quat2Mat(R, quat)
             normal = np.asarray(R).reshape(3, 3)[:, 2]
             normal = normal / (np.linalg.norm(normal) or 1.0)
-            p0, _ = synced_site_pose(bb.client, "cup_site")
+            # Descend at the cup's CURRENT orientation, not affordance.quat_cup_down.
+            # PlannedReach lands the cup already pointing down (roll-agnostic IK), so
+            # re-imposing quat_cup_down's fixed roll makes the frame task spin the
+            # axisymmetric cup's wrist — and the whole-body QP recruits the BASE to
+            # help, swinging it into furniture (seen live). Holding the landed
+            # orientation makes the descent a pure straight-down move; the roll is a
+            # don't-care for the grasp.
+            p0, self._quat = synced_site_pose(bb.client, "cup_site")
         except RuntimeError as e:
             self._init_error = str(e)
             return
+        self._quat = np.asarray(self._quat, dtype=float)
         self._surf = np.asarray(surf, dtype=float)
         self._pressed = self._surf + self.HOVER_M * normal  # hover ABOVE, don't press
         self._start_pose = p0
@@ -901,18 +923,22 @@ class VerifyAttach(py_trees.behaviour.Behaviour):
         client = bb.client
         self._init_error = None
         try:
-            p0, _ = synced_site_pose(client, "cup_site")
+            p0, cup_quat = synced_site_pose(client, "cup_site")
             self._z_before = _object_z(client, bb.object_actor_id)
         except RuntimeError as e:
             self._init_error = str(e)
             return
         _hold_suction(client, bb.name)  # the two synced reads above zeroed suction
         self._start_pose = p0
-        # Hold the CANONICAL cup-down orientation (bb.q_cup, computed once by
-        # ResolveAffordance), NOT the live-read cup pose — a slightly drifted
-        # descent pose would otherwise lock a tilted/flipped orientation into
-        # the lift. The target orientation must never change from cup-down.
-        self._quat = np.asarray(bb.q_cup, dtype=float)
+        # Hold the LANDED cup orientation (already cup-down after the roll-free
+        # reach), NOT the canonical bb.q_cup. bb.q_cup pins a specific ROLL about
+        # the tool axis, which is vertical when cup-down — the SAME axis as base
+        # yaw (joint_th) — so the whole-body QP "corrects" that unwanted roll by
+        # ROTATING THE BASE during the lift (seen live). The cup is axisymmetric,
+        # so its roll is a don't-care; holding the current orientation keeps it
+        # cup-down with zero roll correction -> the lift is a pure vertical raise.
+        # (mju_mat2Quat gives a consistent-sign quat, so no flip risk.)
+        self._quat = np.asarray(cup_quat, dtype=float)
         self._target = p0 + np.array([0.0, 0.0, self.LIFT_M])
         self._t0 = time.time()
         self._retried = False
@@ -997,15 +1023,18 @@ class StowCarry(py_trees.behaviour.Behaviour):
         client = bb.client
         self._init_error = None
         try:
-            p0, _ = synced_site_pose(client, "cup_site")
+            p0, cup_quat = synced_site_pose(client, "cup_site")
         except RuntimeError as e:
             self._init_error = str(e)
             return
         _hold_suction(client, bb.name)  # keep the grip through the carry (read zeroed it)
         self._start_pose = p0
-        # Canonical cup-down orientation (see VerifyAttach) — never the live-read
-        # pose, so the carried box stays flat and the target never flips.
-        self._quat = np.asarray(bb.q_cup, dtype=float)
+        # Hold the LANDED cup orientation, NOT canonical bb.q_cup (see VerifyAttach):
+        # pinning the roll makes the whole-body QP rotate the BASE to correct a
+        # don't-care roll about the vertical tool axis. Holding the current
+        # (already cup-down) orientation keeps the carried box flat with no base
+        # yaw. mju_mat2Quat gives a consistent-sign quat, so the target won't flip.
+        self._quat = np.asarray(cup_quat, dtype=float)
         self._target = p0 + self.OFFSET
         self._t0 = time.time()
         self._stowed = False

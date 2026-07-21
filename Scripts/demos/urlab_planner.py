@@ -185,13 +185,22 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
 
     rng = np.random.default_rng(seed)
     pos = np.asarray(pos, dtype=float)
+    # Wrist-roll pin: joint_7 is the axisymmetric cup's pure-roll DOF (see below).
+    _WRIST_IDX = ctx.joints.index("joint_7") if "joint_7" in ctx.joints else None
+    q_start_full = ctx.q_start()
     # mink resolves frame_name by exact string against the compiled model, so
     # pass the prefixed compiled name (the caller gives a bare suffix).
     frame_name = _resolve_name(ctx.m, mujoco.mjtObj.mjOBJ_SITE, ctx.m.nsite, site)
     if frame_name is None:
         raise ValueError(f"site {site!r} not in model")
+    # Roll-agnostic orientation: the cup is axisymmetric, so rotation ABOUT its
+    # tool axis (cup_site local z) is a don't-care DOF. Zeroing the z-axis
+    # orientation cost lets the posture regularizer keep the wrist near its
+    # current angle instead of the IK baking in a large arbitrary roll (live: a
+    # 208 deg joint_7 spin) — [x, y, z] = [constrain, constrain, free-roll].
     task = mink.FrameTask(frame_name=frame_name, frame_type="site",
-                          position_cost=1.0, orientation_cost=1.0, lm_damping=1.0)
+                          position_cost=1.0, orientation_cost=[1.0, 1.0, 0.0],
+                          lm_damping=1.0)
     rot = mink.SO3(np.asarray(quat_wxyz, dtype=float))
     task.set_target(mink.SE3.from_rotation_and_translation(rot, pos))
     posture_cost = np.zeros(ctx.m.nv)
@@ -227,6 +236,16 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
         if not converged:
             continue
         qg = np.asarray(cfg.q)[ctx.qadr].copy()
+        # Pin the wrist roll to the CURRENT angle. joint_7 is a pure roll DOF
+        # about the axisymmetric cup's tool axis (verified: moving it does not
+        # translate cup_site), so its value is a don't-care for the grasp — but
+        # the roll-free orientation cost lets IK leave it at whatever the random
+        # seed had, baking a pointless wrist spin into the plan (live: +3.6 rad).
+        # Overwriting it with the start angle costs nothing (cup pose unchanged)
+        # and is collision-safe (rotating an axisymmetric cup about its own axis
+        # sweeps no new volume); the collision_free check below still runs on it.
+        if _WRIST_IDX is not None:
+            qg[_WRIST_IDX] = q_start_full[_WRIST_IDX]
         if not ctx.collision_free(qg):
             continue
         if any(np.max(np.abs(qg - g)) < 0.05 for g in goals):
