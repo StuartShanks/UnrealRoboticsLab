@@ -176,6 +176,21 @@ def _edge_free(ctx, qa, qb, resolution=0.05):
     return True
 
 
+def _base_frame_offset_xy(ctx):
+    """World-minus-joint xy offset of the base slide frame. joint_x/joint_y
+    qpos are relative to the robot's SPAWN frame, not the world: world_xy =
+    offset + joint_xy. In-house demos spawned at the origin (offset 0), which
+    hid any confusion; a non-origin spawn (HomeInterior: (-10,-18)) fed world
+    coords into base joints and scattered goal-IK seeds 10-20 m from the
+    target — goal_ik found nothing. Evaluated at the snapshot start config;
+    assumes joints[0]/joints[1] are world-aligned x/y slides (true for the
+    holonomic base; a spawn-yawed robot would need the rotation too)."""
+    q0 = ctx.q_start()
+    ctx._set(q0)
+    bid = int(ctx.m.jnt_bodyid[ctx.jids[1]])   # joint_y's body: moved by both slides
+    return ctx.d.xpos[bid][:2].copy() - q0[:2]
+
+
 def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
                         iters=200, dt=0.05, pos_tol=5e-3, ori_tol=5e-2):
     """python-mink IK from n seeds -> deduped collision-free goal configs.
@@ -208,6 +223,8 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
         posture_cost[ctx.m.jnt_dofadr[jid]] = 1e-3
     limits = [mink.ConfigurationLimit(ctx.m)]
 
+    # World target -> base joint frame (spawn offset); see _base_frame_offset_xy.
+    off_xy = _base_frame_offset_xy(ctx)
     goals = []
     for k in range(n):
         q = ctx.q_start()
@@ -215,8 +232,8 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
             q = rng.uniform(ctx.lo, ctx.hi)
             r = rng.uniform(0.3, 0.9)          # base in an annulus around the
             th = rng.uniform(-np.pi, np.pi)    # target xy, roughly arm reach
-            q[0] = np.clip(pos[0] + r * np.cos(th), ctx.lo[0], ctx.hi[0])
-            q[1] = np.clip(pos[1] + r * np.sin(th), ctx.lo[1], ctx.hi[1])
+            q[0] = np.clip(pos[0] - off_xy[0] + r * np.cos(th), ctx.lo[0], ctx.hi[0])
+            q[1] = np.clip(pos[1] - off_xy[1] + r * np.sin(th), ctx.lo[1], ctx.hi[1])
         cfg = mink.Configuration(ctx.m)
         qfull = ctx.qpos0.copy()
         qfull[ctx.qadr] = q
@@ -229,8 +246,14 @@ def sample_goal_configs(ctx, pos, quat_wxyz, site="cup_site", n=8, seed=0,
                               damping=1e-3, limits=limits)
             cfg.integrate_inplace(v, dt)
             err = task.compute_error(cfg)
+            # Score the CONSTRAINED orientation axes only: err[5] is rotation
+            # about the site z (tool) axis, which orientation_cost=[1,1,0]
+            # deliberately frees (axisymmetric cup). Scoring err[3:] vetoed
+            # perfect grasps whenever the uncontrolled roll sat far from the
+            # target roll (live: every seed pos_err 0.000, |ori_xy| 0.000,
+            # 0.3-1.85 rad of don't-care roll -> goal_ik dry).
             if (np.linalg.norm(err[:3]) <= pos_tol
-                    and np.linalg.norm(err[3:]) <= ori_tol):
+                    and np.linalg.norm(err[3:5]) <= ori_tol):
                 converged = True
                 break
         if not converged:
