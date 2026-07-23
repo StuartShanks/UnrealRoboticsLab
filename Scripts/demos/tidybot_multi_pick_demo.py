@@ -91,6 +91,16 @@ def main(one_way: bool):
         pass
     c.runtime.set_paused(paused=False)
     time.sleep(1.0)
+    # ESTABLISH the starting task state — never inherit ambient controller
+    # state. A previous run's teardown leaves [True,True,True,False] (EE on,
+    # twist OFF): nav then streams twists onto a bus with no consumer while
+    # the EE hold pins the base — stuck watchdog, 'nav failed' (this exact
+    # poisoning cost live gate 1 a diagnosis). Nav-ready = EE off, twist on;
+    # damping high (StageAt's Drive relaxes it itself).
+    c._rpc_configure_controller(articulation=name, params={
+        "task_enabled": [False, True, True, True],
+        "task_costs": {"2": {"cost": 5.0}},
+    })
 
     bb = U.PickBlackboard()
     bb.client = c
