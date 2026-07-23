@@ -405,6 +405,107 @@ class Drive(py_trees.behaviour.Behaviour):
             self.bb.fail_reason = f"Drive[{self.name}]: failed"
 
 
+def staging_ring(target_xy, station_aabb, here_xy, erode_m: float = 0.58,
+                 radii=(0.95, 1.10), n_bearings: int = 16):
+    """Staging candidates around a reach target beside a station: ring points
+    at `radii` from `target_xy`, keeping only points OUTSIDE the station AABB
+    inflated by the navmesh erosion (so the requested point is itself
+    navigable, not silently projected), sorted by drive distance from
+    `here_xy`. Pure — no client."""
+    xmin, xmax, ymin, ymax = station_aabb
+    here = np.asarray(here_xy, dtype=float)
+    out = []
+    for r in radii:
+        for k in range(n_bearings):
+            th = 2.0 * np.pi * k / n_bearings
+            p = np.array([target_xy[0] + r * np.cos(th),
+                          target_xy[1] + r * np.sin(th)])
+            if (xmin - erode_m <= p[0] <= xmax + erode_m) and \
+                    (ymin - erode_m <= p[1] <= ymax + erode_m):
+                continue
+            out.append(p)
+    out.sort(key=lambda p: float(np.linalg.norm(p - here)))
+    return out
+
+
+class StageAt(py_trees.behaviour.Behaviour):
+    """Staging-policy-as-a-skill: ring candidates around the reach target
+    (staging_ring), each attempted with Drive in strict mode
+    (max_projection) and VERIFIED on arrival against the REQUESTED point
+    (defense-in-depth over the strict mode). SUCCESS on the first verified
+    candidate; FAILURE when the ring / max_tries are exhausted. Subsumes the
+    fab demo's inline staging loop."""
+
+    def __init__(self, name, bb, station_aabb, target_xy, erode_m: float = 0.58,
+                 verify_m: float = 0.30, max_projection: float = 0.30,
+                 max_tries: int = 4, timeout_s: float = NAV_TIMEOUT_S):
+        super().__init__(name)
+        self.bb = bb
+        self.station_aabb = station_aabb
+        self.target_xy = target_xy
+        self.erode_m = float(erode_m)
+        self.verify_m = float(verify_m)
+        self.max_projection = float(max_projection)
+        self.max_tries = int(max_tries)
+        self.timeout_s = float(timeout_s)
+        self._candidates = None
+        self._tries = 0
+        self._drive = None
+
+    def _next_drive(self):
+        """Arm a Drive at the next candidate; None when exhausted."""
+        while self._candidates and self._tries < self.max_tries:
+            cand = self._candidates.pop(0)
+            self._tries += 1
+            d = Drive(f"{self.name}/cand{self._tries}", self.bb,
+                      (float(cand[0]), float(cand[1])),
+                      timeout_s=self.timeout_s,
+                      max_projection=self.max_projection)
+            d.initialise()
+            return d, cand
+        return None, None
+
+    def initialise(self):
+        here = _base_xy(self.bb.client)
+        self._candidates = staging_ring(self.target_xy, self.station_aabb,
+                                        here, self.erode_m)
+        self._tries = 0
+        self.bb.fail_reason = ""
+        self._drive, self._cand = self._next_drive()
+
+    def update(self):
+        bb = self.bb
+        if self._drive is None:
+            if not bb.fail_reason:
+                bb.fail_reason = (f"StageAt[{self.name}]: ring exhausted "
+                                  f"({self._tries} tries)")
+            return py_trees.common.Status.FAILURE
+        status = self._drive.update()
+        if status == py_trees.common.Status.RUNNING:
+            return py_trees.common.Status.RUNNING
+        if status == py_trees.common.Status.SUCCESS:
+            actual = _base_xy(bb.client)
+            miss = float(np.linalg.norm(actual - self._cand))
+            if miss <= self.verify_m:
+                self.logger.info(f"staged at {np.round(actual, 2)} "
+                                 f"({miss:.2f} m from requested)")
+                return py_trees.common.Status.SUCCESS
+            self.logger.info(f"arrival {miss:.2f} m off requested "
+                             f"{np.round(self._cand, 2)} — next candidate")
+        # rejected / failed / unverified: advance the ring
+        bb.fail_reason = ""
+        self._drive, self._cand = self._next_drive()
+        if self._drive is None:
+            bb.fail_reason = (f"StageAt[{self.name}]: ring exhausted "
+                              f"({self._tries} tries)")
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status):
+        if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
+            self.bb.fail_reason = f"StageAt[{self.name}]: failed"
+
+
 class ResolveAffordance(py_trees.behaviour.Behaviour):
     """One-shot: resolve the pick object's affordance frame onto the
     blackboard (bb.affordance, bb.q_cup) via resolve_affordance's

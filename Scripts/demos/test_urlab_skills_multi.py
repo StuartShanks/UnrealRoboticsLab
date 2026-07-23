@@ -65,3 +65,70 @@ assert "max_projection" not in rt.goal_calls[0], rt.goal_calls[0]
 assert d.update() == py_trees.common.Status.SUCCESS
 
 print("task-1 Drive tests OK")
+
+# --- staging_ring: geometry + ordering (pure) --------------------------------
+AABB = (-13.20, -12.44, -15.63, -14.87)
+ring = U.staging_ring((-12.71, -15.36), AABB, here_xy=np.array([-10.0, -18.0]))
+assert len(ring) > 0
+for p in ring:
+    inside = (AABB[0] - 0.58 <= p[0] <= AABB[1] + 0.58) and \
+             (AABB[2] - 0.58 <= p[1] <= AABB[3] + 0.58)
+    assert not inside, f"candidate {p} inside the eroded band"
+d0 = [float(np.linalg.norm(p - np.array([-10.0, -18.0]))) for p in ring]
+assert d0 == sorted(d0), "candidates not sorted by drive distance"
+
+# --- StageAt: first candidate rejected -> second verified --------------------
+rt = StubRuntime(
+    goal_replies=[
+        {"accepted": False, "reason": "projection_exceeds_max", "projection_m": 0.4},
+        {"accepted": True},
+    ],
+    status_replies=[{"state": "arrived", "distance_to_goal": 0.0}],
+)
+bb = make_bb(rt)
+stage = U.StageAt("stage", bb, AABB, (-12.71, -15.36))
+# Arrival verification: base "lands" exactly on the last requested candidate;
+# before any goal was requested (the ring-sort read in initialise) report the
+# spawn point.
+U._base_xy = lambda client: (
+    np.array([rt.goal_calls[-1]["x"], rt.goal_calls[-1]["y"]])
+    if rt.goal_calls else np.array([-10.0, -18.0]))
+stage.initialise()
+status = py_trees.common.Status.RUNNING
+for _ in range(10):
+    status = stage.update()
+    if status != py_trees.common.Status.RUNNING:
+        break
+assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
+assert len(rt.goal_calls) == 2, "should have advanced past the rejected candidate"
+assert rt.goal_calls[0]["max_projection"] == 0.30
+
+# --- StageAt: arrival too far from the REQUESTED point -> next candidate -----
+rt = StubRuntime(
+    goal_replies=[{"accepted": True}, {"accepted": True}],
+    status_replies=[
+        {"state": "arrived", "distance_to_goal": 0.0},
+        {"state": "arrived", "distance_to_goal": 0.0},
+    ],
+)
+bb = make_bb(rt)
+calls = {"n": 0}
+def _fake_base_xy(client):
+    calls["n"] += 1
+    if calls["n"] == 1:   # ring-sort read in initialise (no goals yet)
+        return np.array([-10.0, -18.0])
+    if calls["n"] == 2:   # first arrival verification: 1 m off the request
+        return np.array([rt.goal_calls[0]["x"] + 1.0, rt.goal_calls[0]["y"]])
+    return np.array([rt.goal_calls[-1]["x"], rt.goal_calls[-1]["y"]])
+U._base_xy = _fake_base_xy
+stage = U.StageAt("stage", bb, AABB, (-12.71, -15.36))
+stage.initialise()
+status = py_trees.common.Status.RUNNING
+for _ in range(10):
+    status = stage.update()
+    if status != py_trees.common.Status.RUNNING:
+        break
+assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
+assert len(rt.goal_calls) == 2, "substituted arrival must advance the ring"
+
+print("task-2 StageAt tests OK")
