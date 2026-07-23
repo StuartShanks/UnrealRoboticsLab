@@ -1395,3 +1395,131 @@ class Release(py_trees.behaviour.Behaviour):
     def terminate(self, new_status):
         if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
             self.bb.fail_reason = f"Release[{self.name}]: failed"
+
+
+class PlaceOn(py_trees.behaviour.Behaviour):
+    """The pick's inverse: planned reach to a hover above the place point
+    (via a synthetic Affordance + the module's PlannedReach), slow streamed
+    descend until the OBJECT (not the cup) settles on the surface, release,
+    verify, retract. The hover accounts for the object riding ~4-6 cm below
+    the cup on the adhesion margin.
+
+    PLANNER CAVEAT (recorded risk): the plan runs with the object HELD —
+    the planner models it as a static body at its held pose, not attached.
+    Believed benign (the phantom sits inside the start config's margin
+    contacts; goals are elsewhere); live gate 1 is the arbiter, and the
+    fallback is a straight streamed approach instead of a planned one."""
+
+    PRE_PLACE_HOVER_M = 0.16   # cup hover above surface_z
+    AFFORDANCE_DZ = 0.13       # hover minus PlannedReach's PRE_GRASP_M (0.03)
+    CUP_FLOOR_M = 0.03         # never stream the cup below surface + this
+    DESCEND_STEP_M = 0.015     # per-tick descend increment (bounded error)
+    DWELL_S = 1.0
+    RETRACT = np.array([-0.15, 0.0, 0.15])
+
+    def __init__(self, name, bb, place_xy, surface_z, half_thickness,
+                 object_name, settle_tol: float = 0.02,
+                 descend_timeout_s: float = 12.0):
+        super().__init__(name)
+        self.bb = bb
+        self.place_xy = place_xy
+        self.surface_z = float(surface_z)
+        self.half = float(half_thickness)
+        self.object_name = object_name
+        self.settle_tol = float(settle_tol)
+        self.descend_timeout_s = float(descend_timeout_s)
+        self._phase = "plan"
+        self._reach = None
+        self._quat = None
+        self._cup_target = None
+        self._t0 = None
+
+    def initialise(self):
+        bb = self.bb
+        up = np.array([0.0, 0.0, 1.0])
+        q = cup_down_quat(up)
+        bb.affordance = Affordance(
+            point=np.array([self.place_xy[0], self.place_xy[1],
+                            self.surface_z + self.AFFORDANCE_DZ]),
+            normal=up, quat_cup_down=q)
+        bb.q_cup = q
+        self._phase = "plan"
+        self._reach = PlannedReach(f"{self.name}/reach", bb)
+        self._reach.initialise()
+        self._quat = None
+        self._t0 = None
+
+    def update(self):
+        bb = self.bb
+        client = bb.client
+
+        if self._phase == "plan":
+            status = self._reach.update()
+            if status == py_trees.common.Status.RUNNING:
+                return py_trees.common.Status.RUNNING
+            self._reach.terminate(status)
+            if status == py_trees.common.Status.FAILURE:
+                return py_trees.common.Status.FAILURE
+            # seed-then-enable at the landed pose, then descend
+            p0, q0 = synced_site_pose(client, "cup_site")
+            stream_target(client, bb.name, p0, q0)
+            client._rpc_configure_controller(
+                articulation=bb.name,
+                params={"task_enabled": [True, True, True, False]})
+            self._quat = q0
+            self._cup_target = p0.copy()
+            self._t0 = time.time()
+            self._phase = "descend"
+            return py_trees.common.Status.RUNNING
+
+        if self._phase == "descend":
+            _hold_suction(client, bb.name)
+            z_obj = _actor_z_by_name(client, self.object_name)
+            if abs(z_obj - self.surface_z) <= self.settle_tol:
+                self._phase = "release"
+                self._t0 = None
+                return py_trees.common.Status.RUNNING
+            if time.time() - self._t0 > self.descend_timeout_s:
+                bb.fail_reason = (f"PlaceOn[{self.name}]: descend timeout "
+                                  f"(object z {z_obj:.3f})")
+                return py_trees.common.Status.FAILURE
+            floor = self.surface_z + self.CUP_FLOOR_M
+            self._cup_target[2] = max(floor,
+                                      self._cup_target[2] - self.DESCEND_STEP_M)
+            stream_target(client, bb.name, self._cup_target, self._quat)
+            if self._cup_target[2] <= floor and z_obj - self.surface_z > 0.06:
+                bb.fail_reason = (f"PlaceOn[{self.name}]: cup at floor limit "
+                                  f"but object z {z_obj:.3f} never settled")
+                return py_trees.common.Status.FAILURE
+            return py_trees.common.Status.RUNNING
+
+        if self._phase == "release":
+            if self._t0 is None:
+                client.runtime.set_suction(articulation=bb.name, value=0.0)
+                self._t0 = time.time()
+                return py_trees.common.Status.RUNNING
+            if time.time() - self._t0 < self.DWELL_S:
+                return py_trees.common.Status.RUNNING
+            z_obj = _actor_z_by_name(client, self.object_name)
+            if abs(z_obj - self.surface_z) > self.settle_tol + 0.02:
+                bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
+                                  f"not at surface {self.surface_z:.3f} after release")
+                return py_trees.common.Status.FAILURE
+            p0, _ = synced_site_pose(client, "cup_site")
+            self._cup_target = p0 + self.RETRACT
+            self._t0 = time.time()
+            self._phase = "retract"
+            return py_trees.common.Status.RUNNING
+
+        # retract
+        a = min(1.0, (time.time() - self._t0) / 2.0)
+        p0, _ = synced_site_pose(client, "cup_site")
+        pos = (1.0 - a) * p0 + a * self._cup_target
+        stream_target(client, bb.name, pos, self._quat)
+        if a < 1.0:
+            return py_trees.common.Status.RUNNING
+        return py_trees.common.Status.SUCCESS
+
+    def terminate(self, new_status):
+        if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
+            self.bb.fail_reason = f"PlaceOn[{self.name}]: failed"

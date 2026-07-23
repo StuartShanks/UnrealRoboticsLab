@@ -199,3 +199,53 @@ assert r.update() == py_trees.common.Status.SUCCESS
 assert abs(bb.affordance.point[2] - (0.55 + 0.022)) < 1e-9, bb.affordance.point
 
 print("task-3 CarryTransit tests OK")
+
+# --- PlaceOn: descend->release->retract phase machine (plan phase stubbed) ---
+class StubPlannedReach:
+    """Stands in for PlannedReach: immediately SUCCESS."""
+    def __init__(self, *a, **k): pass
+    def initialise(self): pass
+    def update(self): return py_trees.common.Status.SUCCESS
+    def terminate(self, s): pass
+
+U_PlannedReach_orig = U.PlannedReach
+U.PlannedReach = StubPlannedReach
+
+cup_z = {"z": 1.27}
+def _fake_site_pose(client, s):
+    return (np.array([-11.10, -19.60, cup_z["z"]]),
+            np.array([0.0, 1.0, 0.0, 0.0]))
+streamed = []
+def _fake_stream(client, name, p, q):
+    streamed.append(np.array(p))
+    cup_z["z"] = max(1.11 + 0.03, cup_z["z"] - 0.02)   # cup tracks down
+U.synced_site_pose = _fake_site_pose
+U.stream_target = _fake_stream
+
+# book bottom follows the cup down, then settles on the surface at 1.11
+book = {"z": 1.17}
+def _fake_actor_z(client, name):
+    book["z"] = max(1.11, cup_z["z"] - 0.06)
+    return book["z"]
+U._actor_z_by_name = _fake_actor_z
+
+suction = {"vals": []}
+rt = StubRuntime(goal_replies=[], status_replies=[])
+rt.set_suction = lambda **kw: suction["vals"].append(kw.get("value"))
+bb = make_bb(rt)
+bb.q_cup = U.cup_down_quat(np.array([0.0, 0.0, 1.0]))
+place = U.PlaceOn("place", bb, (-11.10, -19.60), 1.11, 0.011, "SM_Book_125")
+place.initialise()
+status = py_trees.common.Status.RUNNING
+for _ in range(600):
+    status = place.update()
+    if status != py_trees.common.Status.RUNNING:
+        break
+    time.sleep(0.005)   # release dwell + retract are wall-clock phases
+assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
+assert 0.0 in suction["vals"], "release must set_suction(0)"
+assert bb.affordance is not None and abs(bb.affordance.point[2] - 1.24) < 1e-6, \
+    "plan affordance must target surface_z + 0.13"
+U.PlannedReach = U_PlannedReach_orig
+
+print("task-4 PlaceOn tests OK")
