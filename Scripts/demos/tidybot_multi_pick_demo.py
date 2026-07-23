@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Multi-pick round trip (LIVE, Simulate running, authored by
 tidybot_multi_pick_author.py): pick the Fab book off the small table, DRIVE
-while holding it to the kitchen island, place it, re-pick it, drive back,
+while holding it to the low side table (SM_Table_00_32 — the kitchen
+island is kinematically out of the cup-down envelope, ceiling ~0.94 m,
+measured at live gate 1), place it, re-pick it, drive back,
 place it back. Fail-fast py_trees Sequence over urlab_skills; teardown in
-finally. --one-way stops after the island place (live gate 1)."""
+finally. --one-way stops after the far-station place (live gate 1)."""
 import argparse, sys, time
 from dataclasses import dataclass
 sys.path.insert(0, "/home/stuart/Documents/Unreal Projects/Test/Plugins/UnrealRoboticsLab/Scripts/demos")
@@ -30,9 +32,9 @@ class Station:
 
 
 TABLE = Station("table", (-13.20, -12.44, -15.63, -14.87), 0.55, (-12.71, -15.36))
-ISLAND = Station("island", (-11.99, -10.17, -20.26, -19.38), 1.11, (-11.10, -19.60))
+FAR = Station("side_table", (-12.53, -12.13, -18.41, -17.95), 0.68, (-12.33, -18.18))
 # Loaded-transit goals: a ring-legal point on each station's open side.
-ISLAND_STAGING = (-11.10, -18.65)
+FAR_STAGING = (-12.33, -17.22)
 TABLE_STAGING = (-12.18, -16.47)
 
 
@@ -54,14 +56,14 @@ def build_tree(bb, one_way: bool):
         ]
     children = (
         pick_leg(TABLE, "table")
-        + [U.CarryTransit("carry_to_island", bb, ISLAND_STAGING, BOOK),
-           U.PlaceOn("place_island", bb, ISLAND.place_xy, ISLAND.top_z,
+        + [U.CarryTransit("carry_to_far", bb, FAR_STAGING, BOOK),
+           U.PlaceOn("place_far", bb, FAR.place_xy, FAR.top_z,
                      BOOK_HALF, BOOK)]
     )
     if not one_way:
         children += (
-            pick_leg(ISLAND, "island")[0:1]      # StageAt only; then re-pick
-            + pick_leg(ISLAND, "island2")[1:]    # Resolve/Reach/Descend/Verify
+            pick_leg(FAR, "far")[0:1]            # StageAt only; then re-pick
+            + pick_leg(FAR, "far2")[1:]          # Resolve/Reach/Descend/Verify
             + [U.CarryTransit("carry_to_table", bb, TABLE_STAGING, BOOK),
                U.PlaceOn("place_table", bb, TABLE.place_xy, TABLE.top_z,
                          BOOK_HALF, BOOK)]
@@ -158,5 +160,5 @@ def main(one_way: bool):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--one-way", action="store_true",
-                    help="stop after placing on the island (live gate 1)")
+                    help="stop after placing on the far station (live gate 1)")
     sys.exit(main(ap.parse_args().one_way))

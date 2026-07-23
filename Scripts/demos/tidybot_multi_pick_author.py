@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Author HomeInterior for the multi-pick round trip (editor IDLE).
-Table + island static hulls; SM_Book_125 dynamic (actor must be Movable —
+Table + island + side-table (SM_Table_00_32, the far place station) static hulls; SM_Book_125 dynamic (actor must be Movable —
 verified via bounds); suction tidybot + nav stack (max_speed 0.4, the carry
 doctrine's slow-everywhere v1) + controller. CUP GUARD IS EMPTY: the cup
 must approach BOTH surfaces to pick/place; descends are vertical and
@@ -64,15 +64,17 @@ rows = c.outliner.find_actors(class_filter="StaticMeshActor")
 def resolve(pref): return next((r.name for r in rows if r.name.startswith(pref)), None)
 
 table = resolve("SM_Table_01"); island = resolve("SM_Kitchen_island_table")
+side = resolve("SM_Table_00")
 book = resolve(BOOK)
-if not (table and island and book):
-    print(f"[multi-author] FAIL: missing actors t={table} i={island} b={book}",
+if not (table and island and side and book):
+    print(f"[multi-author] FAIL: missing actors t={table} i={island} s={side} b={book}",
           flush=True); sys.exit(1)
 c.outliner.add_quick_convert(target=table, by_name=True, static=True, complex_mesh=False)
 c.outliner.add_quick_convert(target=island, by_name=True, static=True, complex_mesh=False)
+c.outliner.add_quick_convert(target=side, by_name=True, static=True, complex_mesh=False)
 b = c.outliner.get_actor_bounds(book, by_name=True)
 c.outliner.add_quick_convert(target=book, by_name=True, static=False, complex_mesh=False)
-log(f"static: {table}, {island}; DYNAMIC {book} (top z={b.max[2]:.3f} — must be Movable)")
+log(f"static: {table}, {island}, {side}; DYNAMIC {book} (top z={b.max[2]:.3f} — must be Movable)")
 
 bp = c.scene.import_xml(path=str(MODEL_XML))
 c.scene.spawn_actor(blueprint=bp, actor_id=ACTOR_ID, location=(SPAWN[0], SPAWN[1], 0.0))
@@ -83,9 +85,9 @@ r = c.scene.spawn_nav_bounds(center=(SPAWN[0], SPAWN[1], 0.5), extent=(15.0, 15.
                              agent_radius=AGENT_RADIUS, timeout_s=60.0)
 log(f"navmesh baked={r.get('nav_data_present')}")
 ik = c.ik.add_controller(target=ACTOR_ID, **guarded_payload(
-    link_bodies=[f"{table}_MjBody", f"{island}_MjBody"],
+    link_bodies=[f"{table}_MjBody", f"{island}_MjBody", f"{side}_MjBody"],
     cup_bodies=[],                       # cup approaches BOTH surfaces
-    base_bodies=[f"{table}_MjBody", f"{island}_MjBody"]))
+    base_bodies=[f"{table}_MjBody", f"{island}_MjBody", f"{side}_MjBody"]))
 w = ik.get("warnings") or []
 log(f"!! WARNINGS: {w}" if w else "no warnings — cup unguarded, arm/base guarded")
 log("AUTHORED. Press SIMULATE, then run tidybot_multi_pick_demo.py.")
