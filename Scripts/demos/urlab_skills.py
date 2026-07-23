@@ -1569,21 +1569,17 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.RUNNING
             if time.time() - self._t0 < self.DWELL_S:
                 return py_trees.common.Status.RUNNING
-            z_obj = _actor_z_by_name(client, self.object_name)
-            # Post-release: gravity settles a tilted/wedged object flat. Allow
-            # a small positive band (leaning against unmodeled visual clutter)
-            # but fail on anything clearly not on the surface.
-            if not (-self.settle_tol <= z_obj - self.surface_z <= 0.06):
-                bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
-                                  f"not at surface {self.surface_z:.3f} after release")
-                return py_trees.common.Status.FAILURE
+            # Verification happens AFTER retract: a released object can rest
+            # TILTED against the cup still hovering over it (live: propped at
+            # +0.065 with the cup 4 cm above — the raised cup friction holds
+            # the lean) and only lies flat once the cup clears away.
             p0, _ = synced_site_pose(client, "cup_site")
             self._cup_target = p0 + self.RETRACT
             self._t0 = time.time()
             self._phase = "retract"
             return py_trees.common.Status.RUNNING
 
-        # retract
+        # retract, then FINAL settle verification (cup clear of the object)
         a = min(1.0, (time.time() - self._t0) / 2.0)
         p0, _ = synced_site_pose(client, "cup_site")
         pos = (1.0 - a) * p0 + a * self._cup_target
@@ -1593,6 +1589,13 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         client._rpc_configure_controller(
             articulation=bb.name,
             params={"task_enabled": [False, True, True, True]})
+        z_obj = _actor_z_by_name(client, self.object_name)
+        if not (-self.settle_tol <= z_obj - self.surface_z <= 0.06):
+            bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
+                              f"not at surface {self.surface_z:.3f} after retract")
+            return py_trees.common.Status.FAILURE
+        print(f"[place] {self.name}: PLACED — object z {z_obj:.3f} on surface "
+              f"{self.surface_z:.3f}", flush=True)
         return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status):
