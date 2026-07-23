@@ -76,7 +76,10 @@ b = c.outliner.get_actor_bounds(book, by_name=True)
 c.outliner.add_quick_convert(target=book, by_name=True, static=False, complex_mesh=False)
 log(f"static: {table}, {island}, {side}; DYNAMIC {book} (top z={b.max[2]:.3f} — must be Movable)")
 
-bp = c.scene.import_xml(path=str(MODEL_XML))
+# --force-reimport: destroy + re-import the robot blueprint (needed when the
+# robot XML changed — the importer caches by path). Use with the editor IDLE.
+bp = c.scene.import_xml(path=str(MODEL_XML),
+                        force_reimport=("--force-reimport" in sys.argv))
 c.scene.spawn_actor(blueprint=bp, actor_id=ACTOR_ID, location=(SPAWN[0], SPAWN[1], 0.0))
 c.scene.ensure_manager()
 nav = c.scene.add_nav_stack(target=ACTOR_ID, debug_draw=True, max_speed=0.4)
