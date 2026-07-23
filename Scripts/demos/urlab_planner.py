@@ -114,6 +114,30 @@ class PlanContext:
         # (resting) contacts, not planner failures — exempt them everywhere.
         self.baseline = self._penetrating_pairs(self.q_start())
 
+    def park_body(self, body_suffix: str):
+        """EXCLUDE a free body from this plan's collision world by parking it
+        10 m underground in the snapshot. For plans made WHILE HOLDING an
+        object: the planner models the held body as STATIC at its held pose,
+        which sits exactly where the EE housing sweeps — RRT-Connect could not
+        grow a single edge out of the start config (live gate 1). The real
+        object's safety is physical (adhesion + QP guards + slow descend), not
+        the planner's job. Recomputes the collision baseline."""
+        bid = -1
+        for b in range(self.m.nbody):
+            nm = mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_BODY, b) or ""
+            if body_suffix in nm:
+                bid = b
+                break
+        if bid < 0:
+            raise ValueError(f"park_body: no body matching {body_suffix!r}")
+        jadr = self.m.body_jntadr[bid]
+        if (jadr < 0 or self.m.body_jntnum[bid] < 1
+                or self.m.jnt_type[jadr] != mujoco.mjtJoint.mjJNT_FREE):
+            raise ValueError(f"park_body: {body_suffix!r} has no free joint")
+        qadr = int(self.m.jnt_qposadr[jadr])
+        self.qpos0[qadr + 2] -= 10.0
+        self.baseline = self._penetrating_pairs(self.q_start())
+
     @classmethod
     def from_client(cls, client, joints=PLANNED_JOINTS):
         """Snapshot live physics into a context. v1 constraint: call PRE-suction
@@ -392,7 +416,8 @@ def time_parameterize(path, joints=PLANNED_JOINTS, v_limits=None, min_dt=0.1):
 
 
 def plan_reach(client, pos, quat_wxyz, site="cup_site", joints=PLANNED_JOINTS,
-               n_goals=12, max_iters=2000, seed=0, v_limits=None):
+               n_goals=12, max_iters=2000, seed=0, v_limits=None,
+               exclude_body_suffix=None):
     """Full pipeline: synced snapshot -> goal IK -> RRT-Connect -> shortcut ->
     timed waypoints. Raises PlanError('goal_ik'|'rrt') on failure.
 
@@ -406,6 +431,8 @@ def plan_reach(client, pos, quat_wxyz, site="cup_site", joints=PLANNED_JOINTS,
     import time as _time
     t0 = _time.time()
     ctx = PlanContext.from_client(client, joints)
+    if exclude_body_suffix:
+        ctx.park_body(exclude_body_suffix)   # held object: see park_body
     goals = sample_goal_configs(ctx, pos, quat_wxyz, site=site, n=n_goals, seed=seed)
     if not goals:
         raise PlanError("goal_ik",

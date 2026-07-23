@@ -887,9 +887,10 @@ class PlannedReach(py_trees.behaviour.Behaviour):
     NO_PROGRESS_S = 6.0      # fail if best err hasn't improved for this long
     PROGRESS_EPS = 0.02      # min err drop that counts as progress
 
-    def __init__(self, name, bb):
+    def __init__(self, name, bb, exclude_body=None):
         super().__init__(name)
         self.bb = bb
+        self.exclude_body = exclude_body   # held-object suffix to park (see planner)
         self._plan = None
         self._joints = None
         self._wp_idx = 0
@@ -917,7 +918,8 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         pre_grasp = np.asarray(aff.point, dtype=float) \
             + self.PRE_GRASP_M * np.asarray(aff.normal, dtype=float)
         try:
-            self._plan = plan_reach(client, pre_grasp, np.asarray(bb.q_cup, dtype=float))
+            self._plan = plan_reach(client, pre_grasp, np.asarray(bb.q_cup, dtype=float),
+                                    exclude_body_suffix=self.exclude_body)
         except PlanError as e:
             self._plan = None
             bb.fail_reason = f"PlannedReach[{self.name}]: plan {e.stage}: {e}"
@@ -1466,7 +1468,8 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             normal=up, quat_cup_down=q)
         bb.q_cup = q
         self._phase = "plan"
-        self._reach = PlannedReach(f"{self.name}/reach", bb)
+        self._reach = PlannedReach(f"{self.name}/reach", bb,
+                                   exclude_body=self.object_name)
         self._reach.initialise()
         self._quat = None
         self._t0 = None

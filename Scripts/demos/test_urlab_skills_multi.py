@@ -206,8 +206,11 @@ print("task-3 CarryTransit tests OK")
 
 # --- PlaceOn: descend->release->retract phase machine (plan phase stubbed) ---
 class StubPlannedReach:
-    """Stands in for PlannedReach: immediately SUCCESS."""
-    def __init__(self, *a, **k): pass
+    """Stands in for PlannedReach: immediately SUCCESS. Records ctor kwargs
+    so PlaceOn's held-object exclusion pass-through is asserted."""
+    last_kwargs = None
+    def __init__(self, *a, **k):
+        StubPlannedReach.last_kwargs = k
     def initialise(self): pass
     def update(self): return py_trees.common.Status.SUCCESS
     def terminate(self, s): pass
@@ -248,6 +251,8 @@ for _ in range(600):
     time.sleep(0.005)   # release dwell + retract are wall-clock phases
 assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
 assert 0.0 in suction["vals"], "release must set_suction(0)"
+assert StubPlannedReach.last_kwargs.get("exclude_body") == "SM_Book_125", \
+    f"PlaceOn must exclude the held object from the plan: {StubPlannedReach.last_kwargs}"
 assert bb.affordance is not None and abs(bb.affordance.point[2] - 1.24) < 1e-6, \
     "plan affordance must target surface_z + 0.13"
 U.PlannedReach = U_PlannedReach_orig

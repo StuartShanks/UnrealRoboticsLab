@@ -137,4 +137,37 @@ for g in ogoals:
     p, _ = octx.site_pose(g, "tip")
     assert np.linalg.norm(p - TGT) < 0.02, p
 
+# --- park_body: held-object exclusion --------------------------------------
+# A free "held" box sits where the arm sweeps; parking it removes it from the
+# collision world (plans made while holding — the phantom-held-object fix).
+HELD_SCENE = """
+<mujoco>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 1"/>
+    <body name="held_box" pos="0.5 0 0.35">
+      <freejoint/>
+      <geom name="held_g" type="box" size="0.15 0.15 0.15"/>
+    </body>
+    <body name="base" pos="0 0 0.35">
+      <joint name="joint_x" type="slide" axis="1 0 0" range="-5 5"/>
+      <joint name="joint_y" type="slide" axis="0 1 0" range="-5 5"/>
+      <geom name="base_g" type="box" size="0.2 0.2 0.1"/>
+      <body name="link" pos="0 0 0.2">
+        <joint name="joint_1" type="hinge" axis="0 0 1" range="-3 3"/>
+        <geom name="arm_g" type="capsule" fromto="0 0 0 0.4 0 0" size="0.05"/>
+        <site name="tip" pos="0.4 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+hm = mujoco.MjModel.from_xml_string(HELD_SCENE)
+hq0 = np.array(hm.qpos0)   # model defaults: held_box AT its authored (0.5,0,0.35)
+hctx = PlanContext(hm, hq0, joints=JOINTS)
+assert not hctx.collision_free(np.array([0.5, 0.0, 0.0])), "box should block"
+hctx2 = PlanContext(hm, np.array(hm.qpos0), joints=JOINTS)
+hctx2.park_body("held_box")
+assert hctx2.collision_free(np.array([0.5, 0.0, 0.0])), \
+    "parked body must be excluded from the collision world"
+
 print("urlab_planner self-tests OK")
