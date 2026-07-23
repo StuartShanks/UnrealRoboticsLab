@@ -280,4 +280,24 @@ log("releasing (suction OFF)")
 release(); time.sleep(1.5)
 zf = book_loc(BOT[0])[2]
 log(f"after drop z = {zf:.3f}")
-log("DONE (picked+carried+dropped)" if z1 - z0 > 0.04 else "DONE (not lifted)")
+
+# RETREAT: the reach typically parks the base inside the table's erosion band
+# (off-navmesh) — this final leg live-exercises the off-mesh-wedge recovery
+# (SetNavGoal projects the START; the path begins with a leg back onto the
+# mesh). Watch the reply's start_projection_m.
+log("retreating to open floor (off-mesh wedge recovery)")
+configure({"task_enabled": [False, True, True, True],
+           "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
+r = c.runtime.set_nav_goal(articulation=name, x=-11.0, y=-17.0, max_projection=STAGE_VERIFY_M)
+sp = r.get("start_projection_m")
+log(f"  retreat goal accepted={r.get('accepted')}"
+    + (f"  start was {sp:.2f}m off-mesh (recovery leg)" if sp is not None and sp > 0.05 else ""))
+if r.get("accepted"):
+    dl = time.time() + 60.0
+    while time.time() < dl:
+        s = c.runtime.get_nav_status(articulation=name)
+        if s.get("state") in ("arrived", "failed"): break
+        time.sleep(1.0)
+    log(f"  retreat: {s.get('state')} (dist_to_requested={s.get('distance_to_requested_m', '?')})")
+configure({"task_costs": {str(DAMPING_TASK): {"cost": 5.0}}})
+log("DONE (picked+carried+dropped+retreated)" if z1 - z0 > 0.04 else "DONE (not lifted)")

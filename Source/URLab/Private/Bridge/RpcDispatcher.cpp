@@ -2671,6 +2671,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 	{
 		float ProjXUE = 0.f, ProjYUE = 0.f; // projected goal, UE cm
 		float ProjCm = -1.f;                // requested->projected 2D displacement
+		float StartProjCm = -1.f;           // base->navmesh displacement (recovery leg)
 		bool bPartial = false;
 		uint8 Reject = 0;                   // EMjNavGoalReject
 	};
@@ -2692,6 +2693,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 			Nav->GetLastGoalInfo(ReqUE, ProjUE, Info.ProjCm, Info.bPartial, Rej);
 			Info.ProjXUE = ProjUE.X;
 			Info.ProjYUE = ProjUE.Y;
+			Info.StartProjCm = Nav->GetLastStartProjectionCm();
 			Info.Reject = (uint8)Rej;
 		}
 	}
@@ -2712,7 +2714,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 		{
 			FThreadSafeBool bAccepted{false};
 			FThreadSafeBool bHasComponent{false};
-			std::atomic<float> ProjXUE{0.f}, ProjYUE{0.f}, ProjCm{-1.f};
+			std::atomic<float> ProjXUE{0.f}, ProjYUE{0.f}, ProjCm{-1.f}, StartProjCm{-1.f};
 			FThreadSafeBool bPartial{false};
 			std::atomic<uint8> Reject{0};
 		};
@@ -2735,6 +2737,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 					Result->ProjXUE = ProjUE.X;
 					Result->ProjYUE = ProjUE.Y;
 					Result->ProjCm = ProjCm;
+					Result->StartProjCm = Nav->GetLastStartProjectionCm();
 					Result->bPartial = bPartial;
 					Result->Reject = (uint8)Rej;
 				}
@@ -2748,6 +2751,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 		Info.ProjXUE = Result->ProjXUE;
 		Info.ProjYUE = Result->ProjYUE;
 		Info.ProjCm = Result->ProjCm;
+		Info.StartProjCm = Result->StartProjCm;
 		Info.bPartial = Result->bPartial;
 		Info.Reject = Result->Reject;
 	}
@@ -2772,12 +2776,17 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 		Reply->SetNumberField(TEXT("projection_m"), Info.ProjCm / 100.0);
 	}
 	Reply->SetBoolField(TEXT("partial"), Info.bPartial);
+	// Off-mesh-wedge recovery: how far the BASE was off the navmesh when the
+	// path was planned (0 = on-mesh). Positive means the path begins with a
+	// recovery leg back onto the mesh from the base's true pose.
+	if (Info.StartProjCm >= 0.f)
+		Reply->SetNumberField(TEXT("start_projection_m"), Info.StartProjCm / 100.0);
 	if (!bAccepted && Info.Reject != 0)
 	{
 		static const TCHAR* Reasons[] = {
 			TEXT("none"), TEXT("off_navmesh"), TEXT("projection_exceeds_max"),
-			TEXT("partial_path"), TEXT("no_path")};
-		const uint8 R = FMath::Min<uint8>(Info.Reject, 4);
+			TEXT("partial_path"), TEXT("no_path"), TEXT("start_off_navmesh")};
+		const uint8 R = FMath::Min<uint8>(Info.Reject, 5);
 		Reply->SetStringField(TEXT("reason"), Reasons[R]);
 	}
 	return Reply;

@@ -120,6 +120,31 @@ FMjNavGoalDecision UMjNavComponent::DecideNavGoal(UWorld* World, const FVector& 
 		D.Reject = EMjNavGoalReject::OffNavmesh;
 		return D;
 	}
+	// Project the START too: after a whole-body reach the base legitimately
+	// stands in an obstacle's erosion band (off-mesh), and a raw off-mesh
+	// start fails the whole path query — nav stayed dead until a sim reset
+	// (the live "off-mesh wedge"). Projection recovers it: the path begins at
+	// the nearest navigable point, so pure pursuit naturally drives the base
+	// back onto the mesh first (the QP's collision guards insure the exit).
+	// Unlike the goal, start displacement is NEVER bounded by strict mode —
+	// the start is where the robot IS; bounding it would forbid recovery.
+	FNavLocation ProjectedStart;
+	if (!Nav->ProjectPointToNavigation(StartUE, ProjectedStart, FVector(100, 100, 500)))
+	{
+		UE_LOG(LogURLab, Warning,
+			TEXT("UMjNavComponent: base at %s is too far off the navmesh to recover (>1 m)."),
+			*StartUE.ToString());
+		D.Reject = EMjNavGoalReject::StartOffNavmesh;
+		return D;
+	}
+	D.StartProjectionCm = FVector::Dist2D(StartUE, ProjectedStart.Location);
+	if (D.StartProjectionCm > AcceptanceRadiusCm)
+	{
+		UE_LOG(LogURLab, Log,
+			TEXT("UMjNavComponent: base is %.0f cm off the navmesh — path will begin at the projected start (recovery leg)."),
+			D.StartProjectionCm);
+	}
+
 	FNavLocation Projected;
 	if (!Nav->ProjectPointToNavigation(WorldGoal, Projected, FVector(100, 100, 500)))
 	{
@@ -148,7 +173,9 @@ FMjNavGoalDecision UMjNavComponent::DecideNavGoal(UWorld* World, const FVector& 
 			*WorldGoal.ToString(), D.ProjectionCm, *Projected.Location.ToString());
 	}
 
-	UNavigationPath* P = Nav->FindPathToLocationSynchronously(World, StartUE, Projected.Location);
+	// Path from the PROJECTED start (on-mesh); the pursuit handles the short
+	// off-mesh recovery leg from the true base pose to the path's first point.
+	UNavigationPath* P = Nav->FindPathToLocationSynchronously(World, ProjectedStart.Location, Projected.Location);
 	if (!P || !P->IsValid() || P->PathPoints.Num() < 1)
 	{
 		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no path to %s."), *WorldGoal.ToString());
@@ -178,6 +205,7 @@ bool UMjNavComponent::SetNavGoal(FVector WorldGoal, float MaxProjectionCm)
 	LastRequestedGoalUE = WorldGoal;
 	LastProjectedGoalUE = WorldGoal;
 	LastProjectionCm = -1.f;
+	LastStartProjectionCm = -1.f;
 	bLastPathPartial = false;
 	LastRejectReason = EMjNavGoalReject::None;
 	bHasGoalInfo = true;
@@ -194,6 +222,7 @@ bool UMjNavComponent::SetNavGoal(FVector WorldGoal, float MaxProjectionCm)
 		DecideNavGoal(GetWorld(), Start, WorldGoal, MaxProjectionCm, AcceptanceRadius);
 	LastProjectedGoalUE = D.ProjectedUE;
 	LastProjectionCm = D.ProjectionCm;
+	LastStartProjectionCm = D.StartProjectionCm;
 	bLastPathPartial = D.bPartial;
 	LastRejectReason = D.Reject;
 	if (!D.bAccepted)

@@ -48,6 +48,7 @@ enum class EMjNavGoalReject : uint8
 	ProjectionExceedsMax, // projected goal displaced beyond the caller's MaxProjectionCm
 	PartialPath,          // path ends short of the projected goal (strict mode only)
 	NoPath,               // pathfinder returned nothing
+	StartOffNavmesh,      // the BASE is too far off the navmesh to recover (start projection failed)
 };
 
 /** Outcome of the goal projection + path decision (see DecideNavGoal). */
@@ -56,6 +57,7 @@ struct FMjNavGoalDecision
 	bool bAccepted = false;
 	FVector ProjectedUE = FVector::ZeroVector; // requested goal when projection failed
 	float ProjectionCm = -1.f;                 // requested->projected 2D displacement; -1 = no projection
+	float StartProjectionCm = -1.f;            // base->navmesh 2D displacement; -1 = start projection failed
 	bool bPartial = false;                     // path ends short of the projected goal
 	EMjNavGoalReject Reject = EMjNavGoalReject::None;
 	TArray<FVector> PathPoints;                // valid when bAccepted
@@ -146,6 +148,11 @@ public:
 
 	bool HasGoalInfo() const { return bHasGoalInfo; }
 
+	/** How far the BASE was off the navmesh at the last SetNavGoal (cm; 0 =
+	 *  on-mesh, -1 = start projection failed / no goal yet). A positive value
+	 *  means the path began with a recovery leg back onto the mesh. */
+	float GetLastStartProjectionCm() const { return LastStartProjectionCm; }
+
 	/** 2D distance (metres) from the base body to the REQUESTED (pre-projection)
 	 *  goal — the honest "did I get where the caller asked" number, as opposed
 	 *  to GetDistanceToGoal() which measures against the projected path end.
@@ -207,6 +214,7 @@ private:
 	FVector LastRequestedGoalUE = FVector::ZeroVector;
 	FVector LastProjectedGoalUE = FVector::ZeroVector;
 	float LastProjectionCm = -1.f;
+	float LastStartProjectionCm = -1.f;
 	bool bLastPathPartial = false;
 	bool bHasGoalInfo = false;
 	EMjNavGoalReject LastRejectReason = EMjNavGoalReject::None;

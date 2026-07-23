@@ -293,7 +293,8 @@ bool FMjNavCompGoalSubstitution::RunTest(const FString&)
 	const FVector Start(-100, -100, 0); // open floor, on-mesh
 	const float Accept = 15.f;          // component default AcceptanceRadius
 
-	// A) Open-floor goal: accepted, projection ~0, no substitution.
+	// A) Open-floor goal: accepted, projection ~0, no substitution; the
+	// on-mesh START reports a ~zero recovery displacement.
 	{
 		const FMjNavGoalDecision D =
 			UMjNavComponent::DecideNavGoal(World, Start, FVector(-200, 100, 0), -1.f, Accept);
@@ -301,6 +302,8 @@ bool FMjNavCompGoalSubstitution::RunTest(const FString&)
 		TestTrue(TEXT("open goal barely projected"), D.ProjectionCm >= 0.f && D.ProjectionCm < 15.f);
 		TestEqual(TEXT("open goal no reject"), (int)D.Reject, (int)EMjNavGoalReject::None);
 		TestTrue(TEXT("open goal has a path"), D.PathPoints.Num() >= 1);
+		TestTrue(TEXT("on-mesh start reports ~zero displacement"),
+			D.StartProjectionCm >= 0.f && D.StartProjectionCm < 15.f);
 	}
 
 	// B) Goal inside the erosion band (x=1.90 m; boundary ≈1.65 m): historical
@@ -339,11 +342,32 @@ bool FMjNavCompGoalSubstitution::RunTest(const FString&)
 			D.bAccepted);
 		TestEqual(TEXT("reason = off_navmesh"),
 			(int)D.Reject, (int)EMjNavGoalReject::OffNavmesh);
+
+		// E) Off-mesh-wedge recovery: START in the erosion band (where a
+		// whole-body reach parks the base). Accepted, with the recovery
+		// displacement reported — the path begins back on the mesh.
+		{
+			const FMjNavGoalDecision D2 = UMjNavComponent::DecideNavGoal(
+				World, FVector(190, 0, 0), FVector(-200, 100, 0), -1.f, Accept);
+			TestTrue(TEXT("banded START recovers (accepted)"), D2.bAccepted);
+			TestTrue(*FString::Printf(TEXT("recovery leg reported (start proj %.0f cm)"),
+				D2.StartProjectionCm),
+				D2.StartProjectionCm > 5.f && D2.StartProjectionCm < 100.f);
+		}
+		// F) START unrecoverably deep (beyond the 1 m projection extent):
+		// distinct start_off_navmesh rejection.
+		{
+			const FMjNavGoalDecision D2 = UMjNavComponent::DecideNavGoal(
+				World, FVector(300, 0, 0), FVector(-200, 100, 0), -1.f, Accept);
+			TestFalse(TEXT("deep-inside START rejected"), D2.bAccepted);
+			TestEqual(TEXT("reason = start_off_navmesh"),
+				(int)D2.Reject, (int)EMjNavGoalReject::StartOffNavmesh);
+		}
 	}
 	else
 	{
 		AddWarning(TEXT("obstacle never carved the navmesh in this environment — "
-			"deep-inside/off_navmesh case skipped (covered by NoNavmeshGraceful for the reason path)"));
+			"deep-inside/off_navmesh + wedge-recovery cases skipped (covered by NoNavmeshGraceful for the reason path)"));
 	}
 
 	// Cleanup: boxes + nav volume.
