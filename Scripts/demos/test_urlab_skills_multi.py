@@ -249,3 +249,16 @@ assert bb.affordance is not None and abs(bb.affordance.point[2] - 1.24) < 1e-6, 
 U.PlannedReach = U_PlannedReach_orig
 
 print("task-4 PlaceOn tests OK")
+
+# --- driver: tree assembles with the right legs ------------------------------
+import tidybot_multi_pick_demo as M
+bb = make_bb(StubRuntime([], []))
+t_full = M.build_tree(bb, one_way=False)
+t_half = M.build_tree(bb, one_way=True)
+names_full = [c.name for c in t_full.children]
+assert len(t_full.children) == 14, names_full   # 5 pick + carry + place + 1 stage + 4 re-pick + carry + place
+assert len(t_half.children) == 7, [c.name for c in t_half.children]
+assert names_full[0].startswith("stage") and "place_table" in names_full[-1]
+
+print("task-6 tree assembly OK")
+print("ALL multi-pick offline tests OK")
