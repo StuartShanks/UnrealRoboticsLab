@@ -107,14 +107,81 @@ bool UMjNavComponent::GetBasePose(FVector& OutPos, float& OutYawRad) const
 	return true;
 }
 
-bool UMjNavComponent::SetNavGoal(FVector WorldGoal)
+FMjNavGoalDecision UMjNavComponent::DecideNavGoal(UWorld* World, const FVector& StartUE,
+	const FVector& WorldGoal, float MaxProjectionCm, float AcceptanceRadiusCm)
 {
-	UNavigationSystemV1* Nav = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
+	FMjNavGoalDecision D;
+	D.ProjectedUE = WorldGoal;
+
+	UNavigationSystemV1* Nav = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
 	if (!Nav)
 	{
 		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no navigation system in world."));
-		return false;
+		D.Reject = EMjNavGoalReject::OffNavmesh;
+		return D;
 	}
+	FNavLocation Projected;
+	if (!Nav->ProjectPointToNavigation(WorldGoal, Projected, FVector(100, 100, 500)))
+	{
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: goal %s is off the navmesh."), *WorldGoal.ToString());
+		D.Reject = EMjNavGoalReject::OffNavmesh;
+		return D;
+	}
+	D.ProjectedUE = Projected.Location;
+	D.ProjectionCm = FVector::Dist2D(WorldGoal, Projected.Location);
+
+	// Strict mode: the caller bounded how far projection may move their goal.
+	if (MaxProjectionCm >= 0.f && D.ProjectionCm > MaxProjectionCm)
+	{
+		UE_LOG(LogURLab, Warning,
+			TEXT("UMjNavComponent: goal %s projected %.0f cm onto the navmesh (max %.0f) — rejected."),
+			*WorldGoal.ToString(), D.ProjectionCm, MaxProjectionCm);
+		D.Reject = EMjNavGoalReject::ProjectionExceedsMax;
+		return D;
+	}
+	// Historical mode: accept, but never silently — a displaced goal changes
+	// what 'arrived' means, so say so at least in the log.
+	if (D.ProjectionCm > AcceptanceRadiusCm)
+	{
+		UE_LOG(LogURLab, Log,
+			TEXT("UMjNavComponent: goal %s SUBSTITUTED — projected %.0f cm to %s (arrival is measured against the projected point)."),
+			*WorldGoal.ToString(), D.ProjectionCm, *Projected.Location.ToString());
+	}
+
+	UNavigationPath* P = Nav->FindPathToLocationSynchronously(World, StartUE, Projected.Location);
+	if (!P || !P->IsValid() || P->PathPoints.Num() < 1)
+	{
+		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no path to %s."), *WorldGoal.ToString());
+		D.Reject = EMjNavGoalReject::NoPath;
+		return D;
+	}
+	// Partial paths end short of even the projected goal — the second silent
+	// shortfall. Strict mode rejects; historical mode reports.
+	D.bPartial = P->IsPartial();
+	if (MaxProjectionCm >= 0.f && D.bPartial)
+	{
+		UE_LOG(LogURLab, Warning,
+			TEXT("UMjNavComponent: path to %s is PARTIAL (ends short of the goal) — rejected in strict mode."),
+			*WorldGoal.ToString());
+		D.Reject = EMjNavGoalReject::PartialPath;
+		return D;
+	}
+	D.bAccepted = true;
+	D.PathPoints = P->PathPoints;
+	return D;
+}
+
+bool UMjNavComponent::SetNavGoal(FVector WorldGoal, float MaxProjectionCm)
+{
+	// Goal-substitution report: reset per attempt so GetLastGoalInfo always
+	// describes THIS call, including rejections.
+	LastRequestedGoalUE = WorldGoal;
+	LastProjectedGoalUE = WorldGoal;
+	LastProjectionCm = -1.f;
+	bLastPathPartial = false;
+	LastRejectReason = EMjNavGoalReject::None;
+	bHasGoalInfo = true;
+
 	FVector Start;
 	float Yaw;
 	if (!GetBasePose(Start, Yaw))
@@ -122,24 +189,33 @@ bool UMjNavComponent::SetNavGoal(FVector WorldGoal)
 		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: could not resolve base body pose."));
 		return false;
 	}
-	FNavLocation Projected;
-	if (!Nav->ProjectPointToNavigation(WorldGoal, Projected, FVector(100, 100, 500)))
-	{
-		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: goal %s is off the navmesh."), *WorldGoal.ToString());
+
+	const FMjNavGoalDecision D =
+		DecideNavGoal(GetWorld(), Start, WorldGoal, MaxProjectionCm, AcceptanceRadius);
+	LastProjectedGoalUE = D.ProjectedUE;
+	LastProjectionCm = D.ProjectionCm;
+	bLastPathPartial = D.bPartial;
+	LastRejectReason = D.Reject;
+	if (!D.bAccepted)
 		return false;
-	}
-	UNavigationPath* P = Nav->FindPathToLocationSynchronously(GetWorld(), Start, Projected.Location);
-	if (!P || !P->IsValid() || P->PathPoints.Num() < 1)
-	{
-		UE_LOG(LogURLab, Warning, TEXT("UMjNavComponent: no path to %s."), *WorldGoal.ToString());
-		return false;
-	}
-	Path = P->PathPoints;
+
+	Path = D.PathPoints;
 	BestDistToGoalCm = TNumericLimits<float>::Max();
 	TimeSinceProgress = 0.f;
 	DistToGoalM.store(FVector::Dist2D(Start, Path.Last()) / 100.f, std::memory_order_release);
 	SetState(EMjNavState::Navigating);
 	return true;
+}
+
+float UMjNavComponent::GetDistanceToRequestedM() const
+{
+	if (!bHasGoalInfo)
+		return -1.f;
+	FVector Pos;
+	float Yaw;
+	if (!GetBasePose(Pos, Yaw))
+		return -1.f;
+	return FVector::Dist2D(Pos, LastRequestedGoalUE) / 100.f;
 }
 
 void UMjNavComponent::SetPathForTesting(const TArray<FVector>& PathPoints)

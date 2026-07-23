@@ -40,6 +40,27 @@ enum class EMjNavState : uint8
 	Failed,
 };
 
+/** Why the last SetNavGoal returned false (None while accepted / no goal yet). */
+enum class EMjNavGoalReject : uint8
+{
+	None,
+	OffNavmesh,           // projection found no navmesh point within the search extent
+	ProjectionExceedsMax, // projected goal displaced beyond the caller's MaxProjectionCm
+	PartialPath,          // path ends short of the projected goal (strict mode only)
+	NoPath,               // pathfinder returned nothing
+};
+
+/** Outcome of the goal projection + path decision (see DecideNavGoal). */
+struct FMjNavGoalDecision
+{
+	bool bAccepted = false;
+	FVector ProjectedUE = FVector::ZeroVector; // requested goal when projection failed
+	float ProjectionCm = -1.f;                 // requested->projected 2D displacement; -1 = no projection
+	bool bPartial = false;                     // path ends short of the projected goal
+	EMjNavGoalReject Reject = EMjNavGoalReject::None;
+	TArray<FVector> PathPoints;                // valid when bAccepted
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMjNavEvent);
 
 /**
@@ -95,9 +116,48 @@ public:
 
 	/** Plan a path to WorldGoal (UE cm) and start following it. Returns false
 	 *  (no state change) if the goal can't be projected to the navmesh or no
-	 *  path exists. Game thread only. */
+	 *  path exists. Game thread only.
+	 *
+	 *  Projection is NOT identity: goals inside an obstacle's agent-radius
+	 *  erosion band get silently relocated up to the projection extent (~1 m)
+	 *  to the nearest navigable point, and the follower then "arrives" at the
+	 *  SUBSTITUTE. Query GetLastGoalInfo() for requested vs projected.
+	 *  MaxProjectionCm >= 0 opts into strict mode: reject when the projection
+	 *  displaces beyond it, and reject partial paths (which end short of even
+	 *  the projected goal). Default -1 keeps the historical accept-anything
+	 *  behavior. */
 	UFUNCTION(BlueprintCallable, Category = "Nav")
-	bool SetNavGoal(FVector WorldGoal);
+	bool SetNavGoal(FVector WorldGoal, float MaxProjectionCm = -1.f);
+
+	/** Requested vs projected goal of the most recent SetNavGoal (UE cm), the
+	 *  2D displacement between them (cm; -1 before any successful projection),
+	 *  whether the accepted path was partial, and the reject reason (None when
+	 *  accepted). Only meaningful after SetNavGoal ran at least once — check
+	 *  HasGoalInfo(). Game thread only. */
+	void GetLastGoalInfo(FVector& OutRequestedUE, FVector& OutProjectedUE,
+		float& OutProjectionCm, bool& bOutPartial, EMjNavGoalReject& OutReject) const
+	{
+		OutRequestedUE = LastRequestedGoalUE;
+		OutProjectedUE = LastProjectedGoalUE;
+		OutProjectionCm = LastProjectionCm;
+		bOutPartial = bLastPathPartial;
+		OutReject = LastRejectReason;
+	}
+
+	bool HasGoalInfo() const { return bHasGoalInfo; }
+
+	/** 2D distance (metres) from the base body to the REQUESTED (pre-projection)
+	 *  goal — the honest "did I get where the caller asked" number, as opposed
+	 *  to GetDistanceToGoal() which measures against the projected path end.
+	 *  Returns -1 with no goal or unresolvable base pose. Game thread only. */
+	float GetDistanceToRequestedM() const;
+
+	/** The projection + path decision behind SetNavGoal, world/start explicit
+	 *  so tests can exercise it against a real navmesh without an articulation
+	 *  rig (whose FMjUESession world has no navigation system). Pure query —
+	 *  mutates nothing. Game thread only (navmesh queries). */
+	static FMjNavGoalDecision DecideNavGoal(UWorld* World, const FVector& StartUE,
+		const FVector& WorldGoal, float MaxProjectionCm, float AcceptanceRadiusCm);
 
 	UFUNCTION(BlueprintCallable, Category = "Nav")
 	void ClearNavGoal();
@@ -141,6 +201,15 @@ private:
 	FVector LookaheadUE = FVector::ZeroVector;
 	float LookaheadYawUE = 0.f;
 	bool bHasLookahead = false;
+
+	// Last SetNavGoal bookkeeping for the goal-substitution report (game
+	// thread; the get_nav_status/set_nav_goal ops marshal their reads).
+	FVector LastRequestedGoalUE = FVector::ZeroVector;
+	FVector LastProjectedGoalUE = FVector::ZeroVector;
+	float LastProjectionCm = -1.f;
+	bool bLastPathPartial = false;
+	bool bHasGoalInfo = false;
+	EMjNavGoalReject LastRejectReason = EMjNavGoalReject::None;
 
 	void SetState(EMjNavState S) { StateAtomic.store((uint8)S, std::memory_order_release); }
 	void StopWithState(EMjNavState S); // zero twist + set state (+ fire delegate)

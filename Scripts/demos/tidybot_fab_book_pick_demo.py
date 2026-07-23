@@ -137,12 +137,17 @@ def staging_ring(target_xy):
 
 def nav_to(requested):
     """Drive to `requested`; True only if nav arrives AND the base actually
-    lands within STAGE_VERIFY_M of the REQUESTED point (SetNavGoal silently
-    projects goals up to ~1m onto the navmesh, then honestly 'arrives' there)."""
+    lands within STAGE_VERIFY_M of the REQUESTED point. `max_projection` makes
+    the engine reject substituted goals up front (goal-substitution RPC) — the
+    post-arrival verification stays as defense-in-depth."""
     configure({"task_enabled": [False, True, True, True], "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
     try:
-        if not c.runtime.set_nav_goal(articulation=name, x=float(requested[0]), y=float(requested[1])).get("accepted"):
-            log(f"  staging {np.round(requested,2)} rejected"); return False
+        r = c.runtime.set_nav_goal(articulation=name, x=float(requested[0]), y=float(requested[1]),
+                                   max_projection=STAGE_VERIFY_M)
+        if not r.get("accepted"):
+            log(f"  staging {np.round(requested,2)} rejected"
+                + (f" ({r['reason']}, proj {r.get('projection_m', 0):.2f}m)" if r.get("reason") else ""))
+            return False
         dl = time.time() + 60.0; s = {"state": "?"}
         while time.time() < dl:
             s = c.runtime.get_nav_status(articulation=name)

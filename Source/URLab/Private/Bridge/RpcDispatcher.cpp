@@ -2652,6 +2652,12 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 	double X = 0, Y = 0;
 	Req->TryGetNumberField(TEXT("x"), X);
 	Req->TryGetNumberField(TEXT("y"), Y);
+	// Optional strict mode: bound how far navmesh projection may displace the
+	// goal (metres). Omitted/negative keeps the historical accept-anything
+	// behavior. Also rejects partial paths when set.
+	double MaxProjectionM = -1.0;
+	Req->TryGetNumberField(TEXT("max_projection"), MaxProjectionM);
+	const float MaxProjectionCm = MaxProjectionM >= 0.0 ? (float)(MaxProjectionM * 100.0) : -1.f;
 
 	AMjArticulation* Art = Mgr->GetArticulation(ArtName);
 	if (!Art)
@@ -2660,17 +2666,33 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 	// MuJoCo metres → UE cm (X→X·100, Y→−Y·100); Z from the actor's height.
 	const FVector UEGoal((float)(X * 100.0), (float)(-Y * 100.0), Art->GetActorLocation().Z);
 
+	// Goal info captured after the call (see EMjNavGoalReject for reasons).
+	struct FGoalInfoPlain
+	{
+		float ProjXUE = 0.f, ProjYUE = 0.f; // projected goal, UE cm
+		float ProjCm = -1.f;                // requested->projected 2D displacement
+		bool bPartial = false;
+		uint8 Reject = 0;                   // EMjNavGoalReject
+	};
+
 	// Navmesh queries and component discovery are game-thread-only. The
 	// dispatcher runs on the transport worker; marshal + wait (camera-op
 	// pattern), but run inline when already on the game thread (tests).
 	bool bAccepted = false;
 	bool bHasComponent = false;
+	FGoalInfoPlain Info;
 	if (IsInGameThread())
 	{
 		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
 		{
 			bHasComponent = true;
-			bAccepted = Nav->SetNavGoal(UEGoal);
+			bAccepted = Nav->SetNavGoal(UEGoal, MaxProjectionCm);
+			FVector ReqUE, ProjUE;
+			EMjNavGoalReject Rej;
+			Nav->GetLastGoalInfo(ReqUE, ProjUE, Info.ProjCm, Info.bPartial, Rej);
+			Info.ProjXUE = ProjUE.X;
+			Info.ProjYUE = ProjUE.Y;
+			Info.Reject = (uint8)Rej;
 		}
 	}
 	else
@@ -2690,18 +2712,31 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 		{
 			FThreadSafeBool bAccepted{false};
 			FThreadSafeBool bHasComponent{false};
+			std::atomic<float> ProjXUE{0.f}, ProjYUE{0.f}, ProjCm{-1.f};
+			FThreadSafeBool bPartial{false};
+			std::atomic<uint8> Reject{0};
 		};
 		TSharedPtr<FNavGoalResult, ESPMode::ThreadSafe> Result =
 			MakeShared<FNavGoalResult, ESPMode::ThreadSafe>();
 		TWeakObjectPtr<AMjArticulation> WeakArt(Art);
 		FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
-		AsyncTask(ENamedThreads::GameThread, [WeakArt, UEGoal, Result, Done]() {
+		AsyncTask(ENamedThreads::GameThread, [WeakArt, UEGoal, MaxProjectionCm, Result, Done]() {
 			if (AMjArticulation* ArtPtr = WeakArt.Get())
 			{
 				if (UMjNavComponent* Nav = ArtPtr->FindComponentByClass<UMjNavComponent>())
 				{
 					Result->bHasComponent = true;
-					Result->bAccepted = Nav->SetNavGoal(UEGoal);
+					Result->bAccepted = Nav->SetNavGoal(UEGoal, MaxProjectionCm);
+					FVector ReqUE, ProjUE;
+					float ProjCm;
+					bool bPartial;
+					EMjNavGoalReject Rej;
+					Nav->GetLastGoalInfo(ReqUE, ProjUE, ProjCm, bPartial, Rej);
+					Result->ProjXUE = ProjUE.X;
+					Result->ProjYUE = ProjUE.Y;
+					Result->ProjCm = ProjCm;
+					Result->bPartial = bPartial;
+					Result->Reject = (uint8)Rej;
 				}
 			}
 			Done->Trigger();
@@ -2710,6 +2745,11 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 		FPlatformProcess::ReturnSynchEventToPool(Done);
 		bAccepted = Result->bAccepted;
 		bHasComponent = Result->bHasComponent;
+		Info.ProjXUE = Result->ProjXUE;
+		Info.ProjYUE = Result->ProjYUE;
+		Info.ProjCm = Result->ProjCm;
+		Info.bPartial = Result->bPartial;
+		Info.Reject = Result->Reject;
 	}
 
 	if (!bHasComponent)
@@ -2719,6 +2759,27 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleSetNavGoal(const TSharedPtr<F
 	TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
 	Reply->SetStringField(TEXT("op"), TEXT("set_nav_goal_ok"));
 	Reply->SetBoolField(TEXT("accepted"), bAccepted);
+	// Goal-substitution report: navmesh projection may have moved the goal (up
+	// to the ~1 m search extent); 'arrived' is measured against the PROJECTED
+	// point. Surface it so callers can decide instead of being silently
+	// rerouted. projected/projection_m present whenever projection succeeded.
+	if (Info.ProjCm >= 0.f)
+	{
+		TArray<TSharedPtr<FJsonValue>> Proj;
+		Proj.Add(MakeShared<FJsonValueNumber>(Info.ProjXUE / 100.0));   // UE cm -> MJ m
+		Proj.Add(MakeShared<FJsonValueNumber>(-Info.ProjYUE / 100.0));  // UE +Y -> MJ -Y
+		Reply->SetArrayField(TEXT("projected"), Proj);
+		Reply->SetNumberField(TEXT("projection_m"), Info.ProjCm / 100.0);
+	}
+	Reply->SetBoolField(TEXT("partial"), Info.bPartial);
+	if (!bAccepted && Info.Reject != 0)
+	{
+		static const TCHAR* Reasons[] = {
+			TEXT("none"), TEXT("off_navmesh"), TEXT("projection_exceeds_max"),
+			TEXT("partial_path"), TEXT("no_path")};
+		const uint8 R = FMath::Min<uint8>(Info.Reject, 4);
+		Reply->SetStringField(TEXT("reason"), Reasons[R]);
+	}
 	return Reply;
 }
 
@@ -2749,6 +2810,11 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	bool bHasLookahead = false;
 	FVector LookaheadUE = FVector::ZeroVector;
 	float LookaheadYawUE = 0.0f;
+	// Goal-substitution report (see HandleSetNavGoal): requested vs projected
+	// goal + honest distance to the REQUESTED point.
+	bool bGoalInfo = false;
+	FVector ReqGoalUE = FVector::ZeroVector, ProjGoalUE = FVector::ZeroVector;
+	float ProjectionCm = -1.f, DistToRequestedM = -1.f;
 	if (IsInGameThread())
 	{
 		if (UMjNavComponent* Nav = Art->FindComponentByClass<UMjNavComponent>())
@@ -2757,6 +2823,14 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 			NavState = Nav->GetNavState();
 			DistanceToGoal = Nav->GetDistanceToGoal();
 			bHasLookahead = Nav->GetLookahead(LookaheadUE, LookaheadYawUE);
+			bGoalInfo = Nav->HasGoalInfo();
+			if (bGoalInfo)
+			{
+				bool bPartial;
+				EMjNavGoalReject Rej;
+				Nav->GetLastGoalInfo(ReqGoalUE, ProjGoalUE, ProjectionCm, bPartial, Rej);
+				DistToRequestedM = Nav->GetDistanceToRequestedM();
+			}
 		}
 	}
 	else
@@ -2774,6 +2848,9 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 			std::atomic<float> DistanceToGoal{0.0f};
 			FThreadSafeBool bHasLookahead{false};
 			std::atomic<float> LookX{0.0f}, LookY{0.0f}, LookYaw{0.0f}; // UE cm / UE yaw rad
+			FThreadSafeBool bGoalInfo{false};
+			std::atomic<float> ReqX{0.f}, ReqY{0.f}, ProjX{0.f}, ProjY{0.f}; // UE cm
+			std::atomic<float> ProjCm{-1.f}, DistReqM{-1.f};
 		};
 		TSharedPtr<FNavStatusResult, ESPMode::ThreadSafe> Result =
 			MakeShared<FNavStatusResult, ESPMode::ThreadSafe>();
@@ -2796,6 +2873,21 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 						Result->LookY = (float)Look.Y;
 						Result->LookYaw = LookYaw;
 					}
+					if (Nav->HasGoalInfo())
+					{
+						Result->bGoalInfo = true;
+						FVector Rq, Pj;
+						float PjCm;
+						bool bPartial;
+						EMjNavGoalReject Rej;
+						Nav->GetLastGoalInfo(Rq, Pj, PjCm, bPartial, Rej);
+						Result->ReqX = (float)Rq.X;
+						Result->ReqY = (float)Rq.Y;
+						Result->ProjX = (float)Pj.X;
+						Result->ProjY = (float)Pj.Y;
+						Result->ProjCm = PjCm;
+						Result->DistReqM = Nav->GetDistanceToRequestedM();
+					}
 				}
 			}
 			Done->Trigger();
@@ -2808,6 +2900,11 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 		bHasLookahead = Result->bHasLookahead;
 		LookaheadUE = FVector(Result->LookX.load(), Result->LookY.load(), 0.f);
 		LookaheadYawUE = Result->LookYaw.load();
+		bGoalInfo = Result->bGoalInfo;
+		ReqGoalUE = FVector(Result->ReqX.load(), Result->ReqY.load(), 0.f);
+		ProjGoalUE = FVector(Result->ProjX.load(), Result->ProjY.load(), 0.f);
+		ProjectionCm = Result->ProjCm.load();
+		DistToRequestedM = Result->DistReqM.load();
 	}
 
 	if (!bHasComponent)
@@ -2833,6 +2930,26 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::HandleGetNavStatus(const TSharedPtr
 	Reply->SetStringField(TEXT("op"), TEXT("get_nav_status_ok"));
 	Reply->SetStringField(TEXT("state"), StateStr);
 	Reply->SetNumberField(TEXT("distance_to_goal"), DistanceToGoal);
+	// Goal-substitution report (MJ metres): distance_to_goal above measures
+	// against the PROJECTED path end — 'arrived' can hold a metre from what
+	// the caller asked. requested/projected goals + the honest distance to the
+	// REQUESTED point let callers verify without re-deriving base pose.
+	if (bGoalInfo)
+	{
+		TArray<TSharedPtr<FJsonValue>> Rq, Pj;
+		Rq.Add(MakeShared<FJsonValueNumber>(ReqGoalUE.X / 100.0));
+		Rq.Add(MakeShared<FJsonValueNumber>(-ReqGoalUE.Y / 100.0));
+		Reply->SetArrayField(TEXT("requested_goal"), Rq);
+		if (ProjectionCm >= 0.f)
+		{
+			Pj.Add(MakeShared<FJsonValueNumber>(ProjGoalUE.X / 100.0));
+			Pj.Add(MakeShared<FJsonValueNumber>(-ProjGoalUE.Y / 100.0));
+			Reply->SetArrayField(TEXT("projected_goal"), Pj);
+			Reply->SetNumberField(TEXT("projection_m"), ProjectionCm / 100.0);
+		}
+		if (DistToRequestedM >= 0.f)
+			Reply->SetNumberField(TEXT("distance_to_requested_m"), DistToRequestedM);
+	}
 	// Pursuit carrot pose, MuJoCo convention (metres, yaw CCW) — the inverse of
 	// set_nav_goal's MJ→UE mapping above (x=X/100, y=−Y/100, yaw=−UE yaw). This
 	// is the pose a whole-body IK consumer streams as its base Frame-task
