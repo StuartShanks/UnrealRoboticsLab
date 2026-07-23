@@ -111,11 +111,24 @@ void AAMjManager::BuildEntityCache()
 				continue;
 			int32 Id = B->GetMjID();
 			if (Id < 0 || Id >= m->nbody)
+			{
+				// A scene body that exists as a component but is not bound to
+				// the compiled model would silently vanish from the bridge's
+				// entity roster (frozen mirror reads client-side) -- say so.
+				UE_LOG(LogURLab, Warning,
+					TEXT("[BuildEntityCache] Skipping '%s' on actor '%s': unbound mj id %d"),
+					*B->GetName(), *Actor->GetName(), Id);
 				continue;
+			}
 
 			FMjEntityRecord Rec;
 			Rec.MjId = Id;
-			Rec.Name = B->GetMjName();
+			// Name from the COMPILED model, not GetMjName(): quick-convert
+			// bodies never set the MjName property, so GetMjName() returns ""
+			// and every record collapses onto the same empty JSON key in the
+			// bridge's entities block. mj_id2name is authoritative and unique.
+			const char* CompiledName = mj_id2name(m, mjOBJ_BODY, Id);
+			Rec.Name = CompiledName ? UTF8_TO_TCHAR(CompiledName) : B->GetName();
 			Rec.BodyComp = B;
 			if (m->body_jntnum && m->body_jntadr)
 			{
@@ -126,6 +139,9 @@ void AAMjManager::BuildEntityCache()
 			EntityCache.Add(Rec);
 		}
 	}
+
+	UE_LOG(LogURLab, Log, TEXT("[BuildEntityCache] %d scene entit%s registered for the bridge"),
+		EntityCache.Num(), EntityCache.Num() == 1 ? TEXT("y") : TEXT("ies"));
 }
 
 void AAMjManager::Compile()
@@ -140,6 +156,15 @@ void AAMjManager::Compile()
 	m_articulations = PhysicsEngine->m_articulations;
 	m_heightfieldActors = PhysicsEngine->m_heightfieldActors;
 	m_ArticulationMap = PhysicsEngine->m_ArticulationMap;
+
+	// Build the entity roster HERE, after PhysicsEngine->Compile() has run its
+	// internal PostCompile (which binds every quick-convert UMjBody's mj id).
+	// This used to live only behind AAMjManager::PostCompile(), which nothing
+	// calls -- so the cache stayed empty forever, the bridge's step replies
+	// shipped an empty `entities` block (the physics-thread path returns empty
+	// rather than walking actors), and every client-side mirror read of a
+	// quick-converted body silently froze at handshake values.
+	BuildEntityCache();
 }
 
 void AAMjManager::BeginPlay()
@@ -565,6 +590,11 @@ bool AAMjManager::CompileModel()
 	m_articulations = PhysicsEngine->m_articulations;
 	m_heightfieldActors = PhysicsEngine->m_heightfieldActors;
 	m_ArticulationMap = PhysicsEngine->m_ArticulationMap;
+
+	// Rebuild the entity roster: a recompile invalidates every cached mj id,
+	// so a stale cache here would be worse than an empty one (dangling ids in
+	// the bridge's entities block). Same rationale as in Compile().
+	BuildEntityCache();
 
 	return Result;
 }
