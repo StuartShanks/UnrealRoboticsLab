@@ -8,6 +8,10 @@ import numpy as np
 import py_trees
 import urlab_skills as U
 
+# Captured BEFORE any block monkeypatches U._base_xy — the world-frame
+# regression test near the bottom must exercise the REAL function.
+_REAL_base_xy = U._base_xy
+
 
 class StubRuntime:
     """Scripted set_nav_goal/get_nav_status; records every payload."""
@@ -267,6 +271,42 @@ assert de._init_error is None, f"DescendEngage errored on a Fab object: {de._ini
 assert np.allclose(de._surf, [-12.71, -15.36, 0.572]), de._surf
 
 print("fix DescendEngage-fallback test OK")
+
+# --- _base_xy returns WORLD base xy (regression: joint-frame bug) ------------
+# At a non-origin spawn, base joint qpos are spawn-frame-relative; reading
+# them as world put StageAt's ring sort ~14 m off (sorted from the world
+# origin — live gate 1 tried only far/blocked candidates). The REAL function
+# must return the slide-driven body's world xpos.
+import mujoco as _mj
+_mjcf = """
+<mujoco><worldbody>
+  <body name="rig" pos="6 -4 0.1">
+    <body name="bx">
+      <joint name="r_joint_x" type="slide" axis="1 0 0" range="-5 5"/>
+      <geom type="sphere" size="0.02"/>
+      <body name="by">
+        <joint name="r_joint_y" type="slide" axis="0 1 0" range="-5 5"/>
+        <geom type="box" size="0.1 0.1 0.1"/>
+      </body>
+    </body>
+  </body>
+</worldbody></mujoco>
+"""
+_mm = _mj.MjModel.from_xml_string(_mjcf)
+_dd = _mj.MjData(_mm)
+_dd.qpos[0] = 0.5   # joint_x
+_dd.qpos[1] = 0.25  # joint_y
+_mj.mj_forward(_mm, _dd)
+class _BaseXYClient:
+    model = _mm
+    data = _dd
+    def step(self, n_steps=1):
+        pass   # mirror-sync no-op; the toy data is forward'd above
+_got = _REAL_base_xy(_BaseXYClient())
+assert np.allclose(_got, [6.5, -3.75]), \
+    f"_base_xy must be WORLD (spawn + joints), got {_got}"
+
+print("fix base-xy world-frame test OK")
 
 # --- driver: tree assembles with the right legs ------------------------------
 import tidybot_multi_pick_demo as M

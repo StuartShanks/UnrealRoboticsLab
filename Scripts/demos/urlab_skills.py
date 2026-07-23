@@ -286,16 +286,21 @@ def _synced_planned_q(client, joints):
 
 
 def _base_xy(client) -> np.ndarray:
-    """Base (joint_x, joint_y) world position — the Tracker.base_xy() pattern
-    from tidybot_mink_demo.py, resolved by joint suffix off the synced qpos
-    mirror."""
+    """Base WORLD xy: the mirror xpos of the body the base slides move. NOT
+    the joint qpos — joint_x/joint_y are relative to the robot's SPAWN frame,
+    so at a non-origin spawn (HomeInterior: (-10,-18)) qpos reads were ~14 m
+    off in world terms: StageAt sorted its staging ring from the world ORIGIN
+    (trying far/blocked candidates first) and would have verified arrivals
+    against the wrong frame. Same world-vs-joint disease as the planner's
+    goal_ik seeding (fixed in df03564); origin spawns masked it in-house."""
+    client.step(n_steps=1)   # sync the mirror first (xpos is zeros pre-step)
     m = client.model
-    jx = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, "joint_x")
     jy = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_JOINT, m.njnt, "joint_y")
-    if jx < 0 or jy < 0:
-        raise RuntimeError(f"base joint not found")
+    if jy < 0:
+        raise RuntimeError("base joint not found")
+    bid = int(m.jnt_bodyid[jy])   # moved by joint_x (ancestor) + joint_y
     d = client.data
-    return np.array([d.qpos[m.jnt_qposadr[jx]], d.qpos[m.jnt_qposadr[jy]]])
+    return np.array([float(d.xpos[bid][0]), float(d.xpos[bid][1])])
 
 
 def resolve_affordance(client, body_suffix: str, prefix: str = "affordance_suction") -> Affordance:
