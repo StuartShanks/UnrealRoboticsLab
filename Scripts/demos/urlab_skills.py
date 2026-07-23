@@ -1437,6 +1437,7 @@ class PlaceOn(py_trees.behaviour.Behaviour):
     PRE_PLACE_HOVER_M = 0.16   # cup hover above surface_z
     AFFORDANCE_DZ = 0.13       # hover minus PlannedReach's PRE_GRASP_M (0.03)
     CUP_FLOOR_M = 0.03         # never stream the cup below surface + this
+    FLOOR_GRACE_S = 5.0        # arm catch-up time after the TARGET clamps at floor
     DESCEND_STEP_M = 0.015     # per-tick descend increment (bounded error)
     DWELL_S = 1.0
     RETRACT = np.array([-0.15, 0.0, 0.15])
@@ -1473,6 +1474,7 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         self._reach.initialise()
         self._quat = None
         self._t0 = None
+        self._floor_t0 = None
 
     def update(self):
         bb = self.bb
@@ -1512,10 +1514,21 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             self._cup_target[2] = max(floor,
                                       self._cup_target[2] - self.DESCEND_STEP_M)
             stream_target(client, bb.name, self._cup_target, self._quat)
-            if self._cup_target[2] <= floor and z_obj - self.surface_z > 0.06:
-                bb.fail_reason = (f"PlaceOn[{self.name}]: cup at floor limit "
-                                  f"but object z {z_obj:.3f} never settled")
-                return py_trees.common.Status.FAILURE
+            # The TARGET reaches the floor limit long before the REAL cup does
+            # (bounded-error streaming: the QP-tracked arm lags the streamed
+            # carrot). Failing the instant the target clamped aborted a live
+            # descend with the arm still 14 cm up — give the arm a grace
+            # window at the floor before declaring the object unsettleable.
+            if self._cup_target[2] <= floor:
+                if self._floor_t0 is None:
+                    self._floor_t0 = time.time()
+                elif (time.time() - self._floor_t0 > self.FLOOR_GRACE_S
+                        and z_obj - self.surface_z > 0.06):
+                    cup_now, _ = synced_site_pose(client, "cup_site")
+                    bb.fail_reason = (
+                        f"PlaceOn[{self.name}]: target at floor {self.FLOOR_GRACE_S:.0f}s "
+                        f"but object z {z_obj:.3f} never settled (cup z {cup_now[2]:.3f})")
+                    return py_trees.common.Status.FAILURE
             return py_trees.common.Status.RUNNING
 
         if self._phase == "release":
