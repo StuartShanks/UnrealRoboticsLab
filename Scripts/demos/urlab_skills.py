@@ -1475,6 +1475,8 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         self._quat = None
         self._t0 = None
         self._floor_t0 = None
+        self._z_prev = None
+        self._z_prev_t = None
 
     def update(self):
         bb = self.bb
@@ -1503,6 +1505,21 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             _hold_suction(client, bb.name)
             z_obj = _actor_z_by_name(client, self.object_name)
             if abs(z_obj - self.surface_z) <= self.settle_tol:
+                self._phase = "release"
+                self._t0 = None
+                return py_trees.common.Status.RUNNING
+            # CONTACT-BY-STALL: a pressed book tilts on first edge contact
+            # (live: pivot read 0.756 with the cup at 0.715 — the flat-settle
+            # check can never pass on a wedged object). If the object's z has
+            # stopped changing while we're still commanding descent, it is ON
+            # the surface: release and let gravity flatten it; the release
+            # phase re-verifies after the settle.
+            if self._z_prev is None or abs(z_obj - self._z_prev) > 0.004:
+                self._z_prev = z_obj
+                self._z_prev_t = time.time()
+            elif (time.time() - self._z_prev_t > 2.0
+                    and self._cup_target[2] <= self.surface_z + self.CUP_FLOOR_M + 0.05):
+                self.logger.info(f"contact-stall at object z {z_obj:.3f} — releasing")
                 self._phase = "release"
                 self._t0 = None
                 return py_trees.common.Status.RUNNING
@@ -1539,7 +1556,10 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             if time.time() - self._t0 < self.DWELL_S:
                 return py_trees.common.Status.RUNNING
             z_obj = _actor_z_by_name(client, self.object_name)
-            if abs(z_obj - self.surface_z) > self.settle_tol + 0.02:
+            # Post-release: gravity settles a tilted/wedged object flat. Allow
+            # a small positive band (leaning against unmodeled visual clutter)
+            # but fail on anything clearly not on the surface.
+            if not (-self.settle_tol <= z_obj - self.surface_z <= 0.06):
                 bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
                                   f"not at surface {self.surface_z:.3f} after release")
                 return py_trees.common.Status.FAILURE
