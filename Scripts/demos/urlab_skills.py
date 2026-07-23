@@ -495,6 +495,7 @@ class StageAt(py_trees.behaviour.Behaviour):
         self._candidates = staging_ring(self.target_xy, self.station_aabb,
                                         here, self.erode_m)
         self._tries = 0
+        self._last_reason = ""
         self.bb.fail_reason = ""
         self._drive, self._cand = self._next_drive()
 
@@ -503,7 +504,7 @@ class StageAt(py_trees.behaviour.Behaviour):
         if self._drive is None:
             if not bb.fail_reason:
                 bb.fail_reason = (f"StageAt[{self.name}]: ring exhausted "
-                                  f"({self._tries} tries)")
+                                  f"({self._tries} tries; last: {self._last_reason or 'n/a'})")
             return py_trees.common.Status.FAILURE
         status = self._drive.update()
         if status == py_trees.common.Status.RUNNING:
@@ -512,17 +513,26 @@ class StageAt(py_trees.behaviour.Behaviour):
             actual = _base_xy(bb.client)
             miss = float(np.linalg.norm(actual - self._cand))
             if miss <= self.verify_m:
-                self.logger.info(f"staged at {np.round(actual, 2)} "
-                                 f"({miss:.2f} m from requested)")
+                print(f"[stage] {self.name}: staged at {np.round(actual, 2)} "
+                      f"({miss:.2f} m from requested)", flush=True)
                 return py_trees.common.Status.SUCCESS
-            self.logger.info(f"arrival {miss:.2f} m off requested "
-                             f"{np.round(self._cand, 2)} — next candidate")
+            self._last_reason = (f"arrival {miss:.2f} m off requested "
+                                 f"{np.round(self._cand, 2)}")
+            print(f"[stage] {self.name}: {self._last_reason} — next candidate",
+                  flush=True)
+        else:
+            # Candidate rejected/failed: keep its reason for the exhaustion
+            # message and SAY it — swallowing per-candidate reasons cost a
+            # live diagnosis (every reject looked identical from outside).
+            self._last_reason = bb.fail_reason or "(no reason reported)"
+            print(f"[stage] {self.name}: candidate {np.round(self._cand, 2)} "
+                  f"failed: {self._last_reason} — next candidate", flush=True)
         # rejected / failed / unverified: advance the ring
         bb.fail_reason = ""
         self._drive, self._cand = self._next_drive()
         if self._drive is None:
             bb.fail_reason = (f"StageAt[{self.name}]: ring exhausted "
-                              f"({self._tries} tries)")
+                              f"({self._tries} tries; last: {self._last_reason or 'n/a'})")
             return py_trees.common.Status.FAILURE
         return py_trees.common.Status.RUNNING
 
