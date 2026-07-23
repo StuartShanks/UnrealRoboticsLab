@@ -225,6 +225,15 @@ def _hold_suction(client, name: str) -> None:
         pass  # never let a re-assert crash a tick
 
 
+def _actor_xy_by_name(client, ue_name: str):
+    """Live PIE actor xy (see _actor_z_by_name)."""
+    for r in client.outliner.find_actors(class_filter="StaticMeshActor",
+                                         in_pie=True):
+        if r.name == ue_name:
+            return np.array([float(r.location[0]), float(r.location[1])])
+    raise RuntimeError(f"actor {ue_name!r} not found in PIE")
+
+
 def _actor_z_by_name(client, ue_name: str) -> float:
     """Live PIE actor z (engine truth — the actor follows the MuJoCo body).
     NOTE: for the Fab books the actor pivot is the mesh BOTTOM."""
@@ -1519,7 +1528,12 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 self._z_prev_t = time.time()
             elif (time.time() - self._z_prev_t > 2.0
                     and self._cup_target[2] <= self.surface_z + self.CUP_FLOOR_M + 0.05):
-                self.logger.info(f"contact-stall at object z {z_obj:.3f} — releasing")
+                cup_now, _ = synced_site_pose(client, "cup_site")
+                obj_xy = _actor_xy_by_name(client, self.object_name)
+                print(f"[place] {self.name}: contact-stall — releasing at "
+                      f"object z {z_obj:.3f} xy {np.round(obj_xy, 2)} "
+                      f"cup {np.round(cup_now, 2)} (target xy {self.place_xy})",
+                      flush=True)
                 self._phase = "release"
                 self._t0 = None
                 return py_trees.common.Status.RUNNING

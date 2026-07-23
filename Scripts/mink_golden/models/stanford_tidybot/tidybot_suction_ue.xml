@@ -189,9 +189,14 @@
                                TILT (rolling), not just slide. Lives on the GRIPPER, so
                                EVERY object the cup grabs inherits it (MuJoCo takes the
                                max condim/friction of the pair) — no per-object setup.
-                               friction = slide torsion roll. -->
+                               friction = slide torsion roll. torsion/roll raised
+                               0.2/0.05 -> 1.0/0.5 after a carried book FLOPPED about
+                               the contact patch (dangling by a corner, it could not
+                               clear the place table): the adhesion preload only
+                               resists tilt through these coefficients, and the old
+                               values were tuned for the heavier, centered box. -->
                           <geom name="cup_geom" type="cylinder" size="0.03 0.01"
-                                margin="0.03" gap="0.03" condim="6" friction="1 0.2 0.05"
+                                margin="0.03" gap="0.03" condim="6" friction="1 1.0 0.5"
                                 rgba="0.15 0.15 0.15 1"/>
                           <!-- Identity quat: cup_site frame z = the cup's outward suction
                                direction (the 2f85 mount's grasping axis). pinch_site used
