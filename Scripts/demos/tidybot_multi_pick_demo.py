@@ -137,8 +137,11 @@ def main(one_way: bool):
             })
         except Exception as e:
             log(f"teardown note: {e}")
-    zf = U._actor_z_by_name(c, BOOK)
-    log(f"final book z = {zf:.3f}")
+    try:
+        zf = U._actor_z_by_name(c, BOOK)
+        log(f"final book z = {zf:.3f}")
+    except Exception as e:
+        log(f"final book-z read failed: {e}")
     return rc
 
 

@@ -248,7 +248,7 @@ def _object_z(client, object_actor_id: str) -> float:
     MJCF, so it can't suffer the frozen-root/physics-mismatch this function
     guards against. When no compiled body matches (bid < 0), fall back to the
     live actor position via find_actors, matched by actor_id OR by UE NAME —
-    this is how bb.object_actor_id = "SM_Book_125" makes DescendEngage /
+    this is how bb.object_actor_id = "SM_Book_125" makes
     VerifyAttach / Release work unchanged for a Fab pick."""
     m = getattr(client, "model", None)
     bid = (resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_BODY, m.nbody, object_actor_id)
@@ -1052,11 +1052,18 @@ class DescendEngage(py_trees.behaviour.Behaviour):
             # free body, so a live target lunges after the box the instant it is
             # nudged (the jumping IK marker) and amplifies a knock-off. A fixed
             # snapshot gives a clean straight-down descent to where the box IS.
-            surf, quat = synced_site_pose(bb.client, "affordance_suction_top")
-            R = np.zeros(9)
-            mujoco.mju_quat2Mat(R, quat)
-            normal = np.asarray(R).reshape(3, 3)[:, 2]
-            normal = normal / (np.linalg.norm(normal) or 1.0)
+            try:
+                surf, quat = synced_site_pose(bb.client, "affordance_suction_top")
+                R = np.zeros(9)
+                mujoco.mju_quat2Mat(R, quat)
+                normal = np.asarray(R).reshape(3, 3)[:, 2]
+                normal = normal / (np.linalg.norm(normal) or 1.0)
+            except RuntimeError:
+                # No MJCF affordance site (a quick-converted Fab object) — use the
+                # surface snapshot ResolveActorTop already put on the blackboard.
+                surf = np.asarray(bb.affordance.point, dtype=float)
+                normal = np.asarray(bb.affordance.normal, dtype=float)
+                normal = normal / (np.linalg.norm(normal) or 1.0)
             # Descend at the cup's CURRENT orientation, not affordance.quat_cup_down.
             # PlannedReach lands the cup already pointing down (roll-agnostic IK), so
             # re-imposing quat_cup_down's fixed roll makes the frame task spin the
@@ -1518,6 +1525,9 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         stream_target(client, bb.name, pos, self._quat)
         if a < 1.0:
             return py_trees.common.Status.RUNNING
+        client._rpc_configure_controller(
+            articulation=bb.name,
+            params={"task_enabled": [False, True, True, True]})
         return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status):

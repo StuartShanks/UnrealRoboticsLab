@@ -250,6 +250,24 @@ U.PlannedReach = U_PlannedReach_orig
 
 print("task-4 PlaceOn tests OK")
 
+# --- DescendEngage falls back to bb.affordance when the MJCF site is absent --
+def _no_affordance_site(client, site):
+    if site == "affordance_suction_top":
+        raise RuntimeError("site suffix 'affordance_suction_top' not found in compiled model")
+    return (np.array([-12.71, -15.36, 0.60]), np.array([0.0, 1.0, 0.0, 0.0]))  # cup_site
+U.synced_site_pose = _no_affordance_site
+bb = make_bb(StubRuntime([], []))
+bb.affordance = U.Affordance(
+    point=np.array([-12.71, -15.36, 0.572]),
+    normal=np.array([0.0, 0.0, 1.0]),
+    quat_cup_down=U.cup_down_quat(np.array([0.0, 0.0, 1.0])))
+de = U.DescendEngage("descend", bb)
+de.initialise()
+assert de._init_error is None, f"DescendEngage errored on a Fab object: {de._init_error}"
+assert np.allclose(de._surf, [-12.71, -15.36, 0.572]), de._surf
+
+print("fix DescendEngage-fallback test OK")
+
 # --- driver: tree assembles with the right legs ------------------------------
 import tidybot_multi_pick_demo as M
 bb = make_bb(StubRuntime([], []))
