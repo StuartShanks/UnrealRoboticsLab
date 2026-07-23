@@ -332,11 +332,13 @@ class Drive(py_trees.behaviour.Behaviour):
     goal jumps back toward its initial value in a single poll; threshold
     tuned live) rather than silently re-driving across a reset."""
 
-    def __init__(self, name, bb, goal_xy, timeout_s: float = NAV_TIMEOUT_S):
+    def __init__(self, name, bb, goal_xy, timeout_s: float = NAV_TIMEOUT_S,
+                 max_projection: float = None):
         super().__init__(name)
         self.bb = bb
         self.goal_xy = goal_xy
         self.timeout_s = float(timeout_s)
+        self.max_projection = max_projection
         self._deadline = None
         self._min_dist = None
 
@@ -347,14 +349,21 @@ class Drive(py_trees.behaviour.Behaviour):
             articulation=bb.name,
             params={"task_costs": {str(bb.damping_task): {"cost": 0.05}}},
         )
-        g = client.runtime.set_nav_goal(
-            articulation=bb.name, x=self.goal_xy[0], y=self.goal_xy[1],
-        )
+        kw = {"articulation": bb.name, "x": self.goal_xy[0], "y": self.goal_xy[1]}
+        if self.max_projection is not None:
+            kw["max_projection"] = float(self.max_projection)
+        g = client.runtime.set_nav_goal(**kw)
         self._min_dist = None
         if not g.get("accepted"):
-            bb.fail_reason = f"Drive[{self.name}]: goal {self.goal_xy} rejected: {g}"
+            detail = ""
+            if g.get("reason"):
+                detail = f" ({g['reason']}, proj {g.get('projection_m', 0):.2f} m)"
+            bb.fail_reason = f"Drive[{self.name}]: goal {self.goal_xy} rejected{detail}"
             self._deadline = -1.0  # sentinel: update() fails immediately
             return
+        sp = g.get("start_projection_m")
+        if sp is not None and sp > 0.05:
+            self.logger.info(f"start {sp:.2f} m off-mesh — recovery leg")
         self._deadline = time.time() + self.timeout_s
 
     def update(self):
