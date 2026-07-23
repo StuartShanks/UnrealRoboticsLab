@@ -2,6 +2,9 @@
 
 Status: agreed 2026-07-16, after mobile-manip v1 (sequential swap, live-validated,
 commit 435ec02) and design review. Two axes of work, in order.
+Updated 2026-07-23: suction pick v1 DONE and exceeded (Fab scene objects);
+axis-3 RRT upgrade path landed early; nav robustness hardened (goal-substitution
+RPC, off-mesh wedge recovery). See "Delivered since 2026-07-16" below.
 
 ## Guiding architecture
 
@@ -136,27 +139,53 @@ interchangeability test as the twist bus:
   BehaviorTree.CPP/py_trees_ros (if the ROS bridge happens). Skills are
   bridge verbs, so the tree ports mechanically either way.
 
-## NEXT MILESTONE — suction pick v1 (scoped, awaiting brainstorm/spec)
+## ✅ Delivered since 2026-07-16 (the suction-pick / Fab-object arc)
 
-"Nav, grab, nav while holding" — the original ask — via suction, which
-collapses grasping into the validated Reach primitive (drive the EE target to
-the object; no grasp-pose synthesis, no finger choreography). Pieces:
+**Suction pick v1 — DONE and exceeded.** All five scoped pieces shipped
+(skills, kinematic gating-by-planner, `set_suction`, suction-cup MJCF, guard
+exclusion for pickables), and the milestone overshot its brief: the validated
+pick is of an EXISTING Fab scene object (HomeInterior book via quick_convert),
+not just our own spawned MJCF assets. Canonical demo:
+`Scripts/demos/tidybot_fab_book_pick_demo.py` — verified nav staging →
+whole-body RRT plan → descend → suction → lift → slow carry → drop → retreat.
+Live-validated end-to-end (user-witnessed) 2026-07-22/23.
 
-1. BT skeleton + `skills.py` (Drive / StowArm / Reach / Descend / Suction /
-   Lift) reproducing the guarded-reach demo as tree composition.
-2. The two kinematic checks above (one op, one function).
-3. `set_suction` runtime op + adhesion actuator (just another d->ctrl slot —
-   the pass-through idiom already carries it through any active controller);
-   contact/proximity check before engaging.
-4. MJCF surgery: 2f85 finger subtree → suction cup (one simple geom). Kills
-   the finger-envelope compromise (gripper becomes guardable at 2–3 cm — the
-   close-quarters clearance a tabletop pick needs); mink golden fixtures need
-   a once-over (EE frame moves).
-5. Design consequences already settled: pickable objects are EXCLUDED from
-   guard obstacle groups (the table stays guarded, the object doesn't — the
-   one-pair-per-limit-entry surface supports this); carried object rides the
-   frozen-arm hold (last-write-wins ctrl), weld-vs-adhesion decides drop
-   physics.
+**Axis-3 "Reach upgrade path" landed early.** The RRT-Connect-over-MuJoCo
+planner (`Scripts/demos/urlab_planner.py`, executed via the `posture_target`
+wire on MjMinkIKController, wrapped as py_trees `PlannedReach` in
+`urlab_skills.py`) is built and live-gated — planner-proposes / QP-disposes /
+guard-insures, as designed.
 
-Axis-1 steps 4–5 and axis 2 are NOT blockers for this milestone; their
+**Nav robustness hardened (found the hard way during the arc):**
+- **Goal-substitution RPC** (0413c2a): `set_nav_goal` reports
+  projected/projection_m/partial/reason and takes `max_projection` (strict
+  mode rejects displaced goals + partial paths up front). `get_nav_status`
+  reports requested/projected goals + distance_to_requested_m. Root cause:
+  navmesh projection silently relocated goals up to ~1 m and 'arrived' was
+  measured against the substitute.
+- **Off-mesh wedge recovery** (5db567e): the START is projected too, so nav
+  recovers after a whole-body reach parks the base in an erosion band (path
+  begins with a recovery leg; `start_projection_m` reported;
+  `start_off_navmesh` for the unrecoverable case). Kills the reset-between-
+  manipulation-and-navigation wedge.
+- **Bridge truthfulness** (the pick-arc bug hunt): entity registration wired
+  up engine-side (4c03068 — the entities block was empty in every session;
+  quick-converted bodies now sync into the client mirror), client entity
+  qpos-sync + `set_suction` ctrl-mirror (URLab_Bridge 346ca54/3afd00d — the
+  positional ctrl stream no longer clobbers suction). Diagnostic RPCs worth
+  knowing: `get_contacts` (engine contacts + forces), `read_mocap_pose`.
+
+**Open items from the arc** (tracked, not blockers): staging-policy heuristic
+(candidate ring) belongs in a Drive/Stage skill; a principled "carry" mode
+(velocity/accel caps while holding) instead of slow-glide-by-convention;
+kinematic condition nodes (reachability annulus, corridor clearance op) as
+cheap pre-checks ahead of the planner.
+
+## NEXT MILESTONE — multi-pick sequence
+
+Convert the single validated pick into repeatable mobile manipulation:
+pick → drive elsewhere → place → return/repeat, as one tree run. The wedge
+recovery (above) was the enabler; remaining work is composition (Place skill =
+Descend+Release inverse of the pick; staging policy as a skill) rather than
+new capability. Axis-1 steps 4–5 and axis 2 remain non-blockers; their
 triggers (dynamic worlds, multi-agent) remain unmet.
