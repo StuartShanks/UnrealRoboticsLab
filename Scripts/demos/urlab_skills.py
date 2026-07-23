@@ -225,22 +225,47 @@ def _hold_suction(client, name: str) -> None:
         pass  # never let a re-assert crash a tick
 
 
+def _actor_z_by_name(client, ue_name: str) -> float:
+    """Live PIE actor z (engine truth — the actor follows the MuJoCo body).
+    NOTE: for the Fab books the actor pivot is the mesh BOTTOM."""
+    for r in client.outliner.find_actors(class_filter="StaticMeshActor",
+                                         in_pie=True):
+        if r.name == ue_name:
+            return float(r.location[2])
+    raise RuntimeError(f"actor {ue_name!r} not found in PIE")
+
+
 def _object_z(client, object_actor_id: str) -> float:
     """Read the object's LIVE PHYSICS z (its MuJoCo body world pos via the synced
     mirror). find_actors(in_pie=True) must NOT be used here: for a spawned free
     body it returns the actor ROOT transform, which stays FROZEN at the spawn
     location and does not track physics — confirmed live (actor z stuck at 0.66
     while the physics body was on the floor at 0.05), so a lift is invisible to
-    it. The body is matched by actor_id suffix (import may prefix the name)."""
+    it. The body is matched by actor_id suffix (import may prefix the name).
+
+    NAME fallback (additive, Fab actors): a quick-converted Fab actor (e.g. a
+    book) has NO compiled MuJoCo body at all — it was never imported into the
+    MJCF, so it can't suffer the frozen-root/physics-mismatch this function
+    guards against. When no compiled body matches (bid < 0), fall back to the
+    live actor position via find_actors, matched by actor_id OR by UE NAME —
+    this is how bb.object_actor_id = "SM_Book_125" makes DescendEngage /
+    VerifyAttach / Release work unchanged for a Fab pick."""
+    m = getattr(client, "model", None)
+    bid = (resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_BODY, m.nbody, object_actor_id)
+           if m is not None else -1)
+    if bid < 0:
+        outliner = getattr(client, "outliner", None)
+        if outliner is not None:
+            for r in outliner.find_actors(class_filter="StaticMeshActor", in_pie=True):
+                if getattr(r, "actor_id", None) == object_actor_id or r.name == object_actor_id:
+                    return float(r.location[2])
+        raise RuntimeError(f"object body {object_actor_id!r} not found in compiled model")
     client.runtime.set_mode("direct")
     client.step(n_steps=1)
-    m, d = client.model, client.data
-    bid = resolve_id_by_suffix(m, mujoco.mjtObj.mjOBJ_BODY, m.nbody, object_actor_id)
-    z = float(d.xpos[bid][2]) if bid >= 0 else None
+    d = client.data
+    z = float(d.xpos[bid][2])
     client.runtime.set_mode("live")
     client.runtime.set_paused(paused=False)
-    if bid < 0:
-        raise RuntimeError(f"object body {object_actor_id!r} not found in compiled model")
     return z
 
 
@@ -527,6 +552,100 @@ class ResolveAffordance(py_trees.behaviour.Behaviour):
         bb.affordance = aff
         bb.q_cup = aff.quat_cup_down
         return py_trees.common.Status.SUCCESS
+
+
+class ResolveActorTop(py_trees.behaviour.Behaviour):
+    """Fab-object affordance: no MJCF affordance site exists on a
+    quick-converted actor, so build the Affordance from the live actor pose
+    (pivot = mesh bottom for these books => top = pivot_z + 2*half).
+    Replaces ResolveAffordance in Fab trees; writes bb.affordance + bb.q_cup."""
+
+    def __init__(self, name, bb, object_name: str, half_thickness: float):
+        super().__init__(name)
+        self.bb = bb
+        self.object_name = object_name
+        self.half = float(half_thickness)
+        self._error = None
+
+    def initialise(self):
+        self._error = None
+        try:
+            found = None
+            for r in self.bb.client.outliner.find_actors(
+                    class_filter="StaticMeshActor", in_pie=True):
+                if r.name == self.object_name:
+                    found = np.array(r.location, dtype=float)
+                    break
+            if found is None:
+                raise RuntimeError(f"actor {self.object_name!r} not found in PIE")
+            up = np.array([0.0, 0.0, 1.0])
+            q = cup_down_quat(up)
+            self.bb.affordance = Affordance(
+                point=np.array([found[0], found[1], found[2] + 2.0 * self.half]),
+                normal=up, quat_cup_down=q)
+            self.bb.q_cup = q
+        except RuntimeError as e:
+            self._error = str(e)
+
+    def update(self):
+        if self._error is not None:
+            self.bb.fail_reason = f"ResolveActorTop[{self.name}]: {self._error}"
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.SUCCESS
+
+
+class CarryTransit(py_trees.behaviour.Behaviour):
+    """Loaded transit: StowCarry's tuck (EE ramped near the base, EE task
+    disabled, posture holds — transit doctrine), then a bus Drive with the
+    suction re-asserted every tick and a drop guard (held object's live z
+    below carry_z_min => attach lost mid-drive; fail fast, no recovery).
+    Presents as ONE skill to the tree."""
+
+    def __init__(self, name, bb, goal_xy, object_name: str,
+                 carry_z_min: float = 0.45, tuck_duration: float = 3.0,
+                 timeout_s: float = NAV_TIMEOUT_S):
+        super().__init__(name)
+        self.bb = bb
+        self.goal_xy = goal_xy
+        self.object_name = object_name
+        self.carry_z_min = float(carry_z_min)
+        self.tuck_duration = float(tuck_duration)
+        self.timeout_s = float(timeout_s)
+        self._stow = None
+        self._drive = None
+
+    def initialise(self):
+        self._stow = StowCarry(f"{self.name}/tuck", self.bb,
+                               duration=self.tuck_duration)
+        self._stow.initialise()
+        self._drive = None
+
+    def update(self):
+        bb = self.bb
+        if self._drive is None:
+            status = self._stow.update()
+            if status == py_trees.common.Status.RUNNING:
+                return py_trees.common.Status.RUNNING
+            if status == py_trees.common.Status.FAILURE:
+                return py_trees.common.Status.FAILURE
+            self._drive = Drive(f"{self.name}/drive", bb, self.goal_xy,
+                                timeout_s=self.timeout_s)
+            self._drive.initialise()
+        _hold_suction(bb.client, bb.name)
+        try:
+            z = _actor_z_by_name(bb.client, self.object_name)
+        except RuntimeError as e:
+            bb.fail_reason = f"CarryTransit[{self.name}]: {e}"
+            return py_trees.common.Status.FAILURE
+        if z < self.carry_z_min:
+            bb.fail_reason = (f"CarryTransit[{self.name}]: object dropped "
+                              f"mid-transit (z={z:.2f} < {self.carry_z_min})")
+            return py_trees.common.Status.FAILURE
+        return self._drive.update()
+
+    def terminate(self, new_status):
+        if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
+            self.bb.fail_reason = f"CarryTransit[{self.name}]: failed"
 
 
 class Reachable(py_trees.behaviour.Behaviour):

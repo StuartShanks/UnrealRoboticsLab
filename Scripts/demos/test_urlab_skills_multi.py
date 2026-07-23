@@ -132,3 +132,70 @@ assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
 assert len(rt.goal_calls) == 2, "substituted arrival must advance the ring"
 
 print("task-2 StageAt tests OK")
+
+# --- CarryTransit: tuck phase then drive; suction held; drop guard fires -----
+class StubOutliner:
+    def __init__(self, z_seq):
+        self.z_seq = list(z_seq)
+    def find_actors(self, class_filter=None, in_pie=False):
+        z = self.z_seq.pop(0) if len(self.z_seq) > 1 else self.z_seq[0]
+        return [types.SimpleNamespace(name="SM_Book_125",
+                                      location=(-12.7, -15.4, z))]
+
+held = {"n": 0}
+def _fake_hold(client, name):
+    held["n"] += 1
+U._hold_suction = _fake_hold
+U.synced_site_pose = lambda client, s: (np.array([0.0, 0.0, 0.7]),
+                                        np.array([0.0, 1.0, 0.0, 0.0]))
+U.stream_target = lambda client, name, p, q: None
+
+rt = StubRuntime(
+    goal_replies=[{"accepted": True}],
+    status_replies=[{"state": "navigating", "distance_to_goal": 2.0},
+                    {"state": "arrived", "distance_to_goal": 0.0}],
+)
+bb = make_bb(rt)
+bb.client.outliner = StubOutliner([0.94] * 8)
+ct = U.CarryTransit("carry", bb, (-11.1, -18.65), "SM_Book_125",
+                    tuck_duration=0.01)   # ~instant tuck (0.0 would divide by zero in StowCarry)
+ct.initialise()
+status = py_trees.common.Status.RUNNING
+for _ in range(20):
+    status = ct.update()
+    if status != py_trees.common.Status.RUNNING:
+        break
+    time.sleep(0.02)
+assert status == py_trees.common.Status.SUCCESS, bb.fail_reason
+assert held["n"] >= 2, "suction must be re-asserted through the transit"
+
+# drop guard: book z collapses mid-drive -> FAILURE with reason
+rt = StubRuntime(
+    goal_replies=[{"accepted": True}],
+    status_replies=[{"state": "navigating", "distance_to_goal": 2.0}] * 8,
+)
+bb = make_bb(rt)
+bb.client.outliner = StubOutliner([0.94, 0.94, 0.10])
+ct = U.CarryTransit("carry", bb, (-11.1, -18.65), "SM_Book_125",
+                    tuck_duration=0.01)
+ct.initialise()
+status = py_trees.common.Status.RUNNING
+for _ in range(20):
+    status = ct.update()
+    if status != py_trees.common.Status.RUNNING:
+        break
+    time.sleep(0.02)
+assert status == py_trees.common.Status.FAILURE
+assert "dropped" in bb.fail_reason, bb.fail_reason
+
+# --- _object_z name fallback + ResolveActorTop -------------------------------
+bb = make_bb(StubRuntime([], []))
+bb.client.outliner = StubOutliner([0.55])
+assert abs(U._object_z(bb.client, "SM_Book_125") - 0.55) < 1e-9, \
+    "_object_z must fall back to name matching for Fab actors"
+r = U.ResolveActorTop("resolve", bb, "SM_Book_125", 0.011)
+r.initialise()
+assert r.update() == py_trees.common.Status.SUCCESS
+assert abs(bb.affordance.point[2] - (0.55 + 0.022)) < 1e-9, bb.affordance.point
+
+print("task-3 CarryTransit tests OK")
