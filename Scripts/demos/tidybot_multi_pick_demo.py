@@ -31,10 +31,16 @@ class Station:
     place_xy: tuple
 
 
-TABLE = Station("table", (-13.20, -12.44, -15.63, -14.87), 0.55, (-12.71, -15.36))
-FAR = Station("side_table", (-12.53, -12.13, -18.41, -17.95), 0.68, (-12.33, -18.18))
+# top_z values MEASURED live (get_actor_bounds): the spec's 0.55 for the
+# table was 1 cm high — a flawless place failed its final verify by 2 mm.
+TABLE = Station("table", (-13.20, -12.44, -15.63, -14.87), 0.540, (-12.71, -15.36))
+FAR = Station("side_table", (-12.53, -12.13, -18.41, -17.95), 0.684, (-12.33, -18.18))
 # Loaded-transit goals: a ring-legal point on each station's open side.
-FAR_STAGING = (-12.33, -17.22)
+# FAR_STAGING hugs the erosion band edge (table north face y=-17.95 + 0.58
+# inflation = -17.37): parking 1.09 m from the place point put the hover at
+# the annulus edge — narrow RRT goal basin (plan exhaustion on most runs)
+# and a reach with no margin. 0.83 m gives both room to breathe.
+FAR_STAGING = (-12.33, -17.35)
 TABLE_STAGING = (-12.18, -16.47)
 
 
