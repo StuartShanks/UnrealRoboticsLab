@@ -195,8 +195,17 @@
                                clear the place table): the adhesion preload only
                                resists tilt through these coefficients, and the old
                                values were tuned for the heavier, centered box. -->
+                          <!-- margin/gap 0.03 -> 0.01: the ENGINE does not honor
+                               gap (measured: 35 N repulsion at dist 0.0295 on a
+                               cup-table contact), so the margin acts as a rigid
+                               invisible bumper — objects "grab" 3 cm below the
+                               face and hang on a springy shell (corner-dangle +
+                               carry oscillation, seen live). 1 cm keeps an
+                               adhesion pull-in zone while shrinking the bumper
+                               to a stiff near-flush hold. Revert to 0.03/0.03
+                               when the engine honors gap. -->
                           <geom name="cup_geom" type="cylinder" size="0.03 0.01"
-                                margin="0.03" gap="0.03" condim="6" friction="1 1.0 0.5"
+                                margin="0.01" gap="0.01" condim="6" friction="1 1.0 0.5"
                                 rgba="0.15 0.15 0.15 1"/>
                           <!-- Identity quat: cup_site frame z = the cup's outward suction
                                direction (the 2f85 mount's grasping axis). pinch_site used
