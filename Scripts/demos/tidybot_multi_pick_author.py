@@ -24,16 +24,32 @@ SPAWN = (-10.0, -18.0)
 def log(m): print(f"[multi-author] {m}", flush=True)
 
 
+# The wrist-end links ride only a few cm above the cup face, so guarding them
+# at the full LINK_STANDOFF pins the face ~3 cm above any pick/place surface —
+# the cup can never reach its 1.2 cm hover, adhesion grabs across the residual
+# gap, and the object dangles tilted below the cup (seen live; the wedged
+# place failures trace to it). A 3 cm distal standoff is still a hard
+# no-contact guarantee while letting the cup land its hover.
+DISTAL_LINKS = ["spherical_wrist_2_link", "bracelet_link"]
+PROXIMAL_LINKS = [l for l in ROBOT_LINKS if l not in DISTAL_LINKS]
+DISTAL_STANDOFF = 0.03
+
+
 def guarded_payload(link_bodies, cup_bodies, base_bodies):
     p = twist_follow_controller_payload()
     p["tasks"][0]["frame"] = "cup_site"
     p["tasks"][1]["joints"] = BASE_JOINTS + ARM_JOINTS
     p["limits"] += [
-        {"kind": "collision_avoidance", "geoms_a": ROBOT_LINKS,
+        {"kind": "collision_avoidance", "geoms_a": PROXIMAL_LINKS,
          "geoms_b": link_bodies, "min_distance": LINK_STANDOFF,
          "detection_distance": LINK_DETECTION_M},
+        {"kind": "collision_avoidance", "geoms_a": DISTAL_LINKS,
+         "geoms_b": link_bodies, "min_distance": DISTAL_STANDOFF,
+         "detection_distance": 0.25},
+        # NOTE: "base" is the 2f85 GRIPPER base (the only body with that
+        # name) — the mobile base is guarded via base_link in ROBOT_LINKS.
         {"kind": "collision_avoidance", "geoms_a": ["base"],
-         "geoms_b": base_bodies, "min_distance": 0.04,
+         "geoms_b": base_bodies, "min_distance": DISTAL_STANDOFF,
          "detection_distance": 0.25},
     ]
     if cup_bodies:
