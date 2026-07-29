@@ -234,6 +234,46 @@ def _actor_xy_by_name(client, ue_name: str):
     raise RuntimeError(f"actor {ue_name!r} not found in PIE")
 
 
+def _hull_world_aabb(client, ue_name: str):
+    """Live world AABB of a quick-converted body's collision hull, from the
+    client mirror (direct-dip synced read, same pattern as synced_site_pose).
+    Unlike the actor PIVOT (a fixed point that equals the center-top only in
+    the nominal flat pose), this tracks the object's ACTUAL geometry through
+    flips and tilts. Returns (min3, max3) as np arrays; raises RuntimeError
+    when no mirror body matches."""
+    client.runtime.set_mode("direct")
+    client.step(n_steps=1)
+    m, d = client.model, client.data
+    mujoco.mj_forward(m, d)
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    found = False
+    for bid in range(m.nbody):
+        bname = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, bid) or ""
+        if ue_name not in bname:
+            continue
+        adr, num = m.body_geomadr[bid], m.body_geomnum[bid]
+        for gid in range(adr, adr + num):
+            if m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH:
+                mid = m.geom_dataid[gid]
+                v0, nv = m.mesh_vertadr[mid], m.mesh_vertnum[mid]
+                w = (d.geom_xmat[gid].reshape(3, 3)
+                     @ m.mesh_vert[v0:v0 + nv].T).T + d.geom_xpos[gid]
+                lo = np.minimum(lo, w.min(axis=0))
+                hi = np.maximum(hi, w.max(axis=0))
+            else:  # primitive geom: bounding-sphere box
+                r = float(m.geom_rbound[gid])
+                lo = np.minimum(lo, d.geom_xpos[gid] - r)
+                hi = np.maximum(hi, d.geom_xpos[gid] + r)
+        found = True
+        break
+    client.runtime.set_mode("live")
+    client.runtime.set_paused(paused=False)
+    if not found:
+        raise RuntimeError(f"no mirror body matches {ue_name!r}")
+    return lo, hi
+
+
 def _actor_z_by_name(client, ue_name: str) -> float:
     """Live PIE actor z (engine truth — the actor follows the MuJoCo body).
     NOTE: for the Fab books the actor pivot is the mesh BOTTOM."""
@@ -463,7 +503,15 @@ def staging_ring(target_xy, station_aabb, here_xy, erode_m: float = 0.58,
                     (ymin - erode_m <= p[1] <= ymax + erode_m):
                 continue
             out.append(p)
-    out.sort(key=lambda p: float(np.linalg.norm(p - here)))
+    # Inner radius FIRST, drive distance second: reach quality dominates
+    # drive cost. Sorted purely by drive distance the outer ring kept
+    # winning, parking the base ~1.2 m out where the descend pins ~3 cm
+    # short of the object (annulus edge + twist task holding the base) and
+    # the grab seats weakly — carries dropped the object mid-transit (live).
+    # At ~1.0 m every descend tracks to its target exactly.
+    tgt = np.asarray(target_xy, dtype=float)
+    out.sort(key=lambda p: (round(float(np.linalg.norm(p - tgt)), 3),
+                            float(np.linalg.norm(p - here))))
     return out
 
 
@@ -580,9 +628,13 @@ class ResolveAffordance(py_trees.behaviour.Behaviour):
 
 class ResolveActorTop(py_trees.behaviour.Behaviour):
     """Fab-object affordance: no MJCF affordance site exists on a
-    quick-converted actor, so build the Affordance from the live actor pose
-    (pivot = mesh bottom for these books => top = pivot_z + 2*half).
-    Replaces ResolveAffordance in Fab trees; writes bb.affordance + bb.q_cup."""
+    quick-converted actor, so build the Affordance from the live actor pose.
+    PIVOT SEMANTICS (measured live): in PIE the quick-converted actor's pivot
+    is the hull TOP face — resting upright on the table it reads
+    table_top + thickness; dropped upside-down on the floor it reads 0. (The
+    EDITOR-world pivot is the mesh bottom — do not calibrate against that.)
+    So the affordance point z is the pivot itself, no offset. Replaces
+    ResolveAffordance in Fab trees; writes bb.affordance + bb.q_cup."""
 
     def __init__(self, name, bb, object_name: str, half_thickness: float):
         super().__init__(name)
@@ -594,19 +646,32 @@ class ResolveActorTop(py_trees.behaviour.Behaviour):
     def initialise(self):
         self._error = None
         try:
-            found = None
-            for r in self.bb.client.outliner.find_actors(
-                    class_filter="StaticMeshActor", in_pie=True):
-                if r.name == self.object_name:
-                    found = np.array(r.location, dtype=float)
-                    break
-            if found is None:
-                raise RuntimeError(f"actor {self.object_name!r} not found in PIE")
             up = np.array([0.0, 0.0, 1.0])
             q = cup_down_quat(up)
-            self.bb.affordance = Affordance(
-                point=np.array([found[0], found[1], found[2] + 2.0 * self.half]),
-                normal=up, quat_cup_down=q)
+            # Preferred: the live hull's world AABB — center xy + true top z,
+            # robust to the object landing flipped or tilted (the actor pivot
+            # is only the center-top in the nominal flat pose; aiming at it
+            # after a non-nominal place produced edge grabs, seen live).
+            try:
+                lo, hi = _hull_world_aabb(self.bb.client, self.object_name)
+                point = np.array([(lo[0] + hi[0]) / 2.0,
+                                  (lo[1] + hi[1]) / 2.0, hi[2]])
+                print(f"[resolve] {self.name}: hull top {np.round(point, 3)} "
+                      f"(pivot fallback not needed)", flush=True)
+            except Exception:
+                # Fallback: actor pivot (= top face in the nominal pose).
+                found = None
+                for r in self.bb.client.outliner.find_actors(
+                        class_filter="StaticMeshActor", in_pie=True):
+                    if r.name == self.object_name:
+                        found = np.array(r.location, dtype=float)
+                        break
+                if found is None:
+                    raise RuntimeError(
+                        f"actor {self.object_name!r} not found in PIE")
+                point = np.array([found[0], found[1], found[2]])
+            self.bb.affordance = Affordance(point=point, normal=up,
+                                            quat_cup_down=q)
             self.bb.q_cup = q
         except RuntimeError as e:
             self._error = str(e)
@@ -895,17 +960,27 @@ class PlannedReach(py_trees.behaviour.Behaviour):
     # surfaced live on a house table pick).
     NO_PROGRESS_S = 6.0      # fail if best err hasn't improved for this long
     PROGRESS_EPS = 0.02      # min err drop that counts as progress
+    PLAN_ATTEMPTS = 3        # RRT-Connect is stochastic: the place-hover query
+                             # exhausted 2000 iters on ~2 of 3 live runs and
+                             # planned fine on the third — re-rolling the seed
+                             # is the cheap remedy before the streamed-approach
+                             # fallback (spec's documented escalation)
 
-    def __init__(self, name, bb, exclude_body=None):
+    def __init__(self, name, bb, exclude_body=None, hold_suction=False):
         super().__init__(name)
         self.bb = bb
         self.exclude_body = exclude_body   # held-object suffix to park (see planner)
+        self.hold_suction = bool(hold_suction)  # re-assert suction in the
+        #   streamed fallback (synced reads zero it server-side) — pass True
+        #   ONLY when an object is held (a place reach); on a pick approach
+        #   early suction re-creates the peel-grab bug.
         self._plan = None
         self._joints = None
         self._wp_idx = 0
         self._best_err = float("inf")
         self._last_improve_t = None
         self._failed = None
+        self._fallback_goal = None
 
     def initialise(self):
         from urlab_planner import PLANNED_JOINTS, PlanError, plan_reach
@@ -915,6 +990,7 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         self._wp_idx = 0
         self._failed = None
         self._best_err = float("inf")
+        self._fallback_goal = None
         # Guard a missing affordance (matches ReachRamp/Reachable/DescendEngage):
         # ResolveAffordance must have run first and published bb.affordance
         # (an Affordance dataclass: point, normal, quat_cup_down, waypoints)
@@ -926,23 +1002,61 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         aff = bb.affordance
         pre_grasp = np.asarray(aff.point, dtype=float) \
             + self.PRE_GRASP_M * np.asarray(aff.normal, dtype=float)
-        try:
-            self._plan = plan_reach(client, pre_grasp, np.asarray(bb.q_cup, dtype=float),
-                                    exclude_body_suffix=self.exclude_body)
-        except PlanError as e:
-            self._plan = None
-            bb.fail_reason = f"PlannedReach[{self.name}]: plan {e.stage}: {e}"
-            self._failed = bb.fail_reason
-            return
-        except Exception as e:
-            # plan_reach can also raise ValueError (unresolved joint/site), a
-            # mink import error, or an RPC error — fail the tick cleanly rather
-            # than crash with a traceback. No exec config has been sent yet, so
-            # there is nothing to clean up.
-            self._plan = None
-            bb.fail_reason = f"PlannedReach[{self.name}]: plan failed: {e}"
-            self._failed = bb.fail_reason
-            return
+        self._plan = None
+        for attempt in range(1, self.PLAN_ATTEMPTS + 1):
+            try:
+                # seed varies per attempt — the planner is DETERMINISTIC
+                # (seed=0 throughout urlab_planner), so retrying with the
+                # default seed replays the identical failing tree.
+                self._plan = plan_reach(client, pre_grasp,
+                                        np.asarray(bb.q_cup, dtype=float),
+                                        exclude_body_suffix=self.exclude_body,
+                                        seed=attempt - 1)
+                if attempt > 1:
+                    print(f"[reach] {self.name}: plan found on attempt {attempt}",
+                          flush=True)
+                break
+            except PlanError as e:
+                if attempt < self.PLAN_ATTEMPTS:
+                    print(f"[reach] {self.name}: plan attempt {attempt} failed "
+                          f"({e.stage}) — retrying", flush=True)
+                    continue
+                # Streamed-approach fallback (the spec's escalation): some
+                # queries are structurally RRT-hostile (side-table region:
+                # exhaustion across FRESH seeds with 2-5 goal configs). Carrot
+                # the cup to the pre-grasp; the whole-body QP tracks (damping
+                # relaxed so the base assists) and the guards still insure.
+                # terminate() restores costs + seed-then-enables regardless.
+                print(f"[reach] {self.name}: plan {e.stage} "
+                      f"({self.PLAN_ATTEMPTS} attempts) — streamed-approach "
+                      f"fallback", flush=True)
+                try:
+                    p0, q0 = synced_site_pose(client, "cup_site")
+                except RuntimeError as e2:
+                    bb.fail_reason = f"PlannedReach[{self.name}]: {e2}"
+                    self._failed = bb.fail_reason
+                    return
+                stream_target(client, bb.name, p0, q0)  # seed-then-enable
+                client._rpc_configure_controller(
+                    articulation=bb.name,
+                    params={"task_enabled": [True, True, True, False],
+                            "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
+                self._fallback_goal = np.asarray(pre_grasp, dtype=float)
+                self._fb_quat = q0
+                self._fb_best = float("inf")
+                self._fb_improve_t = time.time()
+                self._fb_t0 = time.time()
+                return
+            except Exception as e:
+                # plan_reach can also raise ValueError (unresolved joint/site),
+                # a mink import error, or an RPC error — deterministic, so no
+                # retry: fail the tick cleanly rather than crash with a
+                # traceback. No exec config has been sent yet, so there is
+                # nothing to clean up.
+                self._plan = None
+                bb.fail_reason = f"PlannedReach[{self.name}]: plan failed: {e}"
+                self._failed = bb.fail_reason
+                return
         # Frame + twist_follow OFF, posture dominates; relax the lazy-base
         # damping (5.0 -> 0.05, the transit value) so it doesn't fight the
         # posture task driving the base through each planned waypoint (the
@@ -961,6 +1075,28 @@ class PlannedReach(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         bb = self.bb
         client = bb.client
+        if self._fallback_goal is not None:
+            # Streamed-approach fallback (armed in initialise on plan failure).
+            if self.hold_suction:
+                _hold_suction(client, bb.name)
+            cur, _ = synced_site_pose(client, "cup_site")
+            err = self._fallback_goal - cur
+            n = float(np.linalg.norm(err))
+            if n < self._fb_best - 0.01:
+                self._fb_best = n
+                self._fb_improve_t = time.time()
+            plateau = (time.time() - self._fb_improve_t) > 4.0
+            if n < 0.03 or (plateau and n < 0.10):
+                print(f"[reach] {self.name}: fallback reached pre-grasp "
+                      f"(err {n:.3f} m)", flush=True)
+                return py_trees.common.Status.SUCCESS
+            if plateau or time.time() - self._fb_t0 > 25.0:
+                bb.fail_reason = (f"PlannedReach[{self.name}]: streamed "
+                                  f"fallback stalled {n:.2f} m from pre-grasp")
+                return py_trees.common.Status.FAILURE
+            step = err if n <= 0.04 else err * (0.04 / n)
+            stream_target(client, bb.name, cur + step, self._fb_quat)
+            return py_trees.common.Status.RUNNING
         idx = self._wp_idx
         _t_wp, wp = self._plan.waypoints[idx]
         # Stream the CURRENT waypoint, then measure how well it is tracked.
@@ -1036,18 +1172,28 @@ class DescendEngage(py_trees.behaviour.Behaviour):
     surface (snapshot ONCE at initialise so it doesn't chase a nudged box). Does
     NOT press into the object: the adhesion actuator grabs within its 3 cm margin,
     so pressing a light box only knocks it off the table -- hovering + suction
-    lets adhesion pull the box UP to the cup instead. Engages suction once cup_site
-    is within ENGAGE_DIST_M, then holds at the hover target until the cup is within
-    CONTACT_DIST_M of it or SETTLE_TIMEOUT_S elapses. SUCCESS then (VerifyAttach is
-    the real gate); FAILURE only on a read error."""
+    lets adhesion pull the box UP to the cup instead. Suction engages LATE, in the
+    settle phase (cup stationary at the hover) -- firing it mid-descent grabbed the
+    object across a moving 3-5 cm gap, peeling it up nearest-edge-first into a
+    tilted corner-dangle (seen live on the Fab book). Suction fires only once
+    the cup has CLOSED the vertical gap to ENGAGE_GAP_M — the settle phase
+    starts on the ramp TIMER with the arm still lagging ~3 cm up, and engaging
+    on phase entry re-created the peel (seen live: gap 0.030, book still came
+    up tilted). A settle-timeout fallback engage means a slow-converging arm
+    still hands off to VerifyAttach (the real gate) instead of never engaging;
+    a short post-engage dwell lets adhesion seat the object flat before the
+    lift. FAILURE only on a read error."""
 
-    ENGAGE_DIST_M = 0.05    # fire suction once this close to the surface
-    CONTACT_DIST_M = 0.025  # cup within this of the hover target -> settled, done
+    ENGAGE_GAP_M = 0.015    # vertical cup-to-surface gap that triggers suction
+    ENGAGE_DWELL_S = 0.75   # post-engage hold so adhesion seats the object flat
     HOVER_M = 0.012         # hover the cup this far ABOVE the surface. Do NOT press
                             # into the object: the cup grabs within the adhesion
                             # margin (3 cm), so pressing only knocks the light box
                             # off the table. Hover + suction -> adhesion pulls it up.
-    SETTLE_TIMEOUT_S = 3.0  # hold ceiling for adhesion to grab before VerifyAttach
+    SETTLE_TIMEOUT_S = 8.0  # terminal convergence is slow at annulus-edge
+                            # staging (live: still closing at 3 s — the old
+                            # window forced a far fallback engage that only
+                            # VerifyAttach's retry rescued)
 
     def __init__(self, name, bb, ramp_duration: float = 4.0):
         super().__init__(name)
@@ -1059,16 +1205,20 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         self._pressed = None    # fixed descent target (surf + HOVER_M*normal, ABOVE)
         self._t0 = None
         self._engaged = False
+        self._engage_t = None
         self._settling = False
         self._settle_t0 = None
+        self._damping_relaxed = False
         self._init_error = None
 
     def initialise(self):
         bb = self.bb
         self._init_error = None
         self._engaged = False
+        self._engage_t = None
         self._settling = False
         self._settle_t0 = None
+        self._damping_relaxed = False
         if bb.affordance is None:
             self._init_error = "no affordance resolved"
             return
@@ -1105,6 +1255,15 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         self._surf = np.asarray(surf, dtype=float)
         self._pressed = self._surf + self.HOVER_M * normal  # hover ABOVE, don't press
         self._start_pose = p0
+        # Relax the lazy-base damping for the descend (restored in terminate):
+        # staged ~1.2 m out, the hover target sits at the edge of the cup-down
+        # annulus and with damping 5.0 the QP parks with a ~3 cm steady error
+        # (seen live: the settle plateau at gap 0.029-0.030 every run) rather
+        # than creep the base forward. PlannedReach's proven relax pattern.
+        bb.client._rpc_configure_controller(
+            articulation=bb.name,
+            params={"task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
+        self._damping_relaxed = True
         self._t0 = time.time()
 
     def update(self):
@@ -1123,11 +1282,7 @@ class DescendEngage(py_trees.behaviour.Behaviour):
         pressed = self._pressed  # fixed snapshot target
         dist_to_surf = float(np.linalg.norm(cup_pos - self._surf))
 
-        # Engage suction once close, so it's on before contact.
-        if not self._engaged and dist_to_surf <= self.ENGAGE_DIST_M:
-            client.runtime.set_suction(articulation=bb.name, value=1.0)
-            self._engaged = True
-        elif self._engaged:
+        if self._engaged:
             _hold_suction(client, bb.name)  # the synced read above zeroed it
 
         if not self._settling:
@@ -1139,19 +1294,50 @@ class DescendEngage(py_trees.behaviour.Behaviour):
                 self._settle_t0 = time.time()
             return py_trees.common.Status.RUNNING
 
-        # Settle phase: keep pressing the live target until real contact, so the
-        # arm converges and adhesion grabs (rather than lifting off a lagging ramp).
+        # Settle phase: hold the hover target; engage suction only once the
+        # cup has actually closed the vertical gap (see class docstring), so
+        # the grab happens across a static ~1 cm symmetric gap and the object
+        # comes up flat instead of peeled.
         stream_target(client, bb.name, pressed, self._quat)
+        gap = float(cup_pos[2] - self._surf[2])
+        if not self._engaged:
+            if gap <= self.ENGAGE_GAP_M:
+                print(f"[descend] {self.name}: engage at gap={gap:.3f} "
+                      f"(d={dist_to_surf:.3f})", flush=True)
+            elif time.time() - self._settle_t0 >= self.SETTLE_TIMEOUT_S:
+                # Arm never closed the gap — engage anyway and let
+                # VerifyAttach decide on the actual lift.
+                print(f"[descend] {self.name}: settle timeout — fallback "
+                      f"engage at gap={gap:.3f}", flush=True)
+            else:
+                # A FIXED hover target leaves a ~2-3 cm steady tracking error
+                # (PD droop at annulus-edge extension — live: every settle
+                # plateaued at gap 0.030-0.035 and only VerifyAttach's retry
+                # rescued the grab, weakly: a return carry dropped the book).
+                # Walk the TARGET below the hover until the MEASURED gap
+                # closes — the place descend's proven pattern; the 1 cm
+                # margin bumper floors the real cup safely above the object.
+                self._pressed[2] = max(self._surf[2] - 0.02,
+                                       self._pressed[2] - 0.008)
+                return py_trees.common.Status.RUNNING
+            client.runtime.set_suction(articulation=bb.name, value=1.0)
+            self._engaged = True
+            self._engage_t = time.time()
+            return py_trees.common.Status.RUNNING
         client.runtime.set_suction(articulation=bb.name, value=1.0)  # re-assert (read zeroed it)
-        self._engaged = True
-        if dist_to_surf <= self.CONTACT_DIST_M:
-            return py_trees.common.Status.SUCCESS
-        if time.time() - self._settle_t0 >= self.SETTLE_TIMEOUT_S:
-            # Hand off to VerifyAttach — it decides pass/fail on the actual lift.
-            return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.RUNNING
+        if time.time() - self._engage_t < self.ENGAGE_DWELL_S:
+            return py_trees.common.Status.RUNNING
+        return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status):
+        if self._damping_relaxed:
+            try:  # restore what initialise changed, regardless of outcome
+                self.bb.client._rpc_configure_controller(
+                    articulation=self.bb.name,
+                    params={"task_costs": {str(DAMPING_TASK): {"cost": 5.0}}})
+            except Exception:
+                pass
+            self._damping_relaxed = False
         if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
             self.bb.fail_reason = f"DescendEngage[{self.name}]: failed"
 
@@ -1459,6 +1645,9 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         self.place_xy = place_xy
         self.surface_z = float(surface_z)
         self.half = float(half_thickness)
+        # The live pivot is the object's TOP face (see ResolveActorTop), so a
+        # resting object reads pivot = surface + full thickness.
+        self._rest_z = self.surface_z + 2.0 * self.half
         self.object_name = object_name
         self.settle_tol = float(settle_tol)
         self.descend_timeout_s = float(descend_timeout_s)
@@ -1479,13 +1668,18 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         bb.q_cup = q
         self._phase = "plan"
         self._reach = PlannedReach(f"{self.name}/reach", bb,
-                                   exclude_body=self.object_name)
+                                   exclude_body=self.object_name,
+                                   hold_suction=True)  # object is HELD here
         self._reach.initialise()
         self._quat = None
         self._t0 = None
         self._floor_t0 = None
         self._z_prev = None
         self._z_prev_t = None
+        self._damping_relaxed = False
+        self._approach_goal = None
+        self._best_err = float("inf")
+        self._improve_t = None
 
     def update(self):
         bb = self.bb
@@ -1497,9 +1691,36 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.RUNNING
             self._reach.terminate(status)
             if status == py_trees.common.Status.FAILURE:
-                return py_trees.common.Status.FAILURE
+                # Documented fallback (spec): the place-hover RRT query is
+                # structurally hostile (2 goal configs; exhaustion across
+                # FRESH seeds) — stream a bounded-error carrot to the hover
+                # instead. The whole-body QP tracks it (damping relaxed so
+                # the base closes the last gap) and the collision guards
+                # still insure the chain.
+                print(f"[place] {self.name}: plan failed — streamed-approach "
+                      f"fallback", flush=True)
+                bb.fail_reason = ""
+                p0, q0 = synced_site_pose(client, "cup_site")
+                stream_target(client, bb.name, p0, q0)  # seed-then-enable
+                client._rpc_configure_controller(
+                    articulation=bb.name,
+                    params={"task_enabled": [True, True, True, False],
+                            "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
+                self._damping_relaxed = True
+                self._quat = q0
+                self._approach_goal = np.array(
+                    [self.place_xy[0], self.place_xy[1],
+                     self.surface_z + self.PRE_PLACE_HOVER_M])
+                self._best_err = float("inf")
+                self._improve_t = time.time()
+                self._t0 = time.time()
+                self._phase = "approach"
+                return py_trees.common.Status.RUNNING
             # seed-then-enable at the landed pose, then descend
             p0, q0 = synced_site_pose(client, "cup_site")
+            hover_err = float(np.linalg.norm(p0[:2] - np.asarray(self.place_xy)))
+            print(f"[place] {self.name}: hover cup {np.round(p0, 3)} — "
+                  f"{hover_err:.3f} m off target xy {self.place_xy}", flush=True)
             stream_target(client, bb.name, p0, q0)
             client._rpc_configure_controller(
                 articulation=bb.name,
@@ -1510,10 +1731,52 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             self._phase = "descend"
             return py_trees.common.Status.RUNNING
 
+        if self._phase == "approach":
+            # Streamed fallback: bounded-error carrot to the hover; the
+            # descend phase takes over once close (or plateaued near enough
+            # that a straight-down descend still lands ON the surface).
+            _hold_suction(client, bb.name)
+            cur, _ = synced_site_pose(client, "cup_site")
+            err = self._approach_goal - cur
+            n = float(np.linalg.norm(err))
+            if n < self._best_err - 0.01:
+                self._best_err = n
+                self._improve_t = time.time()
+            plateau = (time.time() - self._improve_t) > 4.0
+            if n < 0.03 or (plateau and n < 0.10):
+                hover_err = float(np.linalg.norm(
+                    cur[:2] - np.asarray(self.place_xy)))
+                print(f"[place] {self.name}: approach hover cup "
+                      f"{np.round(cur, 3)} — {hover_err:.3f} m off target xy "
+                      f"{self.place_xy}", flush=True)
+                self._cup_target = cur.copy()
+                self._t0 = time.time()
+                self._floor_t0 = None
+                self._z_prev = None
+                self._phase = "descend"
+                return py_trees.common.Status.RUNNING
+            if plateau or time.time() - self._t0 > 25.0:
+                bb.fail_reason = (f"PlaceOn[{self.name}]: streamed approach "
+                                  f"stalled {n:.2f} m from the hover")
+                return py_trees.common.Status.FAILURE
+            step = err if n <= 0.04 else err * (0.04 / n)
+            stream_target(client, bb.name, cur + step, self._quat)
+            return py_trees.common.Status.RUNNING
+
         if self._phase == "descend":
             _hold_suction(client, bb.name)
             z_obj = _actor_z_by_name(client, self.object_name)
-            if abs(z_obj - self.surface_z) <= self.settle_tol:
+            if abs(z_obj - self._rest_z) <= self.settle_tol:
+                try:  # telemetry only — never let a diagnostic read fail the phase
+                    cup_now, _ = synced_site_pose(client, "cup_site")
+                    obj_xy = _actor_xy_by_name(client, self.object_name)
+                    print(f"[place] {self.name}: flat-settle — releasing at "
+                          f"object z {z_obj:.3f} xy {np.round(obj_xy, 2)} "
+                          f"cup {np.round(cup_now, 2)} (target xy {self.place_xy})",
+                          flush=True)
+                except Exception:
+                    print(f"[place] {self.name}: flat-settle — releasing at "
+                          f"object z {z_obj:.3f}", flush=True)
                 self._phase = "release"
                 self._t0 = None
                 return py_trees.common.Status.RUNNING
@@ -1554,7 +1817,7 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 if self._floor_t0 is None:
                     self._floor_t0 = time.time()
                 elif (time.time() - self._floor_t0 > self.FLOOR_GRACE_S
-                        and z_obj - self.surface_z > 0.06):
+                        and z_obj - self._rest_z > 0.06):
                     cup_now, _ = synced_site_pose(client, "cup_site")
                     bb.fail_reason = (
                         f"PlaceOn[{self.name}]: target at floor {self.FLOOR_GRACE_S:.0f}s "
@@ -1590,14 +1853,22 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             articulation=bb.name,
             params={"task_enabled": [False, True, True, True]})
         z_obj = _actor_z_by_name(client, self.object_name)
-        if not (-self.settle_tol <= z_obj - self.surface_z <= 0.06):
+        if not (-self.settle_tol <= z_obj - self._rest_z <= 0.06):
             bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
-                              f"not at surface {self.surface_z:.3f} after retract")
+                              f"not at rest height {self._rest_z:.3f} after retract")
             return py_trees.common.Status.FAILURE
         print(f"[place] {self.name}: PLACED — object z {z_obj:.3f} on surface "
               f"{self.surface_z:.3f}", flush=True)
         return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status):
+        if getattr(self, "_damping_relaxed", False):
+            try:  # restore the fallback's damping relax regardless of outcome
+                self.bb.client._rpc_configure_controller(
+                    articulation=self.bb.name,
+                    params={"task_costs": {str(DAMPING_TASK): {"cost": 5.0}}})
+            except Exception:
+                pass
+            self._damping_relaxed = False
         if new_status == py_trees.common.Status.FAILURE and not self.bb.fail_reason:
             self.bb.fail_reason = f"PlaceOn[{self.name}]: failed"

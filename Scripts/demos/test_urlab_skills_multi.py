@@ -78,8 +78,11 @@ for p in ring:
     inside = (AABB[0] - 0.58 <= p[0] <= AABB[1] + 0.58) and \
              (AABB[2] - 0.58 <= p[1] <= AABB[3] + 0.58)
     assert not inside, f"candidate {p} inside the eroded band"
-d0 = [float(np.linalg.norm(p - np.array([-10.0, -18.0]))) for p in ring]
-assert d0 == sorted(d0), "candidates not sorted by drive distance"
+# Ordering: inner radius first (reach quality dominates drive cost — outer
+# staging pinned the descend ~3 cm short, live), then drive distance.
+keys = [(round(float(np.linalg.norm(p - np.array([-12.71, -15.36]))), 6),
+         float(np.linalg.norm(p - np.array([-10.0, -18.0])))) for p in ring]
+assert keys == sorted(keys), "candidates not sorted (radius, drive distance)"
 
 # --- StageAt: first candidate rejected -> second verified --------------------
 rt = StubRuntime(
@@ -200,7 +203,7 @@ assert abs(U._object_z(bb.client, "SM_Book_125") - 0.55) < 1e-9, \
 r = U.ResolveActorTop("resolve", bb, "SM_Book_125", 0.011)
 r.initialise()
 assert r.update() == py_trees.common.Status.SUCCESS
-assert abs(bb.affordance.point[2] - (0.55 + 0.022)) < 1e-9, bb.affordance.point
+assert abs(bb.affordance.point[2] - 0.55) < 1e-9, bb.affordance.point  # pivot = top
 
 print("task-3 CarryTransit tests OK")
 
@@ -229,10 +232,11 @@ def _fake_stream(client, name, p, q):
 U.synced_site_pose = _fake_site_pose
 U.stream_target = _fake_stream
 
-# book bottom follows the cup down, then settles on the surface at 1.11
+# book pivot (= TOP face) follows the cup down, then settles at rest height
+# surface + 2*half = 1.132
 book = {"z": 1.17}
 def _fake_actor_z(client, name):
-    book["z"] = max(1.11, cup_z["z"] - 0.06)
+    book["z"] = max(1.11 + 0.022, cup_z["z"] - 0.06)
     return book["z"]
 U._actor_z_by_name = _fake_actor_z
 
