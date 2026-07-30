@@ -55,16 +55,30 @@ revised boundary retains Molmo's native execution path:
 ```python
 client.attach_puppet_simulation(env.mj_model, env.current_data)
 
-env.step(n)       # Molmo owns physics and native bookkeeping
-client.step(0)    # URLab advances nothing; it only transmits current state
+env.step(n)                   # Molmo owns physics and native bookkeeping
+client.push_puppet_state()    # Transmit current state without integration
 ```
 
 Reset follows the same rule:
 
 ```python
 env.reset()
-client.step(0)
+client.push_puppet_state()
 ```
+
+`push_puppet_state()` is an explicit puppet-only API. It must:
+
+- reject direct, live, and auto modes;
+- require an attached external `MjModel` and `MjData`;
+- never call `mj_step`;
+- serialize the attached data's `qpos`, `qvel`, `ctrl`, and `time`;
+- make the URLab server copy those values into its mirror and call
+  `mj_forward`; and
+- return the normal URLab observations and synchronization counter.
+
+The existing internal zero-step puppet path can implement this operation, but
+the public connector must not expose `client.step(0)` as the research-facing
+API. That call has different semantics outside puppet mode.
 
 For the first parity experiment, this synchronization can be explicit in the
 smoke runner. An automatic wrapper or sampler hook is introduced only after
@@ -182,7 +196,7 @@ Only after complete-scene import succeeds:
 1. add a generic external-puppet attachment to URLab Bridge;
 2. preserve `client.model` and `client.data` as the server-model mirror;
 3. store external `MjModel`/`MjData` references separately;
-4. make `client.step(0)` serialize the external state without advancing it;
+4. add the guarded `client.push_puppet_state()` operation;
 5. add typed compatibility failures; and
 6. add offline bridge tests plus the one-episode live parity runner.
 
