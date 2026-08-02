@@ -1676,6 +1676,16 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::BuildCamerasBlock(AAMjManager* Mana
 			AsyncTask(ENamedThreads::GameThread, [WeakCam, ReqDone]() {
 				if (UMjCamera* C = WeakCam.Get())
 				{
+					// Force a fresh render before the readback. With
+					// streaming off (e.g. puppet mode pauses publishers)
+					// bCaptureEveryFrame is false and the render target
+					// still holds the FIRST frame ever captured — a bare
+					// readback then returns that stale image (the robot
+					// at its spawn pose) no matter the current state.
+					if (C->CaptureComponent)
+					{
+						C->CaptureComponent->CaptureScene();
+					}
 					C->RequestReadback();
 				}
 				ReqDone->Trigger();
