@@ -281,6 +281,77 @@ static bool ResolveGeomRgbaFromDefaults(const UMjGeom* GeomComp, UBlueprint* BP,
 	return false;
 }
 
+/** Resolve the geom's group through the default-class chain, mirroring
+ *  ResolveGeomRgbaFromDefaults. The inline attribute wins; otherwise walk
+ *  the chain starting from the explicit class (or the parent body's
+ *  childclass). MuJoCo defaults classes routinely carry group (e.g. the
+ *  Molmo CoACD collider classes use group="4"), and missing this left
+ *  collision hulls visible. */
+static int32 ResolveGeomGroupFromDefaults(const UMjGeom* GeomComp, UBlueprint* BP)
+{
+	if (!GeomComp || !BP || !BP->SimpleConstructionScript)
+		return 0;
+	if (GeomComp->bOverride_group)
+		return GeomComp->group;
+
+	FString ClassName = GeomComp->MjClassName;
+	TArray<USCS_Node*> AllNodes = BP->SimpleConstructionScript->GetAllNodes();
+
+	if (ClassName.IsEmpty())
+	{
+		for (USCS_Node* Node : AllNodes)
+		{
+			if (Node->ComponentTemplate == GeomComp)
+			{
+				for (USCS_Node* Parent : AllNodes)
+				{
+					if (Parent->ChildNodes.Contains(Node))
+					{
+						if (UMjBody* Body = Cast<UMjBody>(Parent->ComponentTemplate))
+						{
+							if (Body->bOverride_childclass && !Body->childclass.IsEmpty())
+							{
+								ClassName = Body->childclass;
+							}
+						}
+						break;
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	if (ClassName.IsEmpty())
+		return 0;
+
+	TSet<FString> Visited;
+	while (!ClassName.IsEmpty() && !Visited.Contains(ClassName))
+	{
+		Visited.Add(ClassName);
+		for (USCS_Node* Node : AllNodes)
+		{
+			UMjDefault* Def = Cast<UMjDefault>(Node->ComponentTemplate);
+			if (!Def || Def->ClassName != ClassName)
+				continue;
+
+			for (USCS_Node* ChildNode : Node->ChildNodes)
+			{
+				if (UMjGeom* ChildGeom = Cast<UMjGeom>(ChildNode->ComponentTemplate))
+				{
+					if (ChildGeom->bOverride_group)
+						return ChildGeom->group;
+				}
+			}
+
+			ClassName = Def->ParentClassName;
+			break;
+		}
+	}
+
+	return 0;
+}
+
 void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Node* ParentNode, UBlueprint* BP,
 	const FString& XMLDir, const FString& AssetImportPath,
 	const TMap<FString, FString>& MeshAssets,
@@ -627,8 +698,13 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 							MeshTemplate->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 							MeshTemplate->SetCollisionResponseToAllChannels(ECR_Overlap);
 
-							// Check if parent Geom has Group=3 (collision/hidden)
-							if (GeomComp && GeomComp->group == 3)
+							// Hide collision/utility geoms. MuJoCo's viewer shows
+							// groups 0-2 by default; Molmo's CoACD collider hulls sit
+							// in group 4 (via default classes) with randomized debug
+							// rgba, and rendered as multicoloured shells on top of the
+							// visual meshes until the group was resolved and compared
+							// with >= 3.
+							if (GeomComp && ResolveGeomGroupFromDefaults(GeomComp, BP) >= 3)
 							{
 								MeshTemplate->SetVisibility(false);
 								MeshTemplate->bHiddenInGame = true;
@@ -669,10 +745,12 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 							// Key by material name (resolved through default chain) if referenced, else fall back to mesh name
 							FString ResolvedMat = ResolveMaterialFromDefaults(GeomComp, BP);
 							FString MaterialKey = MeshName;
+							bool bSharedMjcfMaterial = false;
 							if (!ResolvedMat.IsEmpty() && MaterialData.Contains(ResolvedMat))
 							{
 								MatData = MaterialData[ResolvedMat];
 								MaterialKey = ResolvedMat;
+								bSharedMjcfMaterial = true;
 								UE_LOG(LogURLabEditor, Log, TEXT("Using shared material '%s' for mesh '%s'"), *ResolvedMat, *MeshName);
 							}
 
@@ -685,8 +763,44 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 
 							if (MaterialInstance)
 							{
-								MeshTemplate->SetMaterial(0, MaterialInstance);
-								UE_LOG(LogURLabEditor, Log, TEXT("Assigned material instance to mesh '%s'"), *MeshName);
+								// Stamp the MJCF material onto the static-mesh ASSET too,
+								// across every slot. GLB imports arrive with embedded
+								// placeholder or null slot materials, and any consumer of
+								// the asset that does not carry this template's override
+								// renders those (null slots draw the WorldGrid checker).
+								// MuJoCo renders one material per geom, so all slots get
+								// the same instance.
+								//
+								// Asset-level stamping applies ONLY when the geom resolved
+								// a real MJCF material: meshes are shared between visual
+								// and collision geoms (and multiple instances), and a
+								// later import of the same mesh from a material-less geom
+								// otherwise clobbers the visual's material on the shared
+								// asset with the mesh-name-keyed fallback. Fallback
+								// instances still apply to this template's override.
+								const int32 SlotCount = NewMesh->GetStaticMaterials().Num();
+								if (bSharedMjcfMaterial)
+								{
+									if (SlotCount == 0)
+									{
+										NewMesh->GetStaticMaterials().Add(FStaticMaterial(MaterialInstance));
+										NewMesh->MarkPackageDirty();
+									}
+									else
+									{
+										for (int32 SlotIdx = 0; SlotIdx < SlotCount; ++SlotIdx)
+										{
+											NewMesh->SetMaterial(SlotIdx, MaterialInstance);
+										}
+									}
+								}
+								for (int32 SlotIdx = 0; SlotIdx < FMath::Max(SlotCount, 1); ++SlotIdx)
+								{
+									MeshTemplate->SetMaterial(SlotIdx, MaterialInstance);
+								}
+								UE_LOG(LogURLabEditor, Log,
+									TEXT("Assigned material instance to mesh '%s' (%d slot(s), shared=%d)"),
+									*MeshName, FMath::Max(SlotCount, 1), bSharedMjcfMaterial ? 1 : 0);
 							}
 						}
 					}
@@ -730,8 +844,13 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 					BuiltInViz->SetMaterial(0, MaterialInstance);
 				}
 
-				// Check for Group 3 visibility
-				if (GeomComp->group == 3)
+				// Hide collision/utility primitives — same contract as the
+				// mesh branch above: resolve group through default classes
+				// and hide >= 3. The old inline-only ==3 check let the
+				// episode's 491 primitive collision boxes (group 4 via
+				// default class) render coplanar with visual surfaces,
+				// z-fighting across the scene.
+				if (ResolveGeomGroupFromDefaults(GeomComp, BP) >= 3)
 				{
 					BuiltInViz->SetVisibility(false);
 					BuiltInViz->bHiddenInGame = true;
@@ -744,6 +863,52 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 	{
 		FString Name = Node->GetAttribute(TEXT("name"));
 		FString TypeStr = Node->GetAttribute(TEXT("type"));
+
+		// Resolve type inherited from a class default, same contract as
+		// geoms above: <default class="finger"><joint type="slide"/></default>
+		// then bare <joint class="finger"/>. Without this the joint
+		// compiles as the fallback hinge and slide joints rotate instead
+		// of translating (caught by the puppet pose-parity gate on the
+		// FR3 finger sliders).
+		if (TypeStr.IsEmpty())
+		{
+			FString SearchClass = Node->GetAttribute(TEXT("class"));
+			if (SearchClass.IsEmpty() && ParentNode)
+			{
+				if (UMjBody* ParentBody = Cast<UMjBody>(ParentNode->ComponentTemplate))
+				{
+					SearchClass = ParentBody->childclass;
+				}
+			}
+			if (!SearchClass.IsEmpty() && CreatedDefaultNodes.Contains(SearchClass))
+			{
+				if (USCS_Node* DefNode = CreatedDefaultNodes[SearchClass])
+				{
+					for (USCS_Node* DefChild : DefNode->ChildNodes)
+					{
+						UMjJoint* DefJoint = Cast<UMjJoint>(DefChild->ComponentTemplate);
+						if (!DefJoint)
+							continue;
+						switch (DefJoint->Type)
+						{
+							case EMjJointType::Hinge:
+								TypeStr = TEXT("hinge");
+								break;
+							case EMjJointType::Slide:
+								TypeStr = TEXT("slide");
+								break;
+							case EMjJointType::Ball:
+								TypeStr = TEXT("ball");
+								break;
+							case EMjJointType::Free:
+								TypeStr = TEXT("free");
+								break;
+						}
+						break;
+					}
+				}
+			}
+		}
 		if (Name.IsEmpty())
 		{
 			FString JointTypeName = TypeStr.IsEmpty() ? TEXT("Hinge") : TypeStr;
@@ -1383,7 +1548,9 @@ void UMujocoGenerationAction::ParseAssetsRecursive(const FXmlNode* Node, const F
 				EffectiveMeshBase = FPaths::Combine(XMLDir, CurrentAssetDir);
 			}
 
-			FString FullPath = FPaths::Combine(EffectiveMeshBase, MeshFile);
+			const FString FullPath = FPaths::IsRelative(MeshFile)
+				? FPaths::Combine(EffectiveMeshBase, MeshFile)
+				: MeshFile;
 
 			if (!OutMeshAssets.Contains(MeshName))
 			{
@@ -1462,7 +1629,9 @@ void UMujocoGenerationAction::ParseAssetsRecursive(const FXmlNode* Node, const F
 				EffectiveTextureBase = FPaths::Combine(XMLDir, CurrentAssetDir);
 			}
 
-			FString FullPath = FPaths::Combine(EffectiveTextureBase, TexFile);
+			const FString FullPath = FPaths::IsRelative(TexFile)
+				? FPaths::Combine(EffectiveTextureBase, TexFile)
+				: TexFile;
 
 			if (!OutTextureAssets.Contains(TexName))
 			{
