@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Author HomeInterior for the multi-pick round trip (editor IDLE).
 Table + island + side-table (SM_Table_00_32, the far place station) static hulls; SM_Book_125 dynamic (actor must be Movable —
-verified via bounds); suction tidybot + nav stack (max_speed 0.4, the carry
+verified via bounds); suction tidybot + nav stack (max_speed 0.25, the carry
 doctrine's slow-everywhere v1) + controller. CUP GUARD IS EMPTY: the cup
 must approach BOTH surfaces to pick/place; descends are vertical and
 reaches planner-checked, while arm+base stay guarded."""
@@ -98,8 +98,8 @@ bp = c.scene.import_xml(path=str(MODEL_XML),
                         force_reimport=("--force-reimport" in sys.argv))
 c.scene.spawn_actor(blueprint=bp, actor_id=ACTOR_ID, location=(SPAWN[0], SPAWN[1], 0.0))
 c.scene.ensure_manager()
-nav = c.scene.add_nav_stack(target=ACTOR_ID, debug_draw=True, max_speed=0.4)
-log(f"nav stack={nav.get('created')} (max_speed 0.4 — loaded-transit doctrine)")
+nav = c.scene.add_nav_stack(target=ACTOR_ID, debug_draw=True, max_speed=0.25)
+log(f"nav stack={nav.get('created')} (max_speed 0.25 — displaced-ride tuning, was 0.4)")
 r = c.scene.spawn_nav_bounds(center=(SPAWN[0], SPAWN[1], 0.5), extent=(15.0, 15.0, 2.0),
                              agent_radius=AGENT_RADIUS, timeout_s=60.0)
 log(f"navmesh baked={r.get('nav_data_present')}")

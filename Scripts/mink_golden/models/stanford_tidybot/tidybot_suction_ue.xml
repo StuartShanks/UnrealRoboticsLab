@@ -179,11 +179,18 @@
                         <geom class="2f85/collision" mesh="base"/>
                         <!-- <site name="pinch" pos="0 0 0.145" type="sphere" group="5" rgba="0.9 0.9 0.9 1" size="0.005"/> -->
                         <body name="cup" pos="0 0 0.10">
-                          <!-- margin+gap give the adhesion actuator a contact zone to
-                               pull across: without them the normal (repulsive) contact
-                               force cancels the suction and NOTHING is gripped (verified
-                               in pure MuJoCo). Also lets the cup grab from up to 3 cm
-                               away, so the pick tolerates an imperfect touch. -->
+                          <!-- CORRECT gap semantics (verified in pure MuJoCo 3.10,
+                               2026-07-29): contacts within MARGIN always carry
+                               repulsive force; GAP adds an extra force-FREE
+                               detection band ABOVE the margin (margin..margin+gap)
+                               through which the adhesion actuator can pull. So a
+                               suction cup wants TINY margin (repulsion only at true
+                               face contact) + LARGE gap (long capture band):
+                               margin 0.002 / gap 0.04 = grab from 4 cm, object
+                               rides FLUSH on the face. Large margins (the old
+                               0.03/0.03) put a springy repulsion wall 3 cm out —
+                               objects levitated on it, dangled by corners, and
+                               oscillated in carries. -->
                           <!-- condim=6 + torsional/rolling friction so the suction
                                contact resists SPIN (torsion about the cup axis) and
                                TILT (rolling), not just slide. Lives on the GRIPPER, so
@@ -195,17 +202,8 @@
                                clear the place table): the adhesion preload only
                                resists tilt through these coefficients, and the old
                                values were tuned for the heavier, centered box. -->
-                          <!-- margin/gap 0.03 -> 0.01: the ENGINE does not honor
-                               gap (measured: 35 N repulsion at dist 0.0295 on a
-                               cup-table contact), so the margin acts as a rigid
-                               invisible bumper — objects "grab" 3 cm below the
-                               face and hang on a springy shell (corner-dangle +
-                               carry oscillation, seen live). 1 cm keeps an
-                               adhesion pull-in zone while shrinking the bumper
-                               to a stiff near-flush hold. Revert to 0.03/0.03
-                               when the engine honors gap. -->
                           <geom name="cup_geom" type="cylinder" size="0.03 0.01"
-                                margin="0.01" gap="0.01" condim="6" friction="1 1.0 0.5"
+                                margin="0.002" gap="0.04" condim="6" friction="1 1.0 0.5"
                                 rgba="0.15 0.15 0.15 1"/>
                           <!-- Identity quat: cup_site frame z = the cup's outward suction
                                direction (the 2f85 mount's grasping axis). pinch_site used
@@ -239,7 +237,11 @@
     <position class="small_actuator" name="joint_5" joint="joint_5"/>
     <position class="small_actuator" name="joint_6" joint="joint_6" ctrlrange="-2.0996310901491784 2.0996310901491784"/>
     <position class="small_actuator" name="joint_7" joint="joint_7"/>
-    <adhesion name="suction" body="cup" ctrlrange="0 1" gain="100"/>
+    <!-- gain 100 -> 250: stronger pull-back closes transient separations
+         before they exceed the capture band (margin+gap on cup_geom) — at
+         gain 100 transit jolts dropped carried objects. Static hold was
+         never the issue (42 N at gain 100). -->
+    <adhesion name="suction" body="cup" ctrlrange="0 1" gain="250"/>
   </actuator>
 
   <keyframe>

@@ -358,6 +358,119 @@ void AAMjManager::BeginPlay()
 					Pub->PublishSnapshot(Buf);
 			});
 
+		// ---- Suction weld-on-attach (pre-step, mocap-style pinning) --------
+		// MuJoCo's adhesion actuator holds an object through a compliant
+		// contact field: the hold is xy-strong but has NO tilt restoration —
+		// a flat cup on a crowned convex hull is a point contact, so a held
+		// object ratchets into a corner-dangle under transit accelerations
+		// (validated live at every margin/gap/gain/friction tuning point).
+		// Real vacuum grippers behave rigidly once sealed, so: while an
+		// adhesion actuator's ctrl > 0.5 and a FLOATING body is in contact
+		// with (or inside the margin+gap capture band of) the actuator's
+		// body, pin that body rigidly to the cup frame each step — exactly
+		// how mocap bodies are driven. Release (ctrl < 0.5) restores free
+		// dynamics at rest. State lives in the lambda; re-scans on model
+		// change; drops attachments on sim reset (time going backwards).
+		{
+			struct FSuctionWeldSlot
+			{
+				int ActId = -1;
+				int CupBodyId = -1;
+				int HeldRootId = -1;
+				int QposAdr = -1;
+				int DofAdr = -1;
+				mjtNum RelPos[3] = {0, 0, 0};
+				mjtNum RelQuat[4] = {1, 0, 0, 0};
+			};
+			struct FSuctionWeldState
+			{
+				const mjModel* Model = nullptr;
+				mjtNum LastTime = -1.0;
+				TArray<FSuctionWeldSlot> Slots;
+			};
+			TSharedPtr<FSuctionWeldState, ESPMode::ThreadSafe> Weld =
+				MakeShared<FSuctionWeldState, ESPMode::ThreadSafe>();
+			PhysicsEngine->RegisterPreStepCallback([Weld](mjModel* m, mjData* d) {
+				if (Weld->Model != m)
+				{
+					Weld->Model = m;
+					Weld->Slots.Reset();
+					for (int i = 0; i < m->nu; ++i)
+					{
+						if (m->actuator_trntype[i] != mjTRN_BODY)
+							continue; // adhesion is the only body-transmission actuator
+						FSuctionWeldSlot S;
+						S.ActId = i;
+						S.CupBodyId = m->actuator_trnid[2 * i];
+						Weld->Slots.Add(S);
+					}
+				}
+				if (d->time < Weld->LastTime)
+					for (FSuctionWeldSlot& S : Weld->Slots)
+						S.HeldRootId = -1;
+				Weld->LastTime = d->time;
+
+				for (FSuctionWeldSlot& S : Weld->Slots)
+				{
+					if (d->ctrl[S.ActId] <= 0.5)
+					{
+						if (S.HeldRootId >= 0)
+							UE_LOG(LogURLab, Log,
+								TEXT("[SuctionWeld] released body %d"), S.HeldRootId);
+						S.HeldRootId = -1;
+						continue;
+					}
+					if (S.HeldRootId < 0)
+					{
+						const int CupRoot = m->body_rootid[S.CupBodyId];
+						for (int ci = 0; ci < d->ncon; ++ci)
+						{
+							const mjContact& C = d->contact[ci];
+							const int B1 = m->geom_bodyid[C.geom1];
+							const int B2 = m->geom_bodyid[C.geom2];
+							int Other = -1;
+							if (B1 == S.CupBodyId)
+								Other = B2;
+							else if (B2 == S.CupBodyId)
+								Other = B1;
+							if (Other < 0)
+								continue;
+							const int Root = m->body_rootid[Other];
+							if (Root == CupRoot || Root == 0)
+								continue; // never weld to self or the world
+							if (m->body_jntnum[Root] != 1)
+								continue;
+							const int J = m->body_jntadr[Root];
+							if (m->jnt_type[J] != mjJNT_FREE)
+								continue; // floating bodies only
+							mjtNum NegP[3], NegQ[4];
+							mju_negPose(NegP, NegQ,
+								d->xpos + 3 * S.CupBodyId, d->xquat + 4 * S.CupBodyId);
+							mju_mulPose(S.RelPos, S.RelQuat, NegP, NegQ,
+								d->xpos + 3 * Root, d->xquat + 4 * Root);
+							S.HeldRootId = Root;
+							S.QposAdr = m->jnt_qposadr[J];
+							S.DofAdr = m->jnt_dofadr[J];
+							UE_LOG(LogURLab, Log,
+								TEXT("[SuctionWeld] attached body %d to cup body %d"),
+								Root, S.CupBodyId);
+							break;
+						}
+					}
+					if (S.HeldRootId >= 0)
+					{
+						mjtNum P[3], Q[4];
+						mju_mulPose(P, Q,
+							d->xpos + 3 * S.CupBodyId, d->xquat + 4 * S.CupBodyId,
+							S.RelPos, S.RelQuat);
+						mju_copy3(d->qpos + S.QposAdr, P);
+						mju_copy4(d->qpos + S.QposAdr + 3, Q);
+						mju_zero(d->qvel + S.DofAdr, 6);
+					}
+				}
+			});
+		}
+
 		PhysicsEngine->RunMujocoAsync();
 	}
 

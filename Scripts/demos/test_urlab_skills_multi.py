@@ -153,7 +153,7 @@ held = {"n": 0}
 def _fake_hold(client, name):
     held["n"] += 1
 U._hold_suction = _fake_hold
-U.synced_site_pose = lambda client, s: (np.array([0.0, 0.0, 0.7]),
+U.synced_site_pose = lambda client, s: (np.array([-12.7, -15.4, 0.7]),  # over the stub book (ride-centering check)
                                         np.array([0.0, 1.0, 0.0, 0.0]))
 U.stream_target = lambda client, name, p, q: None
 

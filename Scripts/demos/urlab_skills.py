@@ -628,13 +628,16 @@ class ResolveAffordance(py_trees.behaviour.Behaviour):
 
 class ResolveActorTop(py_trees.behaviour.Behaviour):
     """Fab-object affordance: no MJCF affordance site exists on a
-    quick-converted actor, so build the Affordance from the live actor pose.
-    PIVOT SEMANTICS (measured live): in PIE the quick-converted actor's pivot
-    is the hull TOP face — resting upright on the table it reads
-    table_top + thickness; dropped upside-down on the floor it reads 0. (The
-    EDITOR-world pivot is the mesh bottom — do not calibrate against that.)
-    So the affordance point z is the pivot itself, no offset. Replaces
-    ResolveAffordance in Fab trees; writes bb.affordance + bb.q_cup."""
+    quick-converted actor, so build the Affordance from live geometry.
+    PREFERRED SOURCE: the hull's live world AABB from the client mirror —
+    center xy + true top z, correct regardless of pivot conventions or how
+    the object landed. Do NOT trust pivot-vs-surface arithmetic: the pivot's
+    apparent offset from a station's VISUAL top varies per station because
+    each CoACD hull sits differently proud of its visual mesh (measured
+    live: small table ~2 cm proud, side table flush) — a fixed pivot-offset
+    convention mis-aims on some station. The pivot path remains only as a
+    fallback when no mirror is available. Replaces ResolveAffordance in Fab
+    trees; writes bb.affordance + bb.q_cup."""
 
     def __init__(self, name, bb, object_name: str, half_thickness: float):
         super().__init__(name)
@@ -690,8 +693,13 @@ class CarryTransit(py_trees.behaviour.Behaviour):
     below carry_z_min => attach lost mid-drive; fail fast, no recovery).
     Presents as ONE skill to the tree."""
 
+    RIDE_OFFSET_MAX_M = 0.10  # book xy vs cup xy after the tuck: a load
+                              # recaptured off-center rides displaced and gets
+                              # released over a table edge (live: 15 cm ride
+                              # -> book tipped off the far station)
+
     def __init__(self, name, bb, goal_xy, object_name: str,
-                 carry_z_min: float = 0.45, tuck_duration: float = 3.0,
+                 carry_z_min: float = 0.45, tuck_duration: float = 5.0,
                  timeout_s: float = NAV_TIMEOUT_S):
         super().__init__(name)
         self.bb = bb
@@ -717,6 +725,25 @@ class CarryTransit(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.RUNNING
             if status == py_trees.common.Status.FAILURE:
                 return py_trees.common.Status.FAILURE
+            # Load-centering check ONCE at tuck end, before driving: a load
+            # that already rides off-center is doomed at the place — fail
+            # honestly here instead of carrying it 4 m and dropping it over
+            # a table edge. (One synced read; not per-tick — mode flapping
+            # mid-drive is not worth it.)
+            try:
+                cup_pos, _ = synced_site_pose(bb.client, "cup_site")
+                obj_xy = _actor_xy_by_name(bb.client, self.object_name)
+                _hold_suction(bb.client, bb.name)  # synced read zeroed it
+                off = float(np.linalg.norm(obj_xy - cup_pos[:2]))
+                if off > self.RIDE_OFFSET_MAX_M:
+                    bb.fail_reason = (
+                        f"CarryTransit[{self.name}]: load riding {off:.2f} m "
+                        f"off-center after tuck (max {self.RIDE_OFFSET_MAX_M})")
+                    return py_trees.common.Status.FAILURE
+                print(f"[carry] {self.name}: load centered ({off:.3f} m "
+                      f"offset) — driving", flush=True)
+            except Exception:
+                pass  # centering is best-effort; the z drop guard still runs
             self._drive = Drive(f"{self.name}/drive", bb, self.goal_xy,
                                 timeout_s=self.timeout_s)
             self._drive.initialise()
@@ -1002,6 +1029,7 @@ class PlannedReach(py_trees.behaviour.Behaviour):
         aff = bb.affordance
         pre_grasp = np.asarray(aff.point, dtype=float) \
             + self.PRE_GRASP_M * np.asarray(aff.normal, dtype=float)
+        self._pre_grasp = pre_grasp  # exec-stall fallback streams to this
         self._plan = None
         for attempt in range(1, self.PLAN_ATTEMPTS + 1):
             try:
@@ -1037,9 +1065,14 @@ class PlannedReach(py_trees.behaviour.Behaviour):
                     self._failed = bb.fail_reason
                     return
                 stream_target(client, bb.name, p0, q0)  # seed-then-enable
+                # Twist task OFF during the streamed approach: enabled with a
+                # zero command it PINS the base, so the arm alone must span
+                # the staging distance (live: approaches stalled 0.28-0.35 m
+                # short past ~0.9 m). Carrot-prototype mode — the QP walks
+                # the base in. terminate() restores it.
                 client._rpc_configure_controller(
                     articulation=bb.name,
-                    params={"task_enabled": [True, True, True, False],
+                    params={"task_enabled": [True, True, False, False],
                             "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
                 self._fallback_goal = np.asarray(pre_grasp, dtype=float)
                 self._fb_quat = q0
@@ -1126,14 +1159,30 @@ class PlannedReach(py_trees.behaviour.Behaviour):
             # no-progress guard so it can't spin RUNNING forever.
 
         # Trip only on genuine STALL (best err not improving), not on error still
-        # being high while the QP legitimately drives a long move.
+        # being high while the QP legitimately drives a long move. A stall does
+        # NOT fail the skill: fall back to the streamed approach from wherever
+        # the arm is (a valid plan can still stall in EXECUTION — live: posture
+        # tracking pinned at err 3.29 toward a repositioned-base goal).
         if time.time() - self._last_improve_t > self.NO_PROGRESS_S:
-            self.feedback_message = f"no progress at waypoint {idx} (err {err:.3f})"
-            bb.fail_reason = (
-                f"PlannedReach[{self.name}]: no progress for {self.NO_PROGRESS_S}s "
-                f"at waypoint {idx} (err {err:.3f})"
-            )
-            return py_trees.common.Status.FAILURE
+            print(f"[reach] {self.name}: exec stalled at waypoint {idx} "
+                  f"(err {err:.3f}) — streamed-approach fallback", flush=True)
+            try:
+                p0, q0 = synced_site_pose(client, "cup_site")
+            except RuntimeError as e:
+                bb.fail_reason = f"PlannedReach[{self.name}]: {e}"
+                return py_trees.common.Status.FAILURE
+            stream_target(client, bb.name, p0, q0)  # seed-then-enable
+            # Twist OFF so the base can assist (see plan-failure fallback).
+            client._rpc_configure_controller(
+                articulation=bb.name,
+                params={"task_enabled": [True, True, False, False],
+                        "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
+            self._fallback_goal = np.asarray(self._pre_grasp, dtype=float)
+            self._fb_quat = q0
+            self._fb_best = float("inf")
+            self._fb_improve_t = time.time()
+            self._fb_t0 = time.time()
+            return py_trees.common.Status.RUNNING
         return py_trees.common.Status.RUNNING
 
     def terminate(self, new_status):
@@ -1629,6 +1678,9 @@ class PlaceOn(py_trees.behaviour.Behaviour):
     contacts; goals are elsewhere); live gate 1 is the arbiter, and the
     fallback is a straight streamed approach instead of a planned one."""
 
+    RELEASE_XY_MAX_M = 0.12    # never release an object hanging farther than
+                               # this from the place target — a displaced ride
+                               # released near a table edge tips off (live)
     PRE_PLACE_HOVER_M = 0.16   # cup hover above surface_z
     AFFORDANCE_DZ = 0.13       # hover minus PlannedReach's PRE_GRASP_M (0.03)
     CUP_FLOOR_M = 0.03         # never stream the cup below surface + this
@@ -1702,9 +1754,10 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 bb.fail_reason = ""
                 p0, q0 = synced_site_pose(client, "cup_site")
                 stream_target(client, bb.name, p0, q0)  # seed-then-enable
+                # Twist OFF so the base can assist (see PlannedReach fallback).
                 client._rpc_configure_controller(
                     articulation=bb.name,
-                    params={"task_enabled": [True, True, True, False],
+                    params={"task_enabled": [True, True, False, False],
                             "task_costs": {str(DAMPING_TASK): {"cost": 0.05}}})
                 self._damping_relaxed = True
                 self._quat = q0
@@ -1766,10 +1819,13 @@ class PlaceOn(py_trees.behaviour.Behaviour):
         if self._phase == "descend":
             _hold_suction(client, bb.name)
             z_obj = _actor_z_by_name(client, self.object_name)
-            if abs(z_obj - self._rest_z) <= self.settle_tol:
-                try:  # telemetry only — never let a diagnostic read fail the phase
+            if (self.surface_z - self.settle_tol <= z_obj
+                    <= self._rest_z + self.settle_tol):
+                obj_xy = None
+                try:
                     cup_now, _ = synced_site_pose(client, "cup_site")
                     obj_xy = _actor_xy_by_name(client, self.object_name)
+                    _hold_suction(client, bb.name)  # synced read zeroed it
                     print(f"[place] {self.name}: flat-settle — releasing at "
                           f"object z {z_obj:.3f} xy {np.round(obj_xy, 2)} "
                           f"cup {np.round(cup_now, 2)} (target xy {self.place_xy})",
@@ -1777,6 +1833,15 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                 except Exception:
                     print(f"[place] {self.name}: flat-settle — releasing at "
                           f"object z {z_obj:.3f}", flush=True)
+                if obj_xy is not None:
+                    off = float(np.linalg.norm(
+                        obj_xy - np.asarray(self.place_xy)))
+                    if off > self.RELEASE_XY_MAX_M:
+                        bb.fail_reason = (
+                            f"PlaceOn[{self.name}]: refusing release — object "
+                            f"hangs {off:.2f} m from the place target "
+                            f"(displaced ride)")
+                        return py_trees.common.Status.FAILURE
                 self._phase = "release"
                 self._t0 = None
                 return py_trees.common.Status.RUNNING
@@ -1793,10 +1858,18 @@ class PlaceOn(py_trees.behaviour.Behaviour):
                     and self._cup_target[2] <= self.surface_z + self.CUP_FLOOR_M + 0.05):
                 cup_now, _ = synced_site_pose(client, "cup_site")
                 obj_xy = _actor_xy_by_name(client, self.object_name)
+                _hold_suction(client, bb.name)  # synced read zeroed it
                 print(f"[place] {self.name}: contact-stall — releasing at "
                       f"object z {z_obj:.3f} xy {np.round(obj_xy, 2)} "
                       f"cup {np.round(cup_now, 2)} (target xy {self.place_xy})",
                       flush=True)
+                off = float(np.linalg.norm(obj_xy - np.asarray(self.place_xy)))
+                if off > self.RELEASE_XY_MAX_M:
+                    bb.fail_reason = (
+                        f"PlaceOn[{self.name}]: refusing release — object "
+                        f"hangs {off:.2f} m from the place target "
+                        f"(displaced ride)")
+                    return py_trees.common.Status.FAILURE
                 self._phase = "release"
                 self._t0 = None
                 return py_trees.common.Status.RUNNING
@@ -1853,9 +1926,18 @@ class PlaceOn(py_trees.behaviour.Behaviour):
             articulation=bb.name,
             params={"task_enabled": [False, True, True, True]})
         z_obj = _actor_z_by_name(client, self.object_name)
-        if not (-self.settle_tol <= z_obj - self._rest_z <= 0.06):
+        # The resting pivot's offset from the VISUAL surface varies PER
+        # STATION (each table's CoACD hull sits differently proud of its
+        # visual top: side table flush, small table ~2 cm proud — measured
+        # live; two physically perfect places failed a ±2 cm band by 2 mm).
+        # Accept the physically possible rest range; xy guard + release
+        # dwell + stability carry the rest of the verification.
+        lo = self.surface_z - self.settle_tol
+        hi = self._rest_z + 0.06
+        if not (lo <= z_obj <= hi):
             bb.fail_reason = (f"PlaceOn[{self.name}]: object z {z_obj:.3f} "
-                              f"not at rest height {self._rest_z:.3f} after retract")
+                              f"outside rest band [{lo:.3f}, {hi:.3f}] "
+                              f"after retract")
             return py_trees.common.Status.FAILURE
         print(f"[place] {self.name}: PLACED — object z {z_obj:.3f} on surface "
               f"{self.surface_z:.3f}", flush=True)

@@ -41,7 +41,12 @@ FAR = Station("side_table", (-12.53, -12.13, -18.41, -17.95), 0.684, (-12.33, -1
 # the annulus edge — narrow RRT goal basin (plan exhaustion on most runs)
 # and a reach with no margin. 0.83 m gives both room to breathe.
 FAR_STAGING = (-12.33, -17.35)
-TABLE_STAGING = (-12.18, -16.47)
+# Directly south of the book's home spot, just outside the erosion band
+# (table AABB y_min -15.63 - 0.58 = -16.21): 0.92 m from the place point.
+# The old (-12.18, -16.47) was 1.23 m out — past the distance where the
+# place layers (plan, exec, streamed fallback) all struggle (live: the
+# final place stalled 0.28 m from its hover from there).
+TABLE_STAGING = (-12.66, -16.28)
 
 
 def log(m): print(f"[multi-pick] {m}", flush=True)
