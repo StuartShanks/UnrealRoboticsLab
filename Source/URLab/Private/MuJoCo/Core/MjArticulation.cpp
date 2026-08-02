@@ -645,6 +645,11 @@ void AMjArticulation::PostSetup(mjModel* Model, mjData* Data)
 		UE_LOG(LogURLab, Log, TEXT("AMjArticulation::PostSetup - Bound controller '%s' with %d actuators"),
 			*CachedController->GetClass()->GetName(), CachedController->GetNumBindings());
 	}
+
+	// Re-run collider hiding now that the compiled model is bound: the
+	// BeginPlay pass ran pre-compile on the one-level default fallback;
+	// from here UpdateGroup3Visibility resolves groups from m->geom_group.
+	UpdateGroup3Visibility();
 }
 
 void AMjArticulation::ApplyControls(bool bSkipController)
@@ -1424,6 +1429,33 @@ void AMjArticulation::ValidateSpec()
 
 void AMjArticulation::UpdateGroup3Visibility()
 {
+	// Authoritative path: once a model is compiled and geom ids are bound
+	// (PostSetup), m->geom_group IS the resolved group — the MuJoCo
+	// compiler already applied the full default-class inheritance chain.
+	// The component-tree scan below only serves the editor before any
+	// compile, and it resolves just one level of defaults; do not extend
+	// it — extend the parser (import-time) or trust the model instead.
+	if (m_model && GeomIdMap.Num() > 0)
+	{
+		int Count = 0;
+		for (const TPair<int32, UMjGeom*>& Pair : GeomIdMap)
+		{
+			UMjGeom* Geom = Pair.Value;
+			if (!Geom || Geom->bIsDefault)
+				continue;
+			if (Pair.Key >= 0 && Pair.Key < m_model->ngeom
+				&& MjUtils::IsMjCollisionGroup(m_model->geom_group[Pair.Key]))
+			{
+				Geom->SetGeomVisibility(bShowGroup3);
+				Count++;
+			}
+		}
+		UE_LOG(LogURLab, Log,
+			TEXT("UpdateGroup3Visibility('%s'): %d collision-band geoms via m->geom_group (Show=%d)"),
+			*GetName(), Count, bShowGroup3);
+		return;
+	}
+
 	// 1. Gather all Defaults to support lookups
 	TMap<FString, UMjDefault*> DefaultMap;
 	TArray<UMjDefault*> Defaults;
@@ -1487,12 +1519,7 @@ void AMjArticulation::UpdateGroup3Visibility()
 			}
 		}
 
-		// Apply visibility based on collision-group convention and
-		// bShowGroup3. MuJoCo's viewer hides groups >= 3 by default;
-		// URLab's own content uses group 3 for colliders and Molmo
-		// exports use group 4 (via default classes), so treat >= 3 as
-		// the collision band rather than exactly 3.
-		if (EffectiveGroup >= 3)
+		if (MjUtils::IsMjCollisionGroup(EffectiveGroup))
 		{
 			Geom->SetGeomVisibility(bShowGroup3);
 			Count++;

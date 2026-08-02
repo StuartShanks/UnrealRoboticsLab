@@ -40,6 +40,23 @@ class URLAB_API MjUtils
 {
 public:
 	/**
+	 * @brief First geom group treated as the collision band.
+	 *
+	 * MuJoCo's viewer hides groups >= 3 by default. URLab content puts
+	 * colliders on group 3; other MJCF corpora (e.g. MolmoSpaces) use
+	 * group 4 via default classes. Every visibility/debug decision about
+	 * "is this a collision geom" must classify through
+	 * IsMjCollisionGroup so the convention lives in exactly one place.
+	 */
+	static constexpr int32 CollisionGroupMin = 3;
+
+	/** @brief True if a geom group falls in the hidden collision band.
+	 *  Prefer the compiled model's m->geom_group as the input where a
+	 *  model exists — the MuJoCo compiler has already resolved
+	 *  default-class inheritance there. */
+	static bool IsMjCollisionGroup(int32 Group) { return Group >= CollisionGroupMin; }
+
+	/**
 	 * @brief Converts a MuJoCo position array (double[3]) to an Unreal Engine FVector.
 	 * Applies scaling (*100) and coordinate axis swizzling (Y-inversion) to match UE's coordinate system.
 	 *

@@ -157,11 +157,11 @@ void MjUtils::DrawDebugGeom(UWorld* World, const mjModel* m, const GeomView& geo
 	mjtNum* mat = geom_view.geom_xmat;
 	mjtNum* size = geom_view.geom_size;
 
-	// Draw if group 3 (collision convention) OR if both contype and conaffinity are non-zero (active collider)
+	// Draw if in the collision group band OR if both contype and conaffinity are non-zero (active collider)
 	int group = geom_view._m->geom_group[geom_view.id];
 	int contype = geom_view._m->geom_contype[geom_view.id];
 	int conaffinity = geom_view._m->geom_conaffinity[geom_view.id];
-	bool isCollisionGeom = (group == 3) || (contype != 0 && conaffinity != 0);
+	bool isCollisionGeom = MjUtils::IsMjCollisionGroup(group) || (contype != 0 && conaffinity != 0);
 	if (!isCollisionGeom)
 	{
 		return;

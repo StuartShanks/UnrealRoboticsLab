@@ -104,6 +104,7 @@
 #include "MuJoCo/Components/Geometry/MjSite.h"
 #include "MuJoCo/Components/Sensors/MjCamera.h"
 #include "MuJoCo/Components/Geometry/MjGeom.h"
+#include "MuJoCo/Utils/MjUtils.h"
 #include "MuJoCo/Components/Geometry/Primitives/MjBox.h"
 #include "MuJoCo/Components/Geometry/Primitives/MjSphere.h"
 #include "MuJoCo/Components/Geometry/Primitives/MjCylinder.h"
@@ -778,13 +779,13 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 							MeshTemplate->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 							MeshTemplate->SetCollisionResponseToAllChannels(ECR_Overlap);
 
-							// Hide collision/utility geoms. MuJoCo's viewer shows
-							// groups 0-2 by default; Molmo's CoACD collider hulls sit
-							// in group 4 (via default classes) with randomized debug
-							// rgba, and rendered as multicoloured shells on top of the
-							// visual meshes until the group was resolved and compared
-							// with >= 3.
-							if (GeomComp && ResolveGeomGroupFromDefaults(GeomComp, BP) >= 3)
+							// Hide collision/utility geoms. Group must be resolved
+							// through default classes here (no compiled model exists
+							// at import time); classification goes through the shared
+							// MjUtils::IsMjCollisionGroup so the >= band convention
+							// lives in one place. Post-compile passes resolve from
+							// m->geom_group instead (AMjArticulation).
+							if (GeomComp && MjUtils::IsMjCollisionGroup(ResolveGeomGroupFromDefaults(GeomComp, BP)))
 							{
 								MeshTemplate->SetVisibility(false);
 								MeshTemplate->bHiddenInGame = true;
@@ -926,11 +927,11 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 
 				// Hide collision/utility primitives — same contract as the
 				// mesh branch above: resolve group through default classes
-				// and hide >= 3. The old inline-only ==3 check let the
-				// episode's 491 primitive collision boxes (group 4 via
-				// default class) render coplanar with visual surfaces,
-				// z-fighting across the scene.
-				if (ResolveGeomGroupFromDefaults(GeomComp, BP) >= 3)
+				// (no compiled model at import time) and classify via the
+				// shared MjUtils::IsMjCollisionGroup. The old inline-only
+				// ==3 check let the episode's 491 primitive collision boxes
+				// (group 4 via default class) z-fight the visual surfaces.
+				if (MjUtils::IsMjCollisionGroup(ResolveGeomGroupFromDefaults(GeomComp, BP)))
 				{
 					BuiltInViz->SetVisibility(false);
 					BuiltInViz->bHiddenInGame = true;
