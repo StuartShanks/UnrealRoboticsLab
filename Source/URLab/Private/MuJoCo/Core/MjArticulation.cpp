@@ -1487,8 +1487,12 @@ void AMjArticulation::UpdateGroup3Visibility()
 			}
 		}
 
-		// Apply visibility based on Group 3 and bShowGroup3
-		if (EffectiveGroup == 3)
+		// Apply visibility based on collision-group convention and
+		// bShowGroup3. MuJoCo's viewer hides groups >= 3 by default;
+		// URLab's own content uses group 3 for colliders and Molmo
+		// exports use group 4 (via default classes), so treat >= 3 as
+		// the collision band rather than exactly 3.
+		if (EffectiveGroup >= 3)
 		{
 			Geom->SetGeomVisibility(bShowGroup3);
 			Count++;
