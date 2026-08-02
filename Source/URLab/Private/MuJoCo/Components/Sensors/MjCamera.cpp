@@ -256,12 +256,30 @@ UMjCamera::UMjCamera()
 	}
 }
 
+
+namespace
+{
+// MJCF fovy is the VERTICAL field of view; UE's FOVAngle is HORIZONTAL.
+// They only coincide for square render targets — otherwise derive the
+// horizontal FOV from fovy and the target aspect ratio.
+float MjFovyToUEHorizontalFov(float FovyDeg, const TArray<int32>& Resolution)
+{
+	if (Resolution.Num() >= 2 && Resolution[0] > 0 && Resolution[1] > 0)
+	{
+		const float Aspect = static_cast<float>(Resolution[0]) / static_cast<float>(Resolution[1]);
+		return 2.0f * FMath::RadiansToDegrees(
+			FMath::Atan(FMath::Tan(FMath::DegreesToRadians(FovyDeg * 0.5f)) * Aspect));
+	}
+	return FovyDeg;
+}
+} // namespace
+
 void UMjCamera::OnRegister()
 {
 	Super::OnRegister();
 	if (CaptureComponent)
 	{
-		CaptureComponent->FOVAngle = fovy;
+		CaptureComponent->FOVAngle = MjFovyToUEHorizontalFov(fovy, resolution);
 	}
 }
 
@@ -587,7 +605,7 @@ void UMjCamera::SetStreamingEnabled(bool bEnable)
 		}
 		if (CaptureComponent)
 		{
-			CaptureComponent->FOVAngle = fovy;
+			CaptureComponent->FOVAngle = MjFovyToUEHorizontalFov(fovy, resolution);
 
 			// CRITICAL: SetVisibility(true) must be called to allow the component
 			// to dispatch scene capture updates. bHiddenInGame alone is not sufficient —
@@ -1007,6 +1025,6 @@ void UMjCamera::ImportFromXml(const FXmlNode* Node, const FMjCompilerSettings& C
 
 	if (CaptureComponent)
 	{
-		CaptureComponent->FOVAngle = fovy;
+		CaptureComponent->FOVAngle = MjFovyToUEHorizontalFov(fovy, resolution);
 	}
 }
